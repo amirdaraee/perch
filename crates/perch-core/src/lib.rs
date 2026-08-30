@@ -1,6 +1,7 @@
 //! Perch core: reads Claude Code's on-disk data. Never writes to it.
 
 pub mod config;
+pub mod model;
 
 #[cfg(test)]
 mod tests {
