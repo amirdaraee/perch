@@ -359,7 +359,7 @@ git commit -m "feat(core): resolve Claude Code config dir honoring CLAUDE_CONFIG
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `TurnUsage`, `Turn`, `SessionMeta`, `ProjectRecord`, `SessionRecord` — used by every later task.
+- Produces: `TurnUsage`, `Turn`, `SessionMeta`, `SessionRecord` — used by every later task. (No project struct here: the read side defines `ProjectSummary` in Task 10, and an unused duplicate would be dead code.)
 
 - [ ] **Step 1: Write the failing test**
 
@@ -456,16 +456,6 @@ pub struct SessionMeta {
     pub first_ts: Option<i64>,
     pub last_ts: Option<i64>,
     pub message_count: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectRecord {
-    pub id: i64,
-    pub slug: String,
-    pub real_path: String,
-    pub parent_project_id: Option<i64>,
-    pub display_name: Option<String>,
-    pub path_is_guess: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -571,7 +561,7 @@ mod tests {
     fn parses_timestamp_to_unix_millis() {
         let p = parse_line(ASSISTANT).unwrap();
         // 2026-08-18T12:16:08.619Z
-        assert_eq!(p.ts, Some(1786983368619));
+        assert_eq!(p.ts, Some(1787055368619));
     }
 
     #[test]
@@ -729,7 +719,7 @@ pub mod transcript;
 Run: `cargo test -p perch-core transcript`
 Expected: PASS, 9 tests.
 
-If `parses_timestamp_to_unix_millis` fails, print the actual value and correct the expected constant in the test — the epoch millis for `2026-08-18T12:16:08.619Z` is the source of truth, not the number written here.
+The constant `1787055368619` is the verified epoch-millis value for `2026-08-18T12:16:08.619Z`. If that test fails, the parser is wrong — do not change the constant.
 
 - [ ] **Step 6: Verify against a real transcript**
 
@@ -1572,8 +1562,9 @@ pub fn open_in_memory() -> Result<Db> {
 }
 
 fn init(conn: Connection) -> Result<Db> {
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
+    // `PRAGMA journal_mode` returns a row, so it must go through execute_batch —
+    // pragma_update errors with ExecuteReturnedResults on statements that yield rows.
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
     conn.execute_batch(SCHEMA)?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(Db { conn })
@@ -2092,6 +2083,34 @@ fn links_worktrees_to_their_parent_project() {
 }
 
 #[test]
+fn a_truncated_transcript_is_rescanned_without_duplicating_turns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_session(root, "-Users-a-one", "aaaa", &[
+        assistant("2026-08-18T10:00:00.000Z", "/Users/a/one", 1, 2),
+        assistant("2026-08-18T10:01:00.000Z", "/Users/a/one", 3, 4),
+        assistant("2026-08-18T10:02:00.000Z", "/Users/a/one", 5, 6),
+    ]);
+
+    let db = open_in_memory().unwrap();
+    index_all(&db, root).unwrap();
+    assert_eq!(db.turn_count().unwrap(), 3);
+
+    // The file is replaced by a shorter one — the stored offset is now meaningless.
+    write_session(root, "-Users-a-one", "aaaa", &[
+        assistant("2026-08-18T11:00:00.000Z", "/Users/a/one", 9, 9),
+    ]);
+
+    index_all(&db, root).unwrap();
+    assert_eq!(db.turn_count().unwrap(), 1, "stale turns must be dropped, not duplicated");
+
+    let message_count: i64 = db.conn()
+        .query_row("SELECT message_count FROM sessions WHERE id = 'aaaa'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(message_count, 1, "message count must not accumulate across a rescan");
+}
+
+#[test]
 fn user_notes_survive_a_reindex() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
@@ -2159,6 +2178,16 @@ pub fn index_all(db: &Db, projects_root: &Path) -> Result<IndexStats> {
                 continue;
             };
             let offset = db.session_offset(session_id)?;
+            let file_size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+
+            // `scan_from` restarts at 0 when the file shrank. The already-stored
+            // turns for this session are then stale duplicates and must be dropped,
+            // and the message count must not accumulate on top of them.
+            let restarted = file_size < offset;
+            if restarted {
+                db.delete_turns_for_session(session_id)?;
+            }
+
             let outcome = match scan_from(file, offset) {
                 Ok(o) => o,
                 Err(_) => continue, // unreadable file: skip, never fatal
@@ -2166,16 +2195,22 @@ pub fn index_all(db: &Db, projects_root: &Path) -> Result<IndexStats> {
 
             stats.sessions += 1;
             stats.new_turns += outcome.turns.len();
-            stats.bytes_read += outcome.new_offset.saturating_sub(offset);
+            stats.bytes_read += outcome
+                .new_offset
+                .saturating_sub(if restarted { 0 } else { offset });
             stats.lines_skipped += outcome.lines_skipped;
 
-            let existing_messages = if offset == 0 { 0 } else { db.session_message_count(session_id)? };
+            let existing_messages = if offset == 0 || restarted {
+                0
+            } else {
+                db.session_message_count(session_id)?
+            };
 
             db.upsert_session(&SessionRecord {
                 id: session_id.to_string(),
                 project_id,
                 file_path: file.to_string_lossy().into_owned(),
-                file_size: std::fs::metadata(file).map(|m| m.len()).unwrap_or(0),
+                file_size,
                 indexed_offset: outcome.new_offset,
                 started_at: outcome.meta.first_ts,
                 last_activity_at: outcome.meta.last_ts,
@@ -2199,7 +2234,7 @@ pub fn index_all(db: &Db, projects_root: &Path) -> Result<IndexStats> {
 }
 ```
 
-- [ ] **Step 4: Add the message-count helper the orchestrator needs**
+- [ ] **Step 4: Add the two helpers the orchestrator needs**
 
 In `crates/perch-core/src/db.rs`, add inside `impl Db`:
 
@@ -2215,6 +2250,14 @@ In `crates/perch-core/src/db.rs`, add inside `impl Db`:
             .ok();
         Ok(v.unwrap_or(0).max(0) as u64)
     }
+
+    /// Used when a transcript was truncated or replaced and must be rescanned
+    /// from zero: the previously stored turns are stale duplicates.
+    pub fn delete_turns_for_session(&self, session_id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM turns WHERE session_id = ?1", params![session_id])?;
+        Ok(())
+    }
 ```
 
 - [ ] **Step 5: Register the module**
@@ -2228,7 +2271,7 @@ pub mod index;
 - [ ] **Step 6: Run the tests to verify they pass**
 
 Run: `cargo test -p perch-core --test incremental`
-Expected: PASS, 5 tests.
+Expected: PASS, 6 tests.
 
 Run: `cargo test --workspace`
 Expected: PASS, all tests.
