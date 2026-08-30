@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod model;
+pub mod scan;
 pub mod transcript;
 
 #[cfg(test)]
