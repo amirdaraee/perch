@@ -1,0 +1,10 @@
+[package]
+name = "perch-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+perch-core = { path = "../perch-core" }
+anyhow.workspace = true
+clap.workspace = true
