@@ -4,6 +4,7 @@ pub mod config;
 pub mod db;
 pub mod discovery;
 pub mod index;
+pub mod live;
 pub mod model;
 pub mod pricing;
 pub mod query;
