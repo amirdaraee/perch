@@ -269,6 +269,28 @@ impl Db {
             .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))?)
     }
 
+    pub fn session_message_count(&self, session_id: &str) -> Result<u64> {
+        let v: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT message_count FROM sessions WHERE id = ?1",
+                params![session_id],
+                |r| r.get(0),
+            )
+            .ok();
+        Ok(v.unwrap_or(0).max(0) as u64)
+    }
+
+    /// Used when a transcript was truncated or replaced and must be rescanned
+    /// from zero: the previously stored turns are stale duplicates.
+    pub fn delete_turns_for_session(&self, session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM turns WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
     pub fn turn_totals(&self) -> Result<(i64, i64, i64, i64, i64)> {
         Ok(self.conn.query_row(
             "SELECT COALESCE(SUM(input),0), COALESCE(SUM(output),0), COALESCE(SUM(cache_read),0),
