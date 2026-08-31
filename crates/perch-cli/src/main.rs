@@ -28,6 +28,8 @@ enum Command {
     Usage,
     /// Break usage down by model.
     Models,
+    /// List live Claude Code sessions.
+    Sessions,
 }
 
 fn human_tokens(n: u64) -> String {
@@ -42,6 +44,17 @@ fn human_tokens(n: u64) -> String {
 
 fn human_cost(c: f64) -> String {
     format!("${c:.2}")
+}
+
+fn human_elapsed(ms: i64) -> String {
+    let s = ms.max(0) / 1000;
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else {
+        format!("{}h", s / 3600)
+    }
 }
 
 fn main() -> Result<()> {
@@ -139,6 +152,38 @@ fn main() -> Result<()> {
                 );
             }
         }
+        Command::Sessions => {
+            use perch_core::live::{live_sessions, SessionStatus};
+            use perch_core::platform::RealProcessProbe;
+
+            let probe = RealProcessProbe;
+            let sessions = live_sessions(&config::sessions_dir(&config_dir), &probe);
+            let now = chrono::Utc::now().timestamp_millis();
+
+            if sessions.is_empty() {
+                println!("no live sessions");
+            }
+            println!(
+                "{:<40} {:<10} {:<24} {:>6}",
+                "SESSION", "KIND", "STATUS", "FOR"
+            );
+            for s in sessions {
+                let (label, since) = match &s.status {
+                    SessionStatus::Waiting { reason, since_ms } => (
+                        format!("waiting · {}", reason.as_deref().unwrap_or("unknown")),
+                        *since_ms,
+                    ),
+                    _ => ("working".to_string(), s.status_updated_at),
+                };
+                println!(
+                    "{:<40} {:<10} {:<24} {:>6}",
+                    truncate(&s.name, 38),
+                    s.kind,
+                    truncate(&label, 22),
+                    human_elapsed(now - since),
+                );
+            }
+        }
     }
 
     Ok(())
@@ -170,5 +215,14 @@ mod tests {
         assert_eq!(human_cost(0.0), "$0.00");
         assert_eq!(human_cost(8.204), "$8.20");
         assert_eq!(human_cost(38.0), "$38.00");
+    }
+
+    #[test]
+    fn formats_elapsed_durations_compactly() {
+        assert_eq!(human_elapsed(0), "0s");
+        assert_eq!(human_elapsed(45_000), "45s");
+        assert_eq!(human_elapsed(90_000), "1m");
+        assert_eq!(human_elapsed(3_600_000), "1h");
+        assert_eq!(human_elapsed(115_200_000), "32h");
     }
 }
