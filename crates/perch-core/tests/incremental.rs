@@ -102,6 +102,73 @@ fn reindexing_unchanged_data_is_a_no_op() {
     assert_eq!(db.turn_count().unwrap(), 1);
 }
 
+/// A pass that reads no new bytes yields an all-`None` `SessionMeta`. Those
+/// `None`s must never be written over the values an earlier pass stored —
+/// `cwd` in particular is the only source of a project's real path.
+#[test]
+fn reindexing_unchanged_data_preserves_session_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_session(
+        root,
+        "-Users-a-one",
+        "aaaa",
+        &[assistant("2026-08-18T10:00:00.000Z", "/Users/a/one", 1, 2)],
+    );
+
+    let db = open_in_memory().unwrap();
+    index_all(&db, root).unwrap();
+
+    let first: (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    ) = db
+        .conn()
+        .query_row(
+            "SELECT cwd, git_branch, cc_version, last_activity_at, started_at
+             FROM sessions WHERE id = 'aaaa'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(first.0.as_deref(), Some("/Users/a/one"));
+    assert_eq!(first.1.as_deref(), Some("main"));
+    assert_eq!(first.2.as_deref(), Some("2.1.1"));
+    assert!(first.3.is_some(), "last_activity_at must be set on pass 1");
+    assert!(first.4.is_some(), "started_at must be set on pass 1");
+
+    // A second pass over unchanged bytes.
+    index_all(&db, root).unwrap();
+
+    let second: (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    ) = db
+        .conn()
+        .query_row(
+            "SELECT cwd, git_branch, cc_version, last_activity_at, started_at
+             FROM sessions WHERE id = 'aaaa'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+
+    assert_eq!(second.0, first.0, "cwd must survive a re-index");
+    assert_eq!(second.1, first.1, "git_branch must survive a re-index");
+    assert_eq!(second.2, first.2, "cc_version must survive a re-index");
+    assert_eq!(
+        second.3, first.3,
+        "last_activity_at must survive a re-index"
+    );
+    assert_eq!(second.4, first.4, "started_at must survive a re-index");
+}
+
 #[test]
 fn links_worktrees_to_their_parent_project() {
     let tmp = tempfile::tempdir().unwrap();

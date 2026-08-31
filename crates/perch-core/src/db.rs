@@ -183,9 +183,17 @@ impl Db {
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
              ON CONFLICT(id) DO UPDATE SET
                  project_id = ?2, file_path = ?3, file_size = ?4, indexed_offset = ?5,
+                 -- `started_at` keeps the OLDEST value it has ever seen.
                  started_at = COALESCE(sessions.started_at, ?6),
-                 last_activity_at = ?7, cwd = ?8, git_branch = ?9,
-                 cc_version = ?10, message_count = ?11",
+                 -- The four below keep the LAST value they have ever seen: a pass
+                 -- that read no new bytes yields an all-`None` SessionMeta, and a
+                 -- bare assignment would null out perfectly good stored values on
+                 -- every re-index.
+                 last_activity_at = COALESCE(?7, sessions.last_activity_at),
+                 cwd              = COALESCE(?8, sessions.cwd),
+                 git_branch       = COALESCE(?9, sessions.git_branch),
+                 cc_version       = COALESCE(?10, sessions.cc_version),
+                 message_count = ?11",
             params![
                 s.id,
                 s.project_id,
