@@ -6,6 +6,7 @@ pub mod discovery;
 pub mod index;
 pub mod live;
 pub mod model;
+pub mod platform;
 pub mod pricing;
 pub mod query;
 pub mod scan;
