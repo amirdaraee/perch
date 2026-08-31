@@ -57,6 +57,18 @@ fn human_elapsed(ms: i64) -> String {
     }
 }
 
+/// A non-positive `since` means the record carried no timestamp at all (e.g.
+/// a just-started session with no `statusUpdatedAt` yet) — that is "no data",
+/// not "zero elapsed", so it must not be handed to `human_elapsed` as a
+/// duration.
+fn elapsed_or_dash(now: i64, since: i64) -> String {
+    if since <= 0 {
+        "—".to_string()
+    } else {
+        human_elapsed(now - since)
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -173,6 +185,8 @@ fn main() -> Result<()> {
                         format!("waiting · {}", reason.as_deref().unwrap_or("unknown")),
                         *since_ms,
                     ),
+                    SessionStatus::Idle => ("idle".to_string(), s.status_updated_at),
+                    SessionStatus::Working => ("working".to_string(), s.status_updated_at),
                     _ => ("working".to_string(), s.status_updated_at),
                 };
                 println!(
@@ -180,7 +194,7 @@ fn main() -> Result<()> {
                     truncate(&s.name, 38),
                     s.kind,
                     truncate(&label, 22),
-                    human_elapsed(now - since),
+                    elapsed_or_dash(now, since),
                 );
             }
         }
@@ -224,5 +238,19 @@ mod tests {
         assert_eq!(human_elapsed(90_000), "1m");
         assert_eq!(human_elapsed(3_600_000), "1h");
         assert_eq!(human_elapsed(115_200_000), "32h");
+    }
+
+    #[test]
+    fn a_missing_timestamp_is_a_dash_not_a_giant_duration() {
+        let now = 1_000_000_000;
+        assert_eq!(elapsed_or_dash(now, 0), "—");
+        assert_eq!(elapsed_or_dash(now, -5), "—");
+    }
+
+    #[test]
+    fn a_real_timestamp_formats_the_same_as_human_elapsed() {
+        let now = 1_000_000_000;
+        let since = now - 45_000;
+        assert_eq!(elapsed_or_dash(now, since), human_elapsed(now - since));
     }
 }
