@@ -160,19 +160,42 @@ behind and pids are recycled:
 
 1. The record file exists.
 2. `kill(pid, 0)` succeeds.
-3. The process command line contains the matching `--session-id`.
+3. The process command line identifies it as a Claude Code process.
 
-The socket at `messagingSocketPath` is a supporting signal. Failing the checks marks the
-session ended and moves it to history.
+The socket at `messagingSocketPath` is a supporting fourth signal. Failing the checks marks
+the session ended and moves it to history.
+
+> **Corrected 2026-08-31 against real data.** Confirmation 3 originally read "the process
+> command line contains the matching `--session-id`". That is false for **interactive**
+> sessions: on Claude Code 2.1.251 they show only `claude --dangerously-skip-permissions`,
+> with no session id anywhere on argv. Only daemon-spawned `kind: bg` sessions carry
+> `--session-id`. The original rule filtered out every interactive session — that is, almost
+> everything the user cares about.
+>
+> Matching on the session id is also unnecessary, because **records are keyed by pid**
+> (`<pid>.json`). A new session landing on a recycled pid overwrites the stale record rather
+> than coexisting with it, so two records can never claim one pid. The only residual hazard is
+> a pid recycled by a *non-Claude* process, which "is a Claude Code process" fully excludes.
+>
+> A stronger check remains available if ever needed: the record carries `procStart`, which can
+> be compared against the process's actual start time. It is deferred because it requires
+> timezone normalisation (the record's `procStart` is offset from `ps -o lstart=` by the local
+> UTC offset) for no benefit the pid-keying argument does not already provide.
 
 **Status model**
 
 | State | Source | Presentation |
 |---|---|---|
 | Working | `status: busy` | green |
+| Idle | `status: idle` | dim green — alive but not currently doing anything |
 | Waiting on you | `status: waiting` | amber, with `waitingFor` reason and elapsed time from `statusUpdatedAt` |
 | Background | `kind: bg` | grouped separately so long jobs do not nag |
 | Ended | liveness failed | grey, resumable |
+
+> **`idle` added 2026-08-31 against real data.** The spec originally listed only `busy` and
+> `waiting`; real records also carry `status: "idle"`. Mapping it to Working would paint an
+> idle session green as though it were mid-task. Any *further* unrecognised status still falls
+> back to Working rather than inventing a state.
 
 ## 8. Usage and limits
 
