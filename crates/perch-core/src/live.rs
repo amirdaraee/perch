@@ -95,6 +95,28 @@ pub fn record_files(sessions_dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+use crate::platform::ProcessProbe;
+
+/// Read every session record and keep only those passing all three confirmations
+/// from spec §7. Blocked sessions sort first — they are the ones needing you.
+pub fn live_sessions(sessions_dir: &Path, probe: &dyn ProcessProbe) -> Vec<LiveSession> {
+    let mut out: Vec<LiveSession> = record_files(sessions_dir)
+        .into_iter()
+        .filter_map(|p| std::fs::read_to_string(&p).ok())
+        .filter_map(|s| parse_session_record(&s))
+        .filter(|s| probe.is_alive(s.pid) && probe.cmdline_contains(s.pid, &s.session_id))
+        .collect();
+
+    out.sort_by(|a, b| {
+        let rank = |s: &LiveSession| match s.status {
+            SessionStatus::Waiting { .. } => 0,
+            _ => 1,
+        };
+        rank(a).cmp(&rank(b)).then_with(|| a.name.cmp(&b.name))
+    });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,5 +265,103 @@ mod tests {
                 "status must be derived from `status` alone, never from `kind` ({kind}/{status})"
             );
         }
+    }
+
+    use crate::platform::ProcessProbe;
+    use std::collections::HashSet;
+
+    /// Fake probe so liveness rules are unit-testable without real processes.
+    struct FakeProbe {
+        alive: HashSet<i32>,
+        cmdlines: std::collections::HashMap<i32, String>,
+    }
+
+    impl FakeProbe {
+        fn new(alive: &[i32]) -> Self {
+            Self {
+                alive: alive.iter().copied().collect(),
+                cmdlines: Default::default(),
+            }
+        }
+        fn with_cmdline(mut self, pid: i32, line: &str) -> Self {
+            self.cmdlines.insert(pid, line.to_string());
+            self
+        }
+    }
+
+    impl ProcessProbe for FakeProbe {
+        fn is_alive(&self, pid: i32) -> bool {
+            self.alive.contains(&pid)
+        }
+        fn cmdline_contains(&self, pid: i32, needle: &str) -> bool {
+            self.cmdlines.get(&pid).is_some_and(|l| l.contains(needle))
+        }
+    }
+
+    fn write_record(dir: &Path, pid: i32, session_id: &str, status: &str) {
+        let json = format!(
+            r#"{{"pid":{pid},"sessionId":"{session_id}","cwd":"/tmp/p","name":"n","kind":"interactive","status":"{status}","startedAt":1,"statusUpdatedAt":2}}"#
+        );
+        std::fs::write(dir.join(format!("{pid}.json")), json).unwrap();
+    }
+
+    #[test]
+    fn a_session_needs_all_three_confirmations() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_record(tmp.path(), 100, "alive-and-matching", "busy");
+
+        let probe =
+            FakeProbe::new(&[100]).with_cmdline(100, "claude --session-id alive-and-matching");
+        assert_eq!(live_sessions(tmp.path(), &probe).len(), 1);
+    }
+
+    #[test]
+    fn a_dead_pid_is_not_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_record(tmp.path(), 101, "dead", "busy");
+        let probe = FakeProbe::new(&[]).with_cmdline(101, "claude --session-id dead");
+        assert!(
+            live_sessions(tmp.path(), &probe).is_empty(),
+            "stale record must not resurrect"
+        );
+    }
+
+    #[test]
+    fn a_recycled_pid_running_something_else_is_not_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_record(tmp.path(), 102, "ours", "busy");
+        // pid is alive, but it is now some unrelated process
+        let probe = FakeProbe::new(&[102]).with_cmdline(102, "/usr/bin/python3 unrelated.py");
+        assert!(
+            live_sessions(tmp.path(), &probe).is_empty(),
+            "pid reuse must not be reported as a live session"
+        );
+    }
+
+    #[test]
+    fn live_sessions_are_sorted_waiting_first_then_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_record(tmp.path(), 200, "b-working", "busy");
+        write_record(tmp.path(), 201, "a-waiting", "waiting");
+
+        let probe = FakeProbe::new(&[200, 201])
+            .with_cmdline(200, "claude --session-id b-working")
+            .with_cmdline(201, "claude --session-id a-waiting");
+
+        let out = live_sessions(tmp.path(), &probe);
+        assert_eq!(out.len(), 2);
+        assert_eq!(
+            out[0].session_id, "a-waiting",
+            "blocked sessions surface first"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_record_is_skipped_not_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("bad.json"), "{ not json").unwrap();
+        write_record(tmp.path(), 300, "good", "busy");
+        let probe = FakeProbe::new(&[300]).with_cmdline(300, "claude --session-id good");
+        assert_eq!(live_sessions(tmp.path(), &probe).len(), 1);
     }
 }
