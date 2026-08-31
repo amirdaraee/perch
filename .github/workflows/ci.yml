@@ -65,3 +65,73 @@ jobs:
           fi
 
           echo "no HTTP client or telemetry dependencies found (manifests, workspace root, and lockfile)"
+
+      - name: Assert no hand-rolled sockets in the source
+        run: |
+          set -uo pipefail
+
+          # A dependency audit alone cannot see a socket opened with std::net,
+          # which needs no dependency at all. Spec 10 promises a dependency AND
+          # source audit; this is the source half.
+          SOCKETS='std::net|TcpStream|UdpSocket|TcpListener'
+
+          # Positive control: the pattern must actually detect a known offender.
+          printf 'let s = TcpStream::connect("example.com:80")?;\n' > /tmp/socket-selftest.rs
+          if ! grep -qE "$SOCKETS" /tmp/socket-selftest.rs; then
+            echo "::error::Guard self-test failed: the socket pattern no longer detects a known offender."
+            exit 1
+          fi
+
+          if find crates -path 'crates/*/src/*' -name '*.rs' -print0 \
+             | xargs -0 grep -nE "$SOCKETS"; then
+            echo "::error::A raw socket appears in the source. The data layer makes no outbound requests."
+            exit 1
+          fi
+
+          echo "no raw sockets found in crates/*/src"
+
+      - name: Assert perch-core never writes to the filesystem
+        run: |
+          set -uo pipefail
+
+          # The README's other headline promise: Perch never writes to, moves, or
+          # deletes anything in your Claude Code directory. perch-core is the only
+          # crate that touches that directory, so it must hold no writing API.
+          #
+          # `create_dir_all` is deliberately NOT in this list, and db.rs is
+          # deliberately excluded: db.rs creates the parent directory of Perch's
+          # OWN index database and opens that database, which is Perch's file, not
+          # Claude Code's. Every other module must be write-free.
+          WRITES='fs::write|fs::remove_file|fs::remove_dir|File::create|OpenOptions'
+
+          # Only the production half of each file is audited. Test modules write
+          # fixtures into a tempdir, which is legitimate and never ships; `prod`
+          # cuts each file at its `#[cfg(test)]` line.
+          prod() { awk '/^#\[cfg\(test\)\]/{exit} {print FILENAME ":" FNR ": " $0}' "$1"; }
+
+          # Positive control, through the very same `prod` + grep path the real
+          # check uses, so a break in either half fails here first.
+          printf 'fn main() { fs::write("/tmp/x", "y").unwrap(); }\n' > /tmp/write-selftest.rs
+          if ! prod /tmp/write-selftest.rs | grep -qE "$WRITES"; then
+            echo "::error::Guard self-test failed: the write pattern no longer detects a known offender."
+            exit 1
+          fi
+          # And the exclusion itself must work: a match below #[cfg(test)] is ignored.
+          printf '#[cfg(test)]\nmod tests { fs::write("/tmp/x", "y"); }\n' > /tmp/write-selftest-cfg.rs
+          if prod /tmp/write-selftest-cfg.rs | grep -qE "$WRITES"; then
+            echo "::error::Guard self-test failed: the #[cfg(test)] exclusion is not excluding."
+            exit 1
+          fi
+
+          offenders=0
+          for f in $(find crates/perch-core/src -name '*.rs' ! -name 'db.rs'); do
+            if prod "$f" | grep -E "$WRITES"; then
+              offenders=1
+            fi
+          done
+          if [ "$offenders" -ne 0 ]; then
+            echo "::error::perch-core gained a filesystem-writing call. Perch is read-only with respect to ~/.claude."
+            exit 1
+          fi
+
+          echo "no filesystem writes found in perch-core (db.rs excluded: it creates Perch's own database)"
