@@ -6,3 +6,4 @@ dist/
 *.db
 Cargo.lock.orig
 .DS_Store
+src-tauri/gen/schemas/
