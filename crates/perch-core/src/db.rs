@@ -204,15 +204,17 @@ impl Db {
     }
 
     pub fn session_offset(&self, session_id: &str) -> Result<u64> {
-        let v: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT indexed_offset FROM sessions WHERE id = ?1",
-                params![session_id],
-                |r| r.get(0),
-            )
-            .ok();
-        Ok(v.unwrap_or(0).max(0) as u64)
+        let found = self.conn.query_row(
+            "SELECT indexed_offset FROM sessions WHERE id = ?1",
+            params![session_id],
+            |r| r.get::<_, i64>(0),
+        );
+        match found {
+            Ok(v) => Ok(v.max(0) as u64),
+            // Never scanned before — the normal first-pass signal.
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn insert_turns(&self, session_id: &str, turns: &[Turn]) -> Result<()> {
@@ -270,15 +272,17 @@ impl Db {
     }
 
     pub fn session_message_count(&self, session_id: &str) -> Result<u64> {
-        let v: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT message_count FROM sessions WHERE id = ?1",
-                params![session_id],
-                |r| r.get(0),
-            )
-            .ok();
-        Ok(v.unwrap_or(0).max(0) as u64)
+        let found = self.conn.query_row(
+            "SELECT message_count FROM sessions WHERE id = ?1",
+            params![session_id],
+            |r| r.get::<_, i64>(0),
+        );
+        match found {
+            Ok(v) => Ok(v.max(0) as u64),
+            // Never scanned before — the normal first-pass signal.
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Used when a transcript was truncated or replaced and must be rescanned

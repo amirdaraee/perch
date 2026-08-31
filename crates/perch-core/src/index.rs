@@ -42,7 +42,13 @@ pub fn index_all(db: &Db, projects_root: &Path) -> Result<IndexStats> {
                 continue;
             };
             let offset = db.session_offset(session_id)?;
-            let file_size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+            let file_size = match std::fs::metadata(file) {
+                Ok(m) => m.len(),
+                // Cannot stat the file: skip this session entirely and leave any
+                // previously indexed data untouched. A stat failure must never be
+                // mistaken for a shrink, which would delete stored turns.
+                Err(_) => continue,
+            };
 
             // `scan_from` restarts at 0 when the file shrank. The already-stored
             // turns for this session are then stale duplicates and must be dropped,
