@@ -19,7 +19,7 @@
 - **No transcript contents** may be rendered, logged, or emitted — only paths, counts, totals, model names, session names, and status strings.
 - Rust edition 2021; `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all -- --check` must pass.
 - **`perch-core` must keep compiling and testing on Linux.** OS-bound behaviour goes behind traits (spec §4.1); only `src-tauri` and the trait implementations may be macOS-specific.
-- **Liveness requires three confirmations** (spec §7): record exists, `kill(pid, 0)` succeeds, and the process command line contains the matching `--session-id`. Two are not enough — pids are recycled.
+- **Liveness requires three confirmations** (spec §7, corrected 2026-08-31): record exists, `kill(pid, 0)` succeeds, and the process's executable name is `claude`. NOT `--session-id` — interactive sessions do not carry it on argv. Records are keyed by pid, so a recycled pid overwrites the stale record; the residual hazard is only a *non-Claude* process inheriting the pid, which the executable-name check excludes.
 - Status comes from the `status`/`waitingFor` fields Claude Code publishes. **Never infer status from file mtimes.**
 - License MIT; `.superpowers/` stays git-ignored.
 
@@ -74,7 +74,7 @@ src/                   # frontend
 **Interfaces:**
 - Consumes: `config::sessions_dir`.
 - Produces:
-  - `pub enum SessionStatus { Working, Waiting { reason: Option<String>, since_ms: i64 }, Background, Ended }`
+  - `pub enum SessionStatus { Working, Idle, Waiting { reason: Option<String>, since_ms: i64 }, Background, Ended }`
   - `pub struct LiveSession { pub pid: i32, pub session_id: String, pub cwd: String, pub name: String, pub kind: String, pub status: SessionStatus, pub started_at: i64, pub status_updated_at: i64, pub cc_version: Option<String>, pub socket_path: Option<String> }`
   - `pub fn parse_session_record(json: &str) -> Option<LiveSession>`
   - `pub fn record_files(sessions_dir: &Path) -> Vec<PathBuf>`
@@ -310,7 +310,7 @@ git commit -m "feat(core): parse live session records with published status"
 **Interfaces:**
 - Consumes: `live::{LiveSession, parse_session_record, record_files}`.
 - Produces:
-  - `pub trait ProcessProbe: Send + Sync { fn is_alive(&self, pid: i32) -> bool; fn cmdline_contains(&self, pid: i32, needle: &str) -> bool; }`
+  - `pub trait ProcessProbe: Send + Sync { fn is_alive(&self, pid: i32) -> bool; fn process_name(&self, pid: i32) -> Option<String>; }`
   - `pub struct RealProcessProbe;` implementing it
   - `pub fn live_sessions(sessions_dir: &Path, probe: &dyn ProcessProbe) -> Vec<LiveSession>`
 
@@ -1273,6 +1273,7 @@ Create `src/types.ts`:
 ```ts
 export type SessionStatus =
   | { kind: 'working' }
+  | { kind: 'idle' }
   | { kind: 'waiting'; reason: string | null; sinceMs: number }
   | { kind: 'background' }
   | { kind: 'ended' }
@@ -1351,7 +1352,12 @@ import type { LiveSession, UsageSummary } from './types'
 import { cost, elapsed, tokens } from './format'
 
 function StatusDot({ s }: { s: LiveSession }) {
-  const cls = s.status.kind === 'waiting' ? 'dot y' : s.kind === 'bg' ? 'dot w' : 'dot g'
+  // 'idle' is a real status Claude Code publishes — dim green, not the same as working.
+  const cls =
+    s.status.kind === 'waiting' ? 'dot y'
+    : s.kind === 'bg' ? 'dot w'
+    : s.status.kind === 'idle' ? 'dot gi'
+    : 'dot g'
   return <span className={cls} />
 }
 
