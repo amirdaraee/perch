@@ -118,15 +118,18 @@ mod tests {
             cache_write_per_mtok: 12.5,
         };
         let u = TurnUsage {
-            input: 1_000_000,
+            input: 2_000_000,
             output: 1_000_000,
-            cache_read: 1_000_000,
-            cache_write_5m: 500_000,
-            cache_write_1h: 500_000,
+            cache_read: 400_000,
+            cache_write_5m: 60_000,
+            cache_write_1h: 40_000,
             thinking: 900_000,
         };
-        // 10 + 50 + 1 + 12.5 = 73.5 ; thinking must not add anything
-        assert!((cost_usd(&p, &u) - 73.5).abs() < 1e-9);
+        // Each class has a distinct token count, so a misassigned rate (e.g. swapping
+        // input and cache_read) would change the total: 20 + 50 + 0.4 + 1.25 = 71.65.
+        // cache_write_5m/1h are uneven (60k/40k) to prove cache_write_total() sums both
+        // buckets rather than reading just one. thinking (900_000) must not add anything.
+        assert!((cost_usd(&p, &u) - 71.65).abs() < 1e-9);
     }
 
     #[test]
