@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  no-network:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert no HTTP client dependencies in the data layer
+        run: |
+          set -euo pipefail
+          if grep -rEn '^(reqwest|hyper|ureq|curl|isahc|surf)\s*=' crates/*/Cargo.toml; then
+            echo "::error::An HTTP client was added. The data layer must make no outbound requests."
+            exit 1
+          fi
+          echo "no HTTP client dependencies found"
+      - name: Assert no telemetry or analytics dependencies
+        run: |
+          set -euo pipefail
+          if grep -rEni '(sentry|posthog|segment|mixpanel|datadog|analytics)' crates/*/Cargo.toml; then
+            echo "::error::Telemetry dependency detected. Perch ships no telemetry."
+            exit 1
+          fi
+          echo "no telemetry dependencies found"
