@@ -1751,7 +1751,7 @@ pub mod db;
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `cargo test -p perch-core db`
-Expected: PASS, 9 tests.
+Expected: PASS, 8 tests.
 
 - [ ] **Step 6: Commit**
 
