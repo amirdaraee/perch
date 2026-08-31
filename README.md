@@ -29,6 +29,12 @@ Your transcripts contain source code, pasted secrets, and client names. So:
 
 Requires [Rust](https://rustup.rs).
 
+> **Reported totals are a floor, not a total.** Perch currently indexes only the top-level
+> `*.jsonl` transcripts in each project directory. Subagent transcripts, which live under
+> `<session-id>/subagents/`, are not yet indexed even though that work is billed separately —
+> so your real usage is higher than anything the commands below report, sometimes
+> substantially.
+
 ```bash
 cargo run --release -p perch-cli -- index
 cargo run --release -p perch-cli -- projects
