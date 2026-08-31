@@ -26,19 +26,42 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Assert no HTTP client dependencies in the data layer
+      - name: Assert no HTTP client or telemetry dependencies
         run: |
-          set -euo pipefail
-          if grep -rEn '^(reqwest|hyper|ureq|curl|isahc|surf)\s*=' crates/*/Cargo.toml; then
+          set -uo pipefail
+
+          HTTP='^(reqwest|hyper|ureq|curl|isahc|surf)\b'
+          TELEMETRY='^(sentry|posthog|segment|mixpanel|datadog|analytics)\b'
+          LOCKED='^name = "(reqwest|hyper|ureq|curl|isahc|surf|sentry|posthog|segment|mixpanel|datadog)"'
+
+          # Positive control: the patterns must actually detect a known offender.
+          # Without this, a future edit that breaks the regex would pass silently forever —
+          # which is exactly the failure this guard was found to have.
+          printf 'reqwest.workspace = true\n' > /tmp/guard-selftest.toml
+          if ! grep -qE "$HTTP" /tmp/guard-selftest.toml; then
+            echo "::error::Guard self-test failed: the HTTP pattern no longer detects a known offender."
+            exit 1
+          fi
+          printf 'name = "reqwest"\n' > /tmp/guard-selftest.lock
+          if ! grep -qE "$LOCKED" /tmp/guard-selftest.lock; then
+            echo "::error::Guard self-test failed: the lockfile pattern no longer detects a known offender."
+            exit 1
+          fi
+
+          # Manifests: matches both `dep = "1"` and `dep.workspace = true`.
+          if grep -rEn "$HTTP" Cargo.toml crates/*/Cargo.toml; then
             echo "::error::An HTTP client was added. The data layer must make no outbound requests."
             exit 1
           fi
-          echo "no HTTP client dependencies found"
-      - name: Assert no telemetry or analytics dependencies
-        run: |
-          set -euo pipefail
-          if grep -rEni '(sentry|posthog|segment|mixpanel|datadog|analytics)' crates/*/Cargo.toml; then
+          if grep -rEni "$TELEMETRY" Cargo.toml crates/*/Cargo.toml; then
             echo "::error::Telemetry dependency detected. Perch ships no telemetry."
             exit 1
           fi
-          echo "no telemetry dependencies found"
+
+          # Lockfile: catches transitive pulls that no manifest names.
+          if grep -En "$LOCKED" Cargo.lock; then
+            echo "::error::A forbidden crate appears in the resolved dependency graph."
+            exit 1
+          fi
+
+          echo "no HTTP client or telemetry dependencies found (manifests, workspace root, and lockfile)"
