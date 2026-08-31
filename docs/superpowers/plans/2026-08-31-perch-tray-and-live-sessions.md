@@ -1259,6 +1259,11 @@ git commit -m "feat(app): watch session records and emit live updates"
 
 ## Task 8: The dense popover UI
 
+> **Tighten the CSP in this task.** `tauri.conf.json` ships `"csp": null` from the scaffold,
+> which was fine for an empty window. This task is where real session data — names, cwds,
+> statuses authored elsewhere — first renders. Set a same-origin policy (`"default-src 'self'"`)
+> as part of this task and confirm the popover still loads under it.
+
 **Files:**
 - Create: `src/types.ts`, `src/api.ts`, `src/format.ts`
 - Modify: `src/App.tsx`, `src/styles.css`
@@ -1519,6 +1524,15 @@ Add a job to `.github/workflows/ci.yml` that builds the app on macOS:
 Keep the existing `test` and `no-network` jobs unchanged. **Verify the `no-network` job's file globs still cover the new `src-tauri` crate** — its guard scans `Cargo.toml crates/*/Cargo.toml`, which does not include `src-tauri/Cargo.toml`. Extend those globs to include it, and extend the source-audit globs to cover `src-tauri/src/**` as well. Add a positive-control self-test for the new coverage, matching the existing style.
 
 This matters: `src-tauri` is exactly where an HTTP client would plausibly be added first.
+
+**Be specific about the gap being closed.** The existing manifest regex scans only
+`Cargo.toml crates/*/Cargo.toml`, and the source audit walks only `crates/*/src/*.rs`. So today:
+a *named* crate (`reqwest`, `sentry`) added to `src-tauri/Cargo.toml` is caught only indirectly,
+by the `Cargo.lock` scan, and only while the committed lockfile is in sync — the no-network job
+never builds, so a manifest edit with a stale lockfile slips through. A **hand-rolled socket**
+(`std::net`, `TcpStream`) written directly in `src-tauri/src/` is caught by **nothing at all**.
+Both globs must grow to include `src-tauri`, and the positive-control self-tests must cover the
+new coverage the same way they cover the old.
 
 - [ ] **Step 3: Verify locally**
 
