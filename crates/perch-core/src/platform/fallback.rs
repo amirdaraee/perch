@@ -10,7 +10,7 @@ impl ProcessProbe for RealProcessProbe {
     fn is_alive(&self, _pid: i32) -> bool {
         false
     }
-    fn cmdline_contains(&self, _pid: i32, _needle: &str) -> bool {
-        false
+    fn process_name(&self, _pid: i32) -> Option<String> {
+        None
     }
 }

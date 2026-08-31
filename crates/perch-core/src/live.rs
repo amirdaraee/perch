@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 )]
 pub enum SessionStatus {
     Working,
+    Idle,
     Waiting {
         reason: Option<String>,
         since_ms: i64,
@@ -64,6 +65,7 @@ pub fn parse_session_record(json: &str) -> Option<LiveSession> {
             reason: str_at(&v, "waitingFor"),
             since_ms: status_updated_at,
         },
+        Some("idle") => SessionStatus::Idle,
         // "busy" and anything unrecognised: treat as working rather than
         // inventing a state. A future status string must not break the UI.
         _ => SessionStatus::Working,
@@ -104,7 +106,7 @@ pub fn live_sessions(sessions_dir: &Path, probe: &dyn ProcessProbe) -> Vec<LiveS
         .into_iter()
         .filter_map(|p| std::fs::read_to_string(&p).ok())
         .filter_map(|s| parse_session_record(&s))
-        .filter(|s| probe.is_alive(s.pid) && probe.cmdline_contains(s.pid, &s.session_id))
+        .filter(|s| probe.is_alive(s.pid) && probe.process_name(s.pid).as_deref() == Some("claude"))
         .collect();
 
     out.sort_by(|a, b| {
@@ -169,6 +171,13 @@ mod tests {
     }
 
     #[test]
+    fn idle_status_parses_to_the_idle_variant() {
+        let line = r#"{"pid":1,"sessionId":"x","cwd":"/tmp","name":"n","kind":"interactive","status":"idle","startedAt":1,"statusUpdatedAt":2}"#;
+        let s = parse_session_record(line).unwrap();
+        assert_eq!(s.status, SessionStatus::Idle);
+    }
+
+    #[test]
     fn missing_optional_fields_are_tolerated() {
         let line = r#"{"pid":2,"sessionId":"y","cwd":"/tmp","name":"n","kind":"interactive","status":"busy","startedAt":1,"statusUpdatedAt":2}"#;
         let s = parse_session_record(line).unwrap();
@@ -221,6 +230,9 @@ mod tests {
 
         let working = serde_json::to_value(SessionStatus::Working).unwrap();
         assert_eq!(working["kind"], "working");
+
+        let idle = serde_json::to_value(SessionStatus::Idle).unwrap();
+        assert_eq!(idle["kind"], "idle");
     }
 
     #[test]
@@ -273,18 +285,18 @@ mod tests {
     /// Fake probe so liveness rules are unit-testable without real processes.
     struct FakeProbe {
         alive: HashSet<i32>,
-        cmdlines: std::collections::HashMap<i32, String>,
+        names: std::collections::HashMap<i32, String>,
     }
 
     impl FakeProbe {
         fn new(alive: &[i32]) -> Self {
             Self {
                 alive: alive.iter().copied().collect(),
-                cmdlines: Default::default(),
+                names: Default::default(),
             }
         }
-        fn with_cmdline(mut self, pid: i32, line: &str) -> Self {
-            self.cmdlines.insert(pid, line.to_string());
+        fn with_name(mut self, pid: i32, name: &str) -> Self {
+            self.names.insert(pid, name.to_string());
             self
         }
     }
@@ -293,8 +305,8 @@ mod tests {
         fn is_alive(&self, pid: i32) -> bool {
             self.alive.contains(&pid)
         }
-        fn cmdline_contains(&self, pid: i32, needle: &str) -> bool {
-            self.cmdlines.get(&pid).is_some_and(|l| l.contains(needle))
+        fn process_name(&self, pid: i32) -> Option<String> {
+            self.names.get(&pid).cloned()
         }
     }
 
@@ -310,8 +322,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_record(tmp.path(), 100, "alive-and-matching", "busy");
 
-        let probe =
-            FakeProbe::new(&[100]).with_cmdline(100, "claude --session-id alive-and-matching");
+        let probe = FakeProbe::new(&[100]).with_name(100, "claude");
         assert_eq!(live_sessions(tmp.path(), &probe).len(), 1);
     }
 
@@ -319,7 +330,7 @@ mod tests {
     fn a_dead_pid_is_not_live() {
         let tmp = tempfile::tempdir().unwrap();
         write_record(tmp.path(), 101, "dead", "busy");
-        let probe = FakeProbe::new(&[]).with_cmdline(101, "claude --session-id dead");
+        let probe = FakeProbe::new(&[]).with_name(101, "claude");
         assert!(
             live_sessions(tmp.path(), &probe).is_empty(),
             "stale record must not resurrect"
@@ -331,10 +342,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         write_record(tmp.path(), 102, "ours", "busy");
         // pid is alive, but it is now some unrelated process
-        let probe = FakeProbe::new(&[102]).with_cmdline(102, "/usr/bin/python3 unrelated.py");
+        let probe = FakeProbe::new(&[102]).with_name(102, "python3");
         assert!(
             live_sessions(tmp.path(), &probe).is_empty(),
             "pid reuse must not be reported as a live session"
+        );
+    }
+
+    #[test]
+    fn a_process_whose_path_merely_contains_claude_is_not_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_record(tmp.path(), 103, "not-claude", "busy");
+        // pid is alive, but comm= reports it is actually vim, not claude
+        let probe = FakeProbe::new(&[103]).with_name(103, "vim");
+        assert!(
+            live_sessions(tmp.path(), &probe).is_empty(),
+            "a process name that is merely similar to claude must not match"
         );
     }
 
@@ -345,8 +368,8 @@ mod tests {
         write_record(tmp.path(), 201, "a-waiting", "waiting");
 
         let probe = FakeProbe::new(&[200, 201])
-            .with_cmdline(200, "claude --session-id b-working")
-            .with_cmdline(201, "claude --session-id a-waiting");
+            .with_name(200, "claude")
+            .with_name(201, "claude");
 
         let out = live_sessions(tmp.path(), &probe);
         assert_eq!(out.len(), 2);
@@ -361,7 +384,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("bad.json"), "{ not json").unwrap();
         write_record(tmp.path(), 300, "good", "busy");
-        let probe = FakeProbe::new(&[300]).with_cmdline(300, "claude --session-id good");
+        let probe = FakeProbe::new(&[300]).with_name(300, "claude");
         assert_eq!(live_sessions(tmp.path(), &probe).len(), 1);
     }
 }
