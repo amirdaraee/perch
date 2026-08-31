@@ -5,12 +5,17 @@ use tauri::{
 };
 
 fn toggle_popover(app: &tauri::AppHandle) {
+    use tauri_plugin_positioner::{Position, WindowExt};
+
     let Some(win) = app.get_webview_window("popover") else {
         return;
     };
     if win.is_visible().unwrap_or(false) {
         let _ = win.hide();
     } else {
+        // Anchor under the menu-bar item. Must precede show(), or the window is
+        // briefly painted centre-screen and then jumps.
+        let _ = win.move_window(Position::TrayBottomCenter);
         let _ = win.show();
         let _ = win.set_focus();
     }
@@ -18,6 +23,7 @@ fn toggle_popover(app: &tauri::AppHandle) {
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_positioner::init())
         .setup(|app| {
             // Menu-bar app: no Dock icon, no app switcher entry.
             #[cfg(target_os = "macos")]
@@ -45,6 +51,9 @@ pub fn run() {
                     }
                 })
                 .on_tray_icon_event(|tray, event| {
+                    // Must run for every event, not just left-clicks — the
+                    // plugin needs the position updates to anchor correctly.
+                    tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
@@ -62,6 +71,11 @@ pub fn run() {
             // Closing the popover must not quit the app — Perch lives in the tray.
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
+                let _ = window.hide();
+            }
+            // A popover that outlives its focus is just a window. Clicking
+            // away dismisses it.
+            if let WindowEvent::Focused(false) = event {
                 let _ = window.hide();
             }
         })
