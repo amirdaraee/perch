@@ -542,7 +542,7 @@ In `crates/perch-core/src/lib.rs`, add `pub mod platform;` in alphabetical posit
 - [ ] **Step 7: Run tests to verify they pass**
 
 Run: `source "$HOME/.cargo/env" && cargo test -p perch-core live`
-Expected: PASS, 13 tests (8 from Task 1 plus 5 new).
+Expected: PASS, 16 tests (11 from Task 1 — which grew from 8 in its fix round — plus 5 new).
 
 - [ ] **Step 8: Verify against the real machine**
 
