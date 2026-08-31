@@ -14,6 +14,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 perch-core = { path = "../crates/perch-core" }
 tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
