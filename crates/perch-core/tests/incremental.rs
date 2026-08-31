@@ -216,3 +216,87 @@ fn user_notes_survive_a_reindex() {
     index_all(&db, root).unwrap();
     assert_eq!(db.note(id).unwrap().as_deref(), Some("where I left off"));
 }
+
+#[test]
+fn a_vanished_transcript_does_not_delete_its_indexed_turns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_session(
+        root,
+        "-Users-a-one",
+        "aaaa",
+        &[
+            assistant("2026-08-18T10:00:00.000Z", "/Users/a/one", 1, 2),
+            assistant("2026-08-18T10:01:00.000Z", "/Users/a/one", 3, 4),
+        ],
+    );
+
+    let db = open_in_memory().unwrap();
+    index_all(&db, root).unwrap();
+    assert_eq!(db.turn_count().unwrap(), 2);
+
+    fs::remove_file(root.join("-Users-a-one").join("aaaa.jsonl")).unwrap();
+
+    index_all(&db, root).unwrap();
+    assert_eq!(
+        db.turn_count().unwrap(),
+        2,
+        "a session that can no longer be read must not lose its already-indexed turns"
+    );
+    let session_count: i64 = db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM sessions WHERE id = 'aaaa'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(session_count, 1, "the session row itself must survive too");
+}
+
+#[test]
+fn one_unreadable_session_does_not_stop_other_projects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_session(
+        root,
+        "-Users-a-one",
+        "aaaa",
+        &[assistant("2026-08-18T10:00:00.000Z", "/Users/a/one", 1, 2)],
+    );
+    write_session(
+        root,
+        "-Users-a-two",
+        "bbbb",
+        &[assistant("2026-08-18T10:00:00.000Z", "/Users/a/two", 3, 4)],
+    );
+    // A third session file that exists but cannot be opened for reading.
+    write_session(
+        root,
+        "-Users-a-one",
+        "cccc",
+        &[assistant("2026-08-18T10:00:00.000Z", "/Users/a/one", 5, 6)],
+    );
+    {
+        let unreadable = root.join("-Users-a-one").join("cccc.jsonl");
+        let mut perms = fs::metadata(&unreadable).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
+        fs::set_permissions(&unreadable, perms).unwrap();
+    }
+
+    let db = open_in_memory().unwrap();
+    let result = index_all(&db, root);
+
+    // Restore permissions so the tempdir can be cleaned up.
+    {
+        let unreadable = root.join("-Users-a-one").join("cccc.jsonl");
+        let mut perms = fs::metadata(&unreadable).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o644);
+        fs::set_permissions(&unreadable, perms).unwrap();
+    }
+
+    result.unwrap();
+    assert_eq!(
+        db.turn_count().unwrap(),
+        2,
+        "the other two projects' sessions must still be indexed"
+    );
+}
