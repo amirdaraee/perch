@@ -15,6 +15,11 @@ pub struct IndexStats {
     pub new_turns: usize,
     pub bytes_read: u64,
     pub lines_skipped: u64,
+    /// Sessions the pass could not read at all — a stat failure, a permission
+    /// error, or a file that vanished mid-pass. Such a session contributes to no
+    /// total, so without this counter it would disappear from the report with no
+    /// signal anywhere that anything was missed.
+    pub sessions_skipped: usize,
 }
 
 pub fn index_all(db: &Db, projects_root: &Path) -> Result<IndexStats> {
@@ -47,21 +52,28 @@ pub fn index_all(db: &Db, projects_root: &Path) -> Result<IndexStats> {
                 // Cannot stat the file: skip this session entirely and leave any
                 // previously indexed data untouched. A stat failure must never be
                 // mistaken for a shrink, which would delete stored turns.
-                Err(_) => continue,
+                Err(_) => {
+                    stats.sessions_skipped += 1;
+                    continue;
+                }
             };
-
-            // `scan_from` restarts at 0 when the file shrank. The already-stored
-            // turns for this session are then stale duplicates and must be dropped,
-            // and the message count must not accumulate on top of them.
-            let restarted = file_size < offset;
-            if restarted {
-                db.delete_turns_for_session(session_id)?;
-            }
 
             let outcome = match scan_from(file, offset) {
                 Ok(o) => o,
-                Err(_) => continue, // unreadable file: skip, never fatal
+                // Unreadable file: skip, never fatal.
+                Err(_) => {
+                    stats.sessions_skipped += 1;
+                    continue;
+                }
             };
+
+            // `scan_from` restarts at 0 when the file shrank, and reports it.
+            // The decision is made once, inside the scan, from the same `stat`
+            // the scan itself read: deciding it here from a second `stat` could
+            // disagree with the scan if the file changed in between, and would
+            // then either lose turns or re-ingest the whole file on top of the
+            // rows already stored.
+            let restarted = outcome.restarted;
 
             stats.sessions += 1;
             stats.new_turns += outcome.turns.len();
@@ -77,21 +89,25 @@ pub fn index_all(db: &Db, projects_root: &Path) -> Result<IndexStats> {
                 db.session_message_count(session_id)?
             };
 
-            db.upsert_session(&SessionRecord {
-                id: session_id.to_string(),
-                project_id,
-                file_path: file.to_string_lossy().into_owned(),
-                file_size,
-                indexed_offset: outcome.new_offset,
-                started_at: outcome.meta.first_ts,
-                last_activity_at: outcome.meta.last_ts,
-                cwd: outcome.meta.cwd.clone(),
-                git_branch: outcome.meta.git_branch.clone(),
-                cc_version: outcome.meta.cc_version.clone(),
-                message_count: existing_messages + outcome.meta.message_count,
-            })?;
-
-            db.insert_turns(session_id, &outcome.turns)?;
+            // One transaction: dropping stale turns, advancing the offset, and
+            // storing the new turns must all happen or none of them must.
+            db.apply_scan(
+                &SessionRecord {
+                    id: session_id.to_string(),
+                    project_id,
+                    file_path: file.to_string_lossy().into_owned(),
+                    file_size,
+                    indexed_offset: outcome.new_offset,
+                    started_at: outcome.meta.first_ts,
+                    last_activity_at: outcome.meta.last_ts,
+                    cwd: outcome.meta.cwd.clone(),
+                    git_branch: outcome.meta.git_branch.clone(),
+                    cc_version: outcome.meta.cc_version.clone(),
+                    message_count: existing_messages + outcome.meta.message_count,
+                },
+                &outcome.turns,
+                restarted,
+            )?;
         }
     }
 

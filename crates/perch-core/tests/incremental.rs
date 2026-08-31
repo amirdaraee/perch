@@ -107,6 +107,20 @@ fn reindexing_unchanged_data_is_a_no_op() {
 /// `cwd` in particular is the only source of a project's real path.
 #[test]
 fn reindexing_unchanged_data_preserves_session_metadata() {
+    /// The five indexer-owned session columns, all cast to text so one helper
+    /// can read them together.
+    fn columns(db: &perch_core::db::Db) -> Vec<Option<String>> {
+        db.conn()
+            .query_row(
+                "SELECT cwd, git_branch, cc_version,
+                        CAST(last_activity_at AS TEXT), CAST(started_at AS TEXT)
+                 FROM sessions WHERE id = 'aaaa'",
+                [],
+                |r| Ok(vec![r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?]),
+            )
+            .unwrap()
+    }
+
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     write_session(
@@ -119,54 +133,30 @@ fn reindexing_unchanged_data_preserves_session_metadata() {
     let db = open_in_memory().unwrap();
     index_all(&db, root).unwrap();
 
-    let first: (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<i64>,
-    ) = db
-        .conn()
-        .query_row(
-            "SELECT cwd, git_branch, cc_version, last_activity_at, started_at
-             FROM sessions WHERE id = 'aaaa'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        )
-        .unwrap();
-    assert_eq!(first.0.as_deref(), Some("/Users/a/one"));
-    assert_eq!(first.1.as_deref(), Some("main"));
-    assert_eq!(first.2.as_deref(), Some("2.1.1"));
-    assert!(first.3.is_some(), "last_activity_at must be set on pass 1");
-    assert!(first.4.is_some(), "started_at must be set on pass 1");
+    let first = columns(&db);
+    assert_eq!(first[0].as_deref(), Some("/Users/a/one"), "cwd on pass 1");
+    assert_eq!(first[1].as_deref(), Some("main"), "git_branch on pass 1");
+    assert_eq!(first[2].as_deref(), Some("2.1.1"), "cc_version on pass 1");
+    assert!(first[3].is_some(), "last_activity_at on pass 1");
+    assert!(first[4].is_some(), "started_at on pass 1");
 
-    // A second pass over unchanged bytes.
+    // A second pass over unchanged bytes: `scan_from` returns an empty
+    // `SessionMeta`, and nothing in it may reach the stored row.
     index_all(&db, root).unwrap();
 
-    let second: (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<i64>,
-        Option<i64>,
-    ) = db
-        .conn()
-        .query_row(
-            "SELECT cwd, git_branch, cc_version, last_activity_at, started_at
-             FROM sessions WHERE id = 'aaaa'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        )
-        .unwrap();
-
-    assert_eq!(second.0, first.0, "cwd must survive a re-index");
-    assert_eq!(second.1, first.1, "git_branch must survive a re-index");
-    assert_eq!(second.2, first.2, "cc_version must survive a re-index");
-    assert_eq!(
-        second.3, first.3,
-        "last_activity_at must survive a re-index"
-    );
-    assert_eq!(second.4, first.4, "started_at must survive a re-index");
+    let second = columns(&db);
+    for (i, name) in [
+        "cwd",
+        "git_branch",
+        "cc_version",
+        "last_activity_at",
+        "started_at",
+    ]
+    .iter()
+    .enumerate()
+    {
+        assert_eq!(second[i], first[i], "{name} must survive a re-index");
+    }
 }
 
 #[test]
@@ -304,12 +294,17 @@ fn a_vanished_transcript_does_not_delete_its_indexed_turns() {
 
     fs::remove_file(root.join("-Users-a-one").join("aaaa.jsonl")).unwrap();
 
-    index_all(&db, root).unwrap();
+    let stats = index_all(&db, root).unwrap();
     assert_eq!(
         db.turn_count().unwrap(),
         2,
         "a session that can no longer be read must not lose its already-indexed turns"
     );
+    // A file that is gone by discovery time is filtered out by `is_file()` and
+    // never visited, so it is neither indexed nor skipped. Only a file that
+    // survives discovery and then fails to stat or read counts as skipped.
+    assert_eq!(stats.sessions, 0);
+    assert_eq!(stats.sessions_skipped, 0);
     let session_count: i64 = db
         .conn()
         .query_row("SELECT COUNT(*) FROM sessions WHERE id = 'aaaa'", [], |r| {
@@ -360,10 +355,18 @@ fn one_unreadable_session_does_not_stop_other_projects() {
         fs::set_permissions(&unreadable, perms).unwrap();
     }
 
-    result.unwrap();
+    let stats = result.unwrap();
     assert_eq!(
         db.turn_count().unwrap(),
         2,
         "the other two projects' sessions must still be indexed"
+    );
+    assert_eq!(
+        stats.sessions, 2,
+        "only the two readable sessions count as indexed"
+    );
+    assert_eq!(
+        stats.sessions_skipped, 1,
+        "a session that could not be read must be counted, not silently dropped"
     );
 }

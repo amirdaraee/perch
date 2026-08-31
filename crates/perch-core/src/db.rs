@@ -177,37 +177,25 @@ impl Db {
     }
 
     pub fn upsert_session(&self, s: &SessionRecord) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO sessions (id, project_id, file_path, file_size, indexed_offset,
-                 started_at, last_activity_at, cwd, git_branch, cc_version, message_count)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
-             ON CONFLICT(id) DO UPDATE SET
-                 project_id = ?2, file_path = ?3, file_size = ?4, indexed_offset = ?5,
-                 -- `started_at` keeps the OLDEST value it has ever seen.
-                 started_at = COALESCE(sessions.started_at, ?6),
-                 -- The four below keep the LAST value they have ever seen: a pass
-                 -- that read no new bytes yields an all-`None` SessionMeta, and a
-                 -- bare assignment would null out perfectly good stored values on
-                 -- every re-index.
-                 last_activity_at = COALESCE(?7, sessions.last_activity_at),
-                 cwd              = COALESCE(?8, sessions.cwd),
-                 git_branch       = COALESCE(?9, sessions.git_branch),
-                 cc_version       = COALESCE(?10, sessions.cc_version),
-                 message_count = ?11",
-            params![
-                s.id,
-                s.project_id,
-                s.file_path,
-                s.file_size as i64,
-                s.indexed_offset as i64,
-                s.started_at,
-                s.last_activity_at,
-                s.cwd,
-                s.git_branch,
-                s.cc_version,
-                s.message_count as i64
-            ],
-        )?;
+        upsert_session_on(&self.conn, s)
+    }
+
+    /// Apply the result of one scan atomically: a partial failure must never
+    /// leave the offset advanced past turns that were not stored.
+    ///
+    /// The resume offset lives on the session row, so upserting the session and
+    /// inserting its turns as two separate autocommit statements means a failed
+    /// insert leaves a committed offset pointing past bytes whose turns were
+    /// never stored — the next pass resumes beyond them and those turns are lost
+    /// for good. One transaction covers the whole decision.
+    pub fn apply_scan(&self, s: &SessionRecord, turns: &[Turn], restarted: bool) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        if restarted {
+            delete_turns_on(&tx, &s.id)?;
+        }
+        upsert_session_on(&tx, s)?;
+        insert_turns_on(&tx, &s.id, turns)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -226,30 +214,8 @@ impl Db {
     }
 
     pub fn insert_turns(&self, session_id: &str, turns: &[Turn]) -> Result<()> {
-        if turns.is_empty() {
-            return Ok(());
-        }
         let tx = self.conn.unchecked_transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO turns (session_id, ts, model, input, output,
-                     cache_read, cache_write_5m, cache_write_1h, thinking)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            )?;
-            for t in turns {
-                stmt.execute(params![
-                    session_id,
-                    t.ts,
-                    t.model,
-                    t.usage.input as i64,
-                    t.usage.output as i64,
-                    t.usage.cache_read as i64,
-                    t.usage.cache_write_5m as i64,
-                    t.usage.cache_write_1h as i64,
-                    t.usage.thinking as i64
-                ])?;
-            }
-        }
+        insert_turns_on(&tx, session_id, turns)?;
         tx.commit()?;
         Ok(())
     }
@@ -296,11 +262,7 @@ impl Db {
     /// Used when a transcript was truncated or replaced and must be rescanned
     /// from zero: the previously stored turns are stale duplicates.
     pub fn delete_turns_for_session(&self, session_id: &str) -> Result<()> {
-        self.conn.execute(
-            "DELETE FROM turns WHERE session_id = ?1",
-            params![session_id],
-        )?;
-        Ok(())
+        delete_turns_on(&self.conn, session_id)
     }
 
     pub fn turn_totals(&self) -> Result<(i64, i64, i64, i64, i64)> {
@@ -311,6 +273,79 @@ impl Db {
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )?)
     }
+}
+
+// The single definitions of the three statements that `apply_scan` composes.
+// Taking a `&Connection` lets each run either standalone (autocommit, via the
+// `Db` methods) or inside `apply_scan`'s transaction — a `Transaction` derefs
+// to `Connection` — so the two paths can never drift apart.
+
+fn upsert_session_on(conn: &Connection, s: &SessionRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sessions (id, project_id, file_path, file_size, indexed_offset,
+             started_at, last_activity_at, cwd, git_branch, cc_version, message_count)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+         ON CONFLICT(id) DO UPDATE SET
+             project_id = ?2, file_path = ?3, file_size = ?4, indexed_offset = ?5,
+             -- `started_at` keeps the OLDEST value it has ever seen.
+             started_at = COALESCE(sessions.started_at, ?6),
+             -- The four below keep the LAST value they have ever seen: a pass
+             -- that read no new bytes yields an all-`None` SessionMeta, and a
+             -- bare assignment would null out perfectly good stored values on
+             -- every re-index.
+             last_activity_at = COALESCE(?7, sessions.last_activity_at),
+             cwd              = COALESCE(?8, sessions.cwd),
+             git_branch       = COALESCE(?9, sessions.git_branch),
+             cc_version       = COALESCE(?10, sessions.cc_version),
+             message_count = ?11",
+        params![
+            s.id,
+            s.project_id,
+            s.file_path,
+            s.file_size as i64,
+            s.indexed_offset as i64,
+            s.started_at,
+            s.last_activity_at,
+            s.cwd,
+            s.git_branch,
+            s.cc_version,
+            s.message_count as i64
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_turns_on(conn: &Connection, session_id: &str, turns: &[Turn]) -> Result<()> {
+    if turns.is_empty() {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare(
+        "INSERT INTO turns (session_id, ts, model, input, output,
+             cache_read, cache_write_5m, cache_write_1h, thinking)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+    )?;
+    for t in turns {
+        stmt.execute(params![
+            session_id,
+            t.ts,
+            t.model,
+            t.usage.input as i64,
+            t.usage.output as i64,
+            t.usage.cache_read as i64,
+            t.usage.cache_write_5m as i64,
+            t.usage.cache_write_1h as i64,
+            t.usage.thinking as i64
+        ])?;
+    }
+    Ok(())
+}
+
+fn delete_turns_on(conn: &Connection, session_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM turns WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -13,6 +13,13 @@ pub struct ScanOutcome {
     pub new_offset: u64,
     pub lines_parsed: u64,
     pub lines_skipped: u64,
+    /// The stored offset pointed past the end of the file, so the scan restarted
+    /// at byte 0. The caller's already-stored turns for this session are stale
+    /// duplicates and must be dropped. This is the *single* place that decision
+    /// is made: a caller that re-stats the file to decide for itself can reach a
+    /// different answer if the file changes in between, losing turns or
+    /// double-ingesting them.
+    pub restarted: bool,
 }
 
 /// Read new bytes from `path` starting at `offset`.
@@ -24,11 +31,13 @@ pub fn scan_from(path: &Path, offset: u64) -> std::io::Result<ScanOutcome> {
     let len = std::fs::metadata(path)?.len();
 
     // File replaced or truncated: the stored offset is meaningless.
-    let start = if len < offset { 0 } else { offset };
+    let restarted = len < offset;
+    let start = if restarted { 0 } else { offset };
 
     if len == start {
         return Ok(ScanOutcome {
             new_offset: start,
+            restarted,
             ..Default::default()
         });
     }
@@ -45,6 +54,7 @@ pub fn scan_from(path: &Path, offset: u64) -> std::io::Result<ScanOutcome> {
             // No complete line in the new bytes yet.
             return Ok(ScanOutcome {
                 new_offset: start,
+                restarted,
                 ..Default::default()
             });
         }
@@ -54,6 +64,7 @@ pub fn scan_from(path: &Path, offset: u64) -> std::io::Result<ScanOutcome> {
 
     let mut out = ScanOutcome {
         new_offset,
+        restarted,
         ..Default::default()
     };
 
@@ -265,6 +276,28 @@ mod tests {
         let out = scan_from(&p, big_offset).unwrap();
         assert_eq!(out.turns.len(), 1, "shrunk file must be rescanned from 0");
         assert_eq!(out.turns[0].usage.input, 9);
+        assert!(
+            out.restarted,
+            "the outcome must report the restart so the caller can drop stale turns"
+        );
+    }
+
+    #[test]
+    fn a_plain_incremental_scan_does_not_report_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.jsonl");
+        write_lines(&p, &[assistant("2026-08-18T10:00:00.000Z", 1, 2)]);
+
+        let first = scan_from(&p, 0).unwrap();
+        assert!(!first.restarted);
+
+        append_lines(&p, &[assistant("2026-08-18T10:01:00.000Z", 3, 4)]);
+        let second = scan_from(&p, first.new_offset).unwrap();
+        assert!(!second.restarted);
+
+        // No new bytes at all is also not a restart.
+        let third = scan_from(&p, second.new_offset).unwrap();
+        assert!(!third.restarted);
     }
 
     #[test]
@@ -277,6 +310,63 @@ mod tests {
         let second = scan_from(&p, first.new_offset).unwrap();
         assert!(second.turns.is_empty());
         assert_eq!(second.new_offset, first.new_offset);
+    }
+
+    /// `cwd` is FIRST-wins; `git_branch` and `cc_version` are LATEST-wins.
+    /// The asymmetry is deliberate — a session's working directory is fixed at
+    /// launch, while the branch and the CLI version can both change mid-session
+    /// — and every other fixture uses constant values, so nothing else would
+    /// notice if the two guards were swapped.
+    #[test]
+    fn cwd_is_first_wins_while_branch_and_version_are_latest_wins() {
+        fn line(cwd: &str, branch: &str, version: &str, ts: &str) -> String {
+            format!(
+                r#"{{"type":"assistant","cwd":"{cwd}","gitBranch":"{branch}","version":"{version}","timestamp":"{ts}","message":{{"model":"claude-fable-5","usage":{{"input_tokens":1,"output_tokens":1}}}}}}"#
+            )
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.jsonl");
+        write_lines(
+            &p,
+            &[
+                line(
+                    "/first/cwd",
+                    "first-branch",
+                    "1.0.0",
+                    "2026-08-18T10:00:00.000Z",
+                ),
+                line(
+                    "/middle/cwd",
+                    "middle-branch",
+                    "2.0.0",
+                    "2026-08-18T10:01:00.000Z",
+                ),
+                line(
+                    "/last/cwd",
+                    "last-branch",
+                    "3.0.0",
+                    "2026-08-18T10:02:00.000Z",
+                ),
+            ],
+        );
+
+        let out = scan_from(&p, 0).unwrap();
+        assert_eq!(
+            out.meta.cwd.as_deref(),
+            Some("/first/cwd"),
+            "cwd must be the FIRST one seen"
+        );
+        assert_eq!(
+            out.meta.git_branch.as_deref(),
+            Some("last-branch"),
+            "git_branch must be the LAST one seen"
+        );
+        assert_eq!(
+            out.meta.cc_version.as_deref(),
+            Some("3.0.0"),
+            "cc_version must be the LAST one seen"
+        );
     }
 
     #[test]
