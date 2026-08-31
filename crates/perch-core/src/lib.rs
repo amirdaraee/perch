@@ -6,6 +6,7 @@ pub mod discovery;
 pub mod index;
 pub mod model;
 pub mod pricing;
+pub mod query;
 pub mod scan;
 pub mod transcript;
 
