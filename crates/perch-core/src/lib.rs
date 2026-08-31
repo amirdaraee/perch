@@ -4,6 +4,7 @@ pub mod config;
 pub mod db;
 pub mod discovery;
 pub mod model;
+pub mod pricing;
 pub mod scan;
 pub mod transcript;
 
