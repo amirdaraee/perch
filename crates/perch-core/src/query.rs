@@ -197,7 +197,7 @@ mod tests {
                 },
                 Turn {
                     ts: 5_000,
-                    model: "claude-sonnet-5".into(),
+                    model: "claude-haiku-4-5-20251001".into(),
                     usage: TurnUsage {
                         output: 1_000_000,
                         ..Default::default()
@@ -218,8 +218,12 @@ mod tests {
         assert_eq!(r.sessions, 1);
         assert_eq!(r.usage.input, 1_000_000);
         assert_eq!(r.usage.output, 1_000_000);
-        // fable input 15.0 + sonnet output 15.0
-        assert!((r.cost_usd - 30.0).abs() < 1e-9);
+        // fable input 1 MTok @ 15.0/MTok + haiku output 1 MTok @ 5.0/MTok.
+        // The two rates must stay different: if they were equal, a regression
+        // that pools tokens across models and multiplies by a single rate
+        // would still land on the right total. Do not "tidy" this fixture
+        // back to two equal-rate models.
+        assert!((r.cost_usd - 20.0).abs() < 1e-9);
         assert_eq!(r.last_activity_at, Some(5_000));
     }
 
@@ -229,7 +233,12 @@ mod tests {
         let (usage, cost) = usage_since(&db, 4_000).unwrap();
         assert_eq!(usage.input, 0);
         assert_eq!(usage.output, 1_000_000);
-        assert!((cost - 15.0).abs() < 1e-9);
+        assert!((cost - 5.0).abs() < 1e-9);
+
+        // The boundary is inclusive (`ts >= since_ms`): querying exactly at
+        // the second turn's timestamp must still include it.
+        let (usage_at_boundary, _) = usage_since(&db, 5_000).unwrap();
+        assert_eq!(usage_at_boundary.output, 1_000_000);
     }
 
     #[test]
@@ -272,7 +281,7 @@ mod tests {
             "tokens must still be counted"
         );
         assert!(
-            (rows[0].cost_usd - 30.0).abs() < 1e-9,
+            (rows[0].cost_usd - 20.0).abs() < 1e-9,
             "unpriced model adds no cost"
         );
     }
