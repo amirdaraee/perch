@@ -8,3 +8,4 @@ license.workspace = true
 perch-core = { path = "../perch-core" }
 anyhow.workspace = true
 clap.workspace = true
+chrono.workspace = true
