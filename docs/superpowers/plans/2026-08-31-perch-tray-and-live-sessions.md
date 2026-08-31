@@ -1006,6 +1006,47 @@ pub fn run() {
 }
 ```
 
+- [ ] **Step 1b: Anchor the popover to the tray, and dismiss it on focus loss**
+
+Human testing of Step 1 found the window opening as a rectangle in the **middle of the screen**.
+A menu-bar popover must appear under its tray icon, and must dismiss when you click away — that
+is what distinguishes a popover from an ordinary window.
+
+Add to `src-tauri/Cargo.toml`:
+
+```toml
+tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
+```
+
+In `src-tauri/src/lib.rs`:
+
+1. Register the plugin on the builder: `.plugin(tauri_plugin_positioner::init())`.
+2. Inside `on_tray_icon_event`, **before** handling the click, forward every event to the plugin
+   so it can track where the tray icon is:
+   `tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);`
+3. In `toggle_popover`, position the window before showing it:
+
+```rust
+use tauri_plugin_positioner::{Position, WindowExt};
+// Anchor under the menu-bar item. Must happen before `show()`, or the window
+// is briefly painted centre-screen and then jumps.
+let _ = win.move_window(Position::TrayBottomCenter);
+let _ = win.show();
+let _ = win.set_focus();
+```
+
+4. Dismiss on focus loss, alongside the existing `CloseRequested` arm:
+
+```rust
+            // A popover that outlives its focus is just a window. Clicking away dismisses it.
+            if let WindowEvent::Focused(false) = event {
+                let _ = window.hide();
+            }
+```
+
+If `move_window` is not in scope on a `WebviewWindow` under this plugin version, report what the
+trait expects rather than guessing — a silently mispositioned popover is the defect being fixed.
+
 - [ ] **Step 2: Verify the tray behaviour by hand**
 
 ```bash
@@ -1017,7 +1058,9 @@ Verify and report each:
 2. **No Dock icon appears** and Perch does not show in ⌘-Tab.
 3. Left-clicking the tray shows the popover; clicking again hides it.
 4. Right-clicking shows a menu with Quit, and Quit exits.
-5. Closing the popover window (⌘W) hides it rather than quitting.
+5. ⌘W is **not** expected to do anything: the window has `decorations: false` and no menu, so
+   the shortcut is never bound. Dismissal is by clicking the tray again, or clicking away
+   (Step 1b). The `CloseRequested` handler still guards any programmatic close.
 
 If `set_activation_policy` does not resolve, check the current Tauri 2 API name and report what you used instead of guessing silently.
 
@@ -1259,6 +1302,10 @@ git commit -m "feat(app): watch session records and emit live updates"
 
 ## Task 8: The dense popover UI
 
+> **Add Escape-to-dismiss.** ⌘W is confirmed unavailable on this window (no decorations, no
+> menu, so the shortcut is never bound). Wire an Escape key handler in `App.tsx` that hides the
+> popover via the window API, so there is a keyboard dismissal alongside clicking away.
+>
 > **Tighten the CSP in this task.** `tauri.conf.json` ships `"csp": null` from the scaffold,
 > which was fine for an empty window. This task is where real session data — names, cwds,
 > statuses authored elsewhere — first renders. Set a same-origin policy (`"default-src 'self'"`)
