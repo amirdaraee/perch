@@ -22,7 +22,8 @@ Your transcripts contain source code, pasted secrets, and client names. So:
 - **Read-only.** Perch never writes to, moves, or deletes anything in your Claude Code directory.
 - **One outbound host,** and only in the app itself: `anthropic.com`, to read your own rate-limit
   status. The data layer in this repository makes no network requests at all, and CI fails the
-  build if an HTTP client is added to it.
+  build if an HTTP client or telemetry dependency appears in the manifests or the resolved
+  dependency graph.
 
 ## Try the data layer
 
