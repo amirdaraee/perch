@@ -192,7 +192,9 @@ Insert above the `#[cfg(test)]` block:
 
 ```rust
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+// `rename_all` renames the VARIANTS; `rename_all_fields` is also required, or
+// `since_ms` serializes as "since_ms" while the frontend expects "sinceMs".
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum SessionStatus {
     Working,
     Waiting { reason: Option<String>, since_ms: i64 },
@@ -421,7 +423,7 @@ In the workspace root `Cargo.toml` under `[workspace.dependencies]`, add:
 libc = "0.2"
 ```
 
-In `crates/perch-core/Cargo.toml` under `[dependencies]`, add:
+In `crates/perch-core/Cargo.toml`, add a new target-scoped section (NOT a line inside the existing `[dependencies]` table — it is its own table and must come after it):
 
 ```toml
 [target.'cfg(unix)'.dependencies]
@@ -961,7 +963,13 @@ pub fn run() {
             let menu = Menu::with_items(app, &[&quit])?;
 
             TrayIconBuilder::with_id("perch-tray")
-                .icon(app.default_window_icon().unwrap().clone())
+                // `?`, not `unwrap()`: a missing icon must surface as a setup
+                // error, not a panic on launch.
+                .icon(
+                    app.default_window_icon()
+                        .cloned()
+                        .ok_or("no default window icon configured")?,
+                )
                 .icon_as_template(true)
                 .title("Perch")
                 .menu(&menu)
