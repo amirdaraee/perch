@@ -5,7 +5,8 @@
 /// session record resurrect as a false "running session" (spec §7).
 pub trait ProcessProbe: Send + Sync {
     fn is_alive(&self, pid: i32) -> bool;
-    fn cmdline_contains(&self, pid: i32, needle: &str) -> bool;
+    /// The process's executable name (basename of `comm`), if it can be determined.
+    fn process_name(&self, pid: i32) -> Option<String>;
 }
 
 #[cfg(target_os = "macos")]
