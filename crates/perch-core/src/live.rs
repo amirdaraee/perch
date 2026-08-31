@@ -179,4 +179,69 @@ mod tests {
 
         assert!(record_files(&tmp.path().join("nope")).is_empty());
     }
+
+    #[test]
+    fn status_serializes_with_the_field_names_the_frontend_expects() {
+        let waiting = SessionStatus::Waiting {
+            reason: Some("dialog open".into()),
+            since_ms: 5,
+        };
+        let v = serde_json::to_value(&waiting).unwrap();
+        assert_eq!(
+            v["kind"], "waiting",
+            "variant must be camelCase under the `kind` tag"
+        );
+        assert_eq!(
+            v["sinceMs"], 5,
+            "rename_all_fields must camelCase struct-variant fields"
+        );
+        assert_eq!(v["reason"], "dialog open");
+
+        let working = serde_json::to_value(SessionStatus::Working).unwrap();
+        assert_eq!(working["kind"], "working");
+    }
+
+    #[test]
+    fn live_session_serializes_with_camel_case_keys() {
+        let s = parse_session_record(WAITING).unwrap();
+        let v = serde_json::to_value(&s).unwrap();
+        for key in [
+            "sessionId",
+            "statusUpdatedAt",
+            "startedAt",
+            "ccVersion",
+            "socketPath",
+        ] {
+            assert!(
+                v.get(key).is_some(),
+                "missing camelCase key `{key}` in serialized LiveSession"
+            );
+        }
+        assert!(
+            v.get("session_id").is_none(),
+            "snake_case keys must not leak to the frontend"
+        );
+    }
+
+    #[test]
+    fn kind_and_status_are_independent_across_all_four_combinations() {
+        let cases = [
+            ("interactive", "busy", false),
+            ("interactive", "waiting", true),
+            ("bg", "busy", false),
+            ("bg", "waiting", true),
+        ];
+        for (kind, status, expect_waiting) in cases {
+            let line = format!(
+                r#"{{"pid":9,"sessionId":"s","cwd":"/tmp","name":"n","kind":"{kind}","status":"{status}","startedAt":1,"statusUpdatedAt":2}}"#
+            );
+            let s = parse_session_record(&line).expect("should parse");
+            assert_eq!(s.kind, kind, "kind must be preserved verbatim");
+            assert_eq!(
+                matches!(s.status, SessionStatus::Waiting { .. }),
+                expect_waiting,
+                "status must be derived from `status` alone, never from `kind` ({kind}/{status})"
+            );
+        }
+    }
 }
