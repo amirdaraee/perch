@@ -160,7 +160,7 @@ behind and pids are recycled:
 
 1. The record file exists.
 2. `kill(pid, 0)` succeeds.
-3. The process command line identifies it as a Claude Code process.
+3. The process's **executable name** — not its arguments — is `claude`.
 
 The socket at `messagingSocketPath` is a supporting fourth signal. Failing the checks marks
 the session ended and moves it to history.
@@ -174,8 +174,21 @@ the session ended and moves it to history.
 >
 > Matching on the session id is also unnecessary, because **records are keyed by pid**
 > (`<pid>.json`). A new session landing on a recycled pid overwrites the stale record rather
-> than coexisting with it, so two records can never claim one pid. The only residual hazard is
-> a pid recycled by a *non-Claude* process, which "is a Claude Code process" fully excludes.
+> than coexisting with it, so two records can never claim one pid.
+>
+> Read the executable name (`ps -o comm=`), never the full command line (`ps -o command=`).
+> A substring search for "claude" over arguments would match any unrelated process holding a
+> path like `claude-dashboard` — `vim ~/projects/claude-dashboard/x.rs`, for instance.
+>
+> **This narrows the residual hazard; it does not eliminate it.** One window remains: session A
+> crashes leaving a stale record, the OS reuses its pid for a genuinely new `claude` process B,
+> and B has not yet written its own record. In that interval every check passes — the pid is
+> alive and *is* a Claude process — so A's stale record is briefly shown with A's name and cwd
+> against B's pid. It self-corrects as soon as B writes its record (which overwrites A's). If
+> that window ever proves observable, `procStart` is the fix: the record carries it, and
+> comparing it against the process's real start time closes the race. It is deferred only
+> because it needs timezone normalisation (the record's `procStart` is offset from
+> `ps -o lstart=` by the local UTC offset).
 >
 > A stronger check remains available if ever needed: the record carries `procStart`, which can
 > be compared against the process's actual start time. It is deferred because it requires
