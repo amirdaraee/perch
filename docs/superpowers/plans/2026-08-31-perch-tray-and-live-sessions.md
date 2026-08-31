@@ -1333,7 +1333,11 @@ export function cost(usd: number): string {
   return `$${usd.toFixed(2)}`
 }
 
-export function elapsed(ms: number): string {
+/// Callers must pass `null` when the source timestamp was absent — a real session record
+/// can omit `statusUpdatedAt` entirely (observed on a just-started session), and formatting
+/// `now - 0` as a duration renders ~56 years.
+export function elapsed(ms: number | null): string {
+  if (ms === null) return '—'
   const s = Math.max(0, Math.floor(ms / 1000))
   if (s < 60) return `${s}s`
   if (s < 3600) return `${Math.floor(s / 60)}m`
@@ -1363,7 +1367,9 @@ function StatusDot({ s }: { s: LiveSession }) {
 
 function SessionRow({ s, now }: { s: LiveSession; now: number }) {
   const waiting = s.status.kind === 'waiting' ? s.status : null
-  const since = waiting ? waiting.sinceMs : s.statusUpdatedAt
+  // A just-started session can have no statusUpdatedAt at all; 0 means "absent", not "epoch".
+  const rawSince = waiting ? waiting.sinceMs : s.statusUpdatedAt
+  const since = rawSince > 0 ? rawSince : null
   return (
     <div className="srow">
       <StatusDot s={s} />
@@ -1371,7 +1377,7 @@ function SessionRow({ s, now }: { s: LiveSession; now: number }) {
         <b>{s.name || s.sessionId.slice(0, 8)}</b>
         <i>{waiting ? `waiting · ${waiting.reason ?? 'unknown'}` : 'working'}</i>
       </span>
-      <span className="stime">{elapsed(now - since)}</span>
+      <span className="stime">{elapsed(since === null ? null : now - since)}</span>
     </div>
   )
 }
