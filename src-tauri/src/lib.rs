@@ -30,9 +30,27 @@ pub fn run() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             // A menu-bar popover must appear over whatever Space is active, including a
-            // fullscreen app's own Space. Without this it silently fails to show there.
+            // fullscreen app's own Space. Tauri's set_visible_on_all_workspaces sets only
+            // CanJoinAllSpaces (tao sets no FullScreenAuxiliary anywhere), which the user
+            // confirmed is not enough — the popover simply never appears over a fullscreen
+            // app. FullScreenAuxiliary is the flag that governs that case.
+            #[cfg(target_os = "macos")]
             if let Some(win) = app.get_webview_window("popover") {
-                let _ = win.set_visible_on_all_workspaces(true);
+                use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior};
+                match win.ns_window() {
+                    Ok(ptr) => {
+                        let ns_window: &NSWindow = unsafe { &*(ptr as *const NSWindow) };
+                        ns_window.setCollectionBehavior(
+                            NSWindowCollectionBehavior::CanJoinAllSpaces
+                                | NSWindowCollectionBehavior::FullScreenAuxiliary,
+                        );
+                    }
+                    Err(err) => {
+                        // Must not panic at launch: fall through with default window
+                        // behaviour rather than aborting setup over a cosmetic feature.
+                        eprintln!("perch: failed to get ns_window for popover: {err}");
+                    }
+                }
             }
 
             let quit = MenuItem::with_id(app, "quit", "Quit Perch", true, None::<&str>)?;
