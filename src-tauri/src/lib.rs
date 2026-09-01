@@ -29,6 +29,12 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
+            // A menu-bar popover must appear over whatever Space is active, including a
+            // fullscreen app's own Space. Without this it silently fails to show there.
+            if let Some(win) = app.get_webview_window("popover") {
+                let _ = win.set_visible_on_all_workspaces(true);
+            }
+
             let quit = MenuItem::with_id(app, "quit", "Quit Perch", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&quit])?;
 
