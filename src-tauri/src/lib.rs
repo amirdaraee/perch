@@ -5,6 +5,7 @@ use tauri::{
 };
 
 mod commands;
+mod watcher;
 
 // A menu-bar popover must appear over whatever Space is active, including a
 // fullscreen app's own Space. Debugging established that neither
@@ -151,6 +152,8 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            watcher::spawn(app.handle().clone());
 
             Ok(())
         })
