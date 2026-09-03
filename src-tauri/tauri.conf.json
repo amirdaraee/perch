@@ -24,7 +24,7 @@
         "visible": false
       }
     ],
-    "security": { "csp": null }
+    "security": { "csp": "default-src 'self'" }
   },
   "bundle": {
     "active": true,
