@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "popover-default",
+  "description": "The popover may listen for backend events and hide itself. Nothing more.",
+  "windows": ["popover"],
+  "permissions": [
+    "core:event:default",
+    "core:window:allow-hide",
+    "core:window:deny-internal-toggle-maximize"
+  ]
+}
