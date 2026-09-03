@@ -21,6 +21,11 @@ pub struct UsageSummary {
     pub today: UsageSlice,
     /// "estimated" until the tier-1 usage endpoint lands (spec §8).
     pub source: String,
+    /// False when the index holds no turns at all — a freshly created database
+    /// that has never been filled. The zeros in that case mean "nothing indexed
+    /// yet", not "you spent nothing", and the UI must not present them as
+    /// numbers.
+    pub has_data: bool,
 }
 
 fn config_dir() -> Result<std::path::PathBuf, String> {
@@ -80,6 +85,7 @@ pub fn usage_summary() -> Result<UsageSummary, String> {
         week: slice(now - 7 * 24 * 60 * 60 * 1000)?,
         today: slice(now - 24 * 60 * 60 * 1000)?,
         source: "estimated".to_string(),
+        has_data: database.turn_count().map_err(|e| e.to_string())? > 0,
     })
 }
 
