@@ -264,9 +264,17 @@ jobs:
           # silently "pass" regardless of what is actually in the graph.
           #
           # Positive control: the probe must find a crate that IS present, or
-          # a broken invocation would silently pass everything.
-          if ! cargo tree -i serde -p perch-core --edges normal 2>/dev/null | grep -q '^serde '; then
-            echo "::error::Guard self-test failed: cargo tree did not find serde in perch-core."
+          # a broken invocation would silently pass everything. Uses the same
+          # ${{ matrix.cargo-scope }} the loop below consumes (not a
+          # hardcoded -p perch-core) — serde is depended on by every
+          # workspace member, so this also proves the scope string itself is
+          # well-formed. A malformed scope (e.g. a typo'd flag) would make
+          # every `cargo tree` call below fail with empty stdout, which reads
+          # as "crate absent" and would let the job report clean; catching
+          # that here is the whole point of a self-test, so it must fail the
+          # same way the real check would.
+          if ! cargo tree -i serde ${{ matrix.cargo-scope }} --edges normal 2>/dev/null | grep -q '^serde '; then
+            echo "::error::Guard self-test failed: cargo tree did not find serde under scope '${{ matrix.cargo-scope }}'."
             exit 1
           fi
 
