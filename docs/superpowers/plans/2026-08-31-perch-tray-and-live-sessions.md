@@ -19,7 +19,7 @@
 - **No transcript contents** may be rendered, logged, or emitted — only paths, counts, totals, model names, session names, and status strings.
 - Rust edition 2021; `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all -- --check` must pass.
 - **`perch-core` must keep compiling and testing on Linux.** OS-bound behaviour goes behind traits (spec §4.1); only `src-tauri` and the trait implementations may be macOS-specific.
-- **Liveness requires three confirmations** (spec §7, corrected 2026-08-31): record exists, `kill(pid, 0)` succeeds, and the process's executable name is `claude`. NOT `--session-id` — interactive sessions do not carry it on argv. Records are keyed by pid, so a recycled pid overwrites the stale record; the residual hazard is only a *non-Claude* process inheriting the pid, which the executable-name check excludes.
+- **Liveness requires three confirmations** (spec §7, corrected 2026-08-31): record exists, `kill(pid, 0)` succeeds, and the process's executable name is `claude`. NOT `--session-id` — interactive sessions do not carry it on argv. Records are keyed by pid, so a recycled pid overwrites the stale record. The executable-name check narrows the residual pid-reuse hazard but does not eliminate it — a stale record can still be shown briefly against a genuinely new `claude` process that has not yet written its own record; see spec §7.
 - Status comes from the `status`/`waitingFor` fields Claude Code publishes. **Never infer status from file mtimes.**
 - License MIT; `.superpowers/` stays git-ignored.
 

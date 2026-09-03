@@ -189,11 +189,6 @@ the session ended and moves it to history.
 > comparing it against the process's real start time closes the race. It is deferred only
 > because it needs timezone normalisation (the record's `procStart` is offset from
 > `ps -o lstart=` by the local UTC offset).
->
-> A stronger check remains available if ever needed: the record carries `procStart`, which can
-> be compared against the process's actual start time. It is deferred because it requires
-> timezone normalisation (the record's `procStart` is offset from `ps -o lstart=` by the local
-> UTC offset) for no benefit the pid-keying argument does not already provide.
 
 **Status model**
 
@@ -240,6 +235,11 @@ with zero price rather than dropped.
 ### 9.1 Menu bar
 
 The menu-bar item displays the **window utilization percentage**.
+
+> **Note, 2026-09-03.** As shipped, the menu-bar item shows a live-session count and an
+> hourglass when a session is waiting, not the utilization percentage. The percentage needs
+> the tier-1 usage endpoint (§8), and §8 forbids fabricating one against an unknown ceiling;
+> it lands with that endpoint.
 
 The popover is the **dense** layout: window / week / today as three side-by-side stats
 with the reset countdown, followed by session rows carrying status, elapsed time, and

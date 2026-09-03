@@ -25,6 +25,36 @@ Your transcripts contain source code, pasted secrets, and client names. So:
   build if an HTTP client or telemetry dependency appears in the manifests or the resolved
   dependency graph.
 
+## The app
+
+Perch is a **menu-bar app** (macOS) built with [Tauri 2](https://tauri.app): a tray icon
+showing live-session count, and a popover with usage stats and the session list.
+
+Prerequisites: [Rust](https://rustup.rs), [pnpm](https://pnpm.io), and the Tauri CLI
+(`cargo install tauri-cli --version '^2'`, giving `cargo tauri`).
+
+```bash
+pnpm install
+cargo tauri build                  # .app + .dmg under target/release/bundle
+# or, for just the binary:
+pnpm build && cargo build --release -p perch-app --features custom-protocol
+```
+
+The `custom-protocol` feature is what embeds the built frontend in the binary. `cargo tauri
+build` turns it on for you; a plain `cargo build` does not, and produces a binary that expects
+a dev server instead.
+
+The popover is converted to an `NSPanel` using [`tauri-nspanel`](https://github.com/ahkohd/tauri-nspanel),
+because a plain window cannot appear over fullscreen apps. It is AppKit-only, it is the only
+dependency in this project that does not come from crates.io — a git dependency on a personal
+repository, pinned by commit in `src-tauri/Cargo.toml` — and it is compiled only on macOS.
+
+**Known issue: the app and `perch-cli` can disagree about where your data is.** An app launched
+from Finder does not inherit environment variables set in a shell rc, so `CLAUDE_CONFIG_DIR`
+and `XDG_CONFIG_HOME` are invisible to it: the app falls back to `~/.claude` while `perch-cli`,
+run from your shell, honours them. This resolves when Perch grows a settings file to record the
+directory explicitly.
+
 ## Try the data layer
 
 Requires [Rust](https://rustup.rs).
