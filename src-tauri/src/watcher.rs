@@ -15,6 +15,7 @@ const POLL: Duration = Duration::from_secs(5);
 pub fn spawn(app: AppHandle) {
     std::thread::spawn(move || {
         let Some(cfg) = config::config_dir() else {
+            eprintln!("perch: watcher: could not locate a Claude Code config directory");
             return;
         };
         let dir = config::sessions_dir(&cfg);
@@ -24,26 +25,44 @@ pub fn spawn(app: AppHandle) {
             let _ = tx.send(res);
         }) {
             Ok(w) => w,
-            Err(_) => return,
+            Err(err) => {
+                eprintln!("perch: watcher: failed to create filesystem watcher: {err}");
+                return;
+            }
         };
-        if watcher.watch(&dir, RecursiveMode::NonRecursive).is_err() {
+        if let Err(err) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
+            eprintln!("perch: watcher: failed to watch {}: {err}", dir.display());
             return;
         }
 
         emit_now(&app, &dir);
         let mut last = Instant::now();
+        // Set when an event arrives inside the debounce dead window and gets
+        // dropped: the next wait ends at the debounce boundary instead of the
+        // full poll boundary, so that event's change is not held back until
+        // the next 5 s poll.
+        let mut pending = false;
 
         loop {
-            match rx.recv_timeout(POLL) {
+            let wait = if pending {
+                DEBOUNCE.saturating_sub(last.elapsed())
+            } else {
+                POLL
+            };
+            match rx.recv_timeout(wait) {
                 Ok(_) => {
                     if last.elapsed() >= DEBOUNCE {
                         emit_now(&app, &dir);
                         last = Instant::now();
+                        pending = false;
+                    } else {
+                        pending = true;
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     emit_now(&app, &dir);
                     last = Instant::now();
+                    pending = false;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
