@@ -1306,6 +1306,13 @@ git commit -m "feat(app): watch session records and emit live updates"
 > menu, so the shortcut is never bound). Wire an Escape key handler in `App.tsx` that hides the
 > popover via the window API, so there is a keyboard dismissal alongside clicking away.
 >
+> **Do not add a drag region without the maximize guard.** The popover is now a non-activating
+> `NSPanel` (Task 5). The plugin's fullscreen example warns that once `data-tauri-drag-region`
+> exists in the HTML, double-click-to-maximize becomes reachable and **crashes** such a panel
+> unless the `core:window:deny-internal-toggle-maximize` capability is also set. Today there is
+> no drag region and `resizable: false`, so the path is unreachable — keep it that way, or add
+> the permission in the same commit as any drag region.
+>
 > **Tighten the CSP in this task.** `tauri.conf.json` ships `"csp": null` from the scaffold,
 > which was fine for an empty window. This task is where real session data — names, cwds,
 > statuses authored elsewhere — first renders. Set a same-origin policy (`"default-src 'self'"`)
