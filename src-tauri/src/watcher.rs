@@ -30,10 +30,23 @@ pub fn spawn(app: AppHandle) {
                 return;
             }
         };
-        if let Err(err) = watcher.watch(&dir, RecursiveMode::NonRecursive) {
-            eprintln!("perch: watcher: failed to watch {}: {err}", dir.display());
-            return;
-        }
+        // A fresh Claude Code install has no `sessions` directory yet, and
+        // notify then fails with `path_not_found`. Losing the thread here would
+        // also lose the 5 s poll backstop, so the tray would stay stale until
+        // Perch restarted. Instead: fall through to a poll-only loop and retry
+        // `watch()` on every tick. The directory is never created here — Perch
+        // is strictly read-only with respect to the Claude Code directory.
+        let mut watching = match watcher.watch(&dir, RecursiveMode::NonRecursive) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!(
+                    "perch: watcher: failed to watch {}: {err} — polling every {}s and retrying",
+                    dir.display(),
+                    POLL.as_secs()
+                );
+                false
+            }
+        };
 
         emit_now(&app, &dir);
         let mut last = Instant::now();
@@ -44,25 +57,35 @@ pub fn spawn(app: AppHandle) {
         let mut pending = false;
 
         loop {
-            let wait = if pending {
+            let wait = if watching && pending {
                 DEBOUNCE.saturating_sub(last.elapsed())
             } else {
                 POLL
             };
             match rx.recv_timeout(wait) {
                 Ok(_) => {
-                    if last.elapsed() >= DEBOUNCE {
+                    if watching && last.elapsed() < DEBOUNCE {
+                        pending = true;
+                    } else {
                         emit_now(&app, &dir);
                         last = Instant::now();
                         pending = false;
-                    } else {
-                        pending = true;
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     emit_now(&app, &dir);
                     last = Instant::now();
                     pending = false;
+                    // Poll-only mode: the directory may have appeared since the
+                    // last tick. One success promotes us back to the normal
+                    // debounced loop, and it is logged once.
+                    if !watching && watcher.watch(&dir, RecursiveMode::NonRecursive).is_ok() {
+                        watching = true;
+                        eprintln!(
+                            "perch: watcher: now watching {} (was polling)",
+                            dir.display()
+                        );
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }

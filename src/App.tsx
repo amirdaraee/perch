@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { getCurrentWindow } from '@tauri-apps/api/window'
-import { getLiveSessions, getUsageSummary, onSessionsChanged } from './api'
+import { getLiveSessions, getUsageSummary, onSessionsChanged, reindex } from './api'
 import type { LiveSession, UsageSummary } from './types'
 import { cost, elapsed, tokens } from './format'
 
@@ -24,7 +24,11 @@ function SessionRow({ s, now }: { s: LiveSession; now: number }) {
       <StatusDot s={s} />
       <span className="sname">
         <b>{s.name || s.sessionId.slice(0, 8)}</b>
-        <i>{waiting ? `waiting · ${waiting.reason ?? 'unknown'}` : 'working'}</i>
+        <i>
+          {waiting ? `waiting · ${waiting.reason ?? 'unknown'}`
+          : s.status.kind === 'idle' ? 'idle'
+          : 'working'}
+        </i>
       </span>
       <span className="stime">{elapsed(since === null ? null : now - since)}</span>
     </div>
@@ -37,9 +41,19 @@ export default function App() {
   const [now, setNow] = useState(Date.now())
 
   useEffect(() => {
+    const loadUsage = () => getUsageSummary().then(setUsage).catch(() => setUsage(null))
+
     getLiveSessions().then(setSessions).catch(() => setSessions([]))
-    getUsageSummary().then(setUsage).catch(() => setUsage(null))
-    const un = onSessionsChanged(setSessions)
+    // Nothing else populates the index, so without this the popover would show
+    // an empty database forever. Cold ~0.25 s, warm ~0.01 s; a failed reindex
+    // must still not stop us reading whatever is already indexed.
+    void reindex().catch(() => {}).then(loadUsage)
+    // The watcher emits at least every 5 s, so usage stays fresh at no extra
+    // polling cost — and the popover is not remounted on hide/show.
+    const un = onSessionsChanged((s) => {
+      setSessions(s)
+      void loadUsage()
+    })
     const tick = setInterval(() => setNow(Date.now()), 1000)
     return () => {
       un.then((f) => f())
@@ -58,22 +72,25 @@ export default function App() {
   }, [])
 
   const waiting = sessions.filter((s) => s.status.kind === 'waiting')
+  // An index with no turns in it reports zeros, which would read as "you spent
+  // nothing". Show em-dashes until there is something real to show.
+  const stats = usage && usage.hasData ? usage : null
 
   return (
     <div className="popover">
       <div className="stats">
         <div className="stat">
           <div className="lbl">Window</div>
-          <div className="num">{usage ? tokens(usage.window.tokens) : '—'}</div>
+          <div className="num">{stats ? tokens(stats.window.tokens) : '—'}</div>
         </div>
         <div className="stat">
           <div className="lbl">Week</div>
-          <div className="num">{usage ? tokens(usage.week.tokens) : '—'}</div>
+          <div className="num">{stats ? tokens(stats.week.tokens) : '—'}</div>
         </div>
         <div className="stat">
           <div className="lbl">24h</div>
-          <div className="num">{usage ? cost(usage.today.costUsd) : '—'}</div>
-          {usage && <div className="est">est</div>}
+          <div className="num">{stats ? cost(stats.today.costUsd) : '—'}</div>
+          {stats && <div className="est">est</div>}
         </div>
       </div>
 

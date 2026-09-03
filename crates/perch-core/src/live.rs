@@ -114,7 +114,13 @@ pub fn live_sessions(sessions_dir: &Path, probe: &dyn ProcessProbe) -> Vec<LiveS
             SessionStatus::Waiting { .. } => 0,
             _ => 1,
         };
-        rank(a).cmp(&rank(b)).then_with(|| a.name.cmp(&b.name))
+        // pid breaks the tie: a just-started session can have no name at all,
+        // and two nameless records would otherwise fall back to `read_dir`
+        // order, letting rows swap places on every poll.
+        rank(a)
+            .cmp(&rank(b))
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.pid.cmp(&b.pid))
     });
     out
 }
@@ -311,8 +317,12 @@ mod tests {
     }
 
     fn write_record(dir: &Path, pid: i32, session_id: &str, status: &str) {
+        write_record_named(dir, pid, session_id, status, "n");
+    }
+
+    fn write_record_named(dir: &Path, pid: i32, session_id: &str, status: &str, name: &str) {
         let json = format!(
-            r#"{{"pid":{pid},"sessionId":"{session_id}","cwd":"/tmp/p","name":"n","kind":"interactive","status":"{status}","startedAt":1,"statusUpdatedAt":2}}"#
+            r#"{{"pid":{pid},"sessionId":"{session_id}","cwd":"/tmp/p","name":"{name}","kind":"interactive","status":"{status}","startedAt":1,"statusUpdatedAt":2}}"#
         );
         std::fs::write(dir.join(format!("{pid}.json")), json).unwrap();
     }
@@ -362,20 +372,34 @@ mod tests {
     }
 
     #[test]
-    fn live_sessions_are_sorted_waiting_first_then_by_name() {
+    fn live_sessions_are_sorted_waiting_first_then_by_name_then_by_pid() {
         let tmp = tempfile::tempdir().unwrap();
-        write_record(tmp.path(), 200, "b-working", "busy");
-        write_record(tmp.path(), 201, "a-waiting", "waiting");
+        write_record_named(tmp.path(), 200, "s-working", "busy", "b-working");
+        write_record_named(tmp.path(), 201, "s-waiting", "waiting", "a-waiting");
+        // Two records sharing a name — e.g. two just-started sessions that have
+        // no name yet — must not fall back to read_dir order, which can swap
+        // them between polls. Written high-pid-first so a stable-but-unsorted
+        // implementation would be caught.
+        write_record_named(tmp.path(), 203, "s-nameless-hi", "busy", "");
+        write_record_named(tmp.path(), 202, "s-nameless-lo", "busy", "");
 
-        let probe = FakeProbe::new(&[200, 201])
+        let probe = FakeProbe::new(&[200, 201, 202, 203])
             .with_name(200, "claude")
-            .with_name(201, "claude");
+            .with_name(201, "claude")
+            .with_name(202, "claude")
+            .with_name(203, "claude");
 
         let out = live_sessions(tmp.path(), &probe);
-        assert_eq!(out.len(), 2);
+        assert_eq!(out.len(), 4);
         assert_eq!(
-            out[0].session_id, "a-waiting",
+            out[0].session_id, "s-waiting",
             "blocked sessions surface first"
+        );
+        let pids: Vec<i32> = out.iter().map(|s| s.pid).collect();
+        assert_eq!(
+            pids,
+            vec![201, 202, 203, 200],
+            "waiting first, then by name, then by pid for identical names"
         );
     }
 
