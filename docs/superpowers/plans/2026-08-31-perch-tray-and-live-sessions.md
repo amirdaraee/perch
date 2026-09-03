@@ -1306,6 +1306,11 @@ git commit -m "feat(app): watch session records and emit live updates"
 > menu, so the shortcut is never bound). Wire an Escape key handler in `App.tsx` that hides the
 > popover via the window API, so there is a keyboard dismissal alongside clicking away.
 >
+> **Label the third stat "24h", not "Today".** `usage_summary.today` is a trailing 24-hour
+> window (`now − 24h`), not a calendar day. Calling it "Today" would read as "since midnight",
+> which is wrong at 1 am and double-counts across midnight. The mockup said "Today"; the honest
+> label for what the number actually is is **24h**. Keep the field name in the API for now.
+>
 > **Do not add a drag region without the maximize guard.** The popover is now a non-activating
 > `NSPanel` (Task 5). The plugin's fullscreen example warns that once `data-tauri-drag-region`
 > exists in the HTML, double-click-to-maximize becomes reachable and **crashes** such a panel
