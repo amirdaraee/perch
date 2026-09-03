@@ -47,16 +47,32 @@ jobs:
       - run: cargo build -p perch-app
 
   no-network:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Mirrors the `test` job's split, and for the same reason: the
+        # resolved-graph check below needs an actual Cargo toolchain now, and
+        # `perch-app` (src-tauri) only resolves against the deps its
+        # macOS-only `[target.'cfg(...)']` sections declare when run where
+        # they apply. macOS proves the full workspace graph, including the
+        # app crate, is clean; Linux keeps proving the portable data-layer
+        # crates stay clean on their own.
+        include:
+          - os: macos-latest
+            cargo-scope: --workspace
+          - os: ubuntu-latest
+            cargo-scope: -p perch-core -p perch-cli
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Assert no HTTP client or telemetry dependencies
         run: |
           set -uo pipefail
 
           HTTP='^(reqwest|hyper|ureq|curl|isahc|surf)\b'
           TELEMETRY='^(sentry|posthog|segment|mixpanel|datadog|analytics)\b'
-          LOCKED='^name = "(reqwest|hyper|ureq|curl|isahc|surf|sentry|posthog|segment|mixpanel|datadog)"'
 
           # src-tauri is exactly where an HTTP client would plausibly be added
           # first, so it must be scanned exactly like every other crate's
@@ -74,12 +90,6 @@ jobs:
             echo "::error::Guard self-test failed: the HTTP pattern no longer detects a known offender."
             exit 1
           fi
-          printf 'name = "reqwest"\n' > /tmp/guard-selftest.lock
-          if ! grep -qE "$LOCKED" /tmp/guard-selftest.lock; then
-            echo "::error::Guard self-test failed: the lockfile pattern no longer detects a known offender."
-            exit 1
-          fi
-
           # Positive control for the src-tauri coverage: a fixture placed as if
           # it were src-tauri/Cargo.toml (never the real file — this lives
           # entirely under /tmp), scanned through the exact path string the
@@ -107,14 +117,7 @@ jobs:
             exit 1
           fi
 
-          # Lockfile: catches transitive pulls that no manifest names. One
-          # workspace lockfile already covers src-tauri's resolved deps too.
-          if grep -En "$LOCKED" Cargo.lock; then
-            echo "::error::A forbidden crate appears in the resolved dependency graph."
-            exit 1
-          fi
-
-          echo "no HTTP client or telemetry dependencies found (manifests, workspace root, src-tauri, and lockfile)"
+          echo "no HTTP client or telemetry dependencies found (manifests, workspace root, and src-tauri)"
 
       - name: Assert no hand-rolled sockets in the source
         run: |
@@ -238,3 +241,41 @@ jobs:
           fi
 
           echo "no filesystem writes found in perch-core (db.rs excluded) or $SRC_TAURI_SRC_DIR ($SRC_TAURI_WRITE_EXCLUDE excluded)"
+
+      - name: Assert forbidden crates are unreachable in the resolved dependency graph
+        run: |
+          set -uo pipefail
+
+          # A lockfile lists every platform's dependencies — tauri declares
+          # reqwest/hyper as dependencies of its Android/iOS targets, which we
+          # never build, so a plain `grep Cargo.lock` here produced a false
+          # positive (found by actually running this check by hand). `cargo
+          # tree -i` against the HOST build graph keeps the property we
+          # wanted from the lockfile scan — catching transitive pulls that no
+          # manifest names — while ignoring deps gated to platforms this
+          # workspace never builds.
+          FORBIDDEN="reqwest hyper ureq curl isahc surf sentry posthog segment mixpanel datadog"
+
+          # `cargo tree -i <crate-absent-from-the-graph>` prints a "nothing to
+          # print" warning to stderr and exits 0 (verified by hand: `cargo
+          # tree -i reqwest -p perch-app; echo $?` prints the warning and
+          # `0`). So this checks stdout content, never the exit code — trusting
+          # the exit code here would make every iteration of the loop below
+          # silently "pass" regardless of what is actually in the graph.
+          #
+          # Positive control: the probe must find a crate that IS present, or
+          # a broken invocation would silently pass everything.
+          if ! cargo tree -i serde -p perch-core --edges normal 2>/dev/null | grep -q '^serde '; then
+            echo "::error::Guard self-test failed: cargo tree did not find serde in perch-core."
+            exit 1
+          fi
+
+          for crate in $FORBIDDEN; do
+            if cargo tree -i "$crate" ${{ matrix.cargo-scope }} --edges normal 2>/dev/null | grep -q "^$crate "; then
+              echo "::error::Forbidden crate '$crate' is reachable in the resolved dependency graph."
+              cargo tree -i "$crate" ${{ matrix.cargo-scope }} --edges normal
+              exit 1
+            fi
+          done
+
+          echo "resolved-graph check clean (${{ matrix.cargo-scope }})"
