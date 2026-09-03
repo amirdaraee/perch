@@ -72,5 +72,29 @@ pub fn spawn(app: AppHandle) {
 
 fn emit_now(app: &AppHandle, dir: &std::path::Path) {
     let sessions = live::live_sessions(dir, &RealProcessProbe);
-    let _ = app.emit("sessions-changed", sessions);
+    let _ = app.emit("sessions-changed", &sessions);
+
+    // Spec §9.1 asks for a window-utilization percentage, which needs the
+    // tier-1 rate-limit endpoint (a later milestone). §8 forbids fabricating
+    // a percentage against an unknown ceiling, so show what can be shown
+    // honestly: a live-session count, with an hourglass when something is
+    // blocked waiting.
+    let waiting = sessions
+        .iter()
+        .filter(|s| matches!(s.status, live::SessionStatus::Waiting { .. }))
+        .count();
+    let title = if waiting > 0 {
+        format!("{} ⏳", waiting)
+    } else if sessions.is_empty() {
+        String::new()
+    } else {
+        format!("{}", sessions.len())
+    };
+    // TrayIcon::set_title dispatches to the main thread internally (via
+    // run_on_main_thread, blocking on a channel recv) and is documented as
+    // safe to call from any thread, including this watcher thread — no
+    // explicit run_on_main_thread wrapping needed here.
+    if let Some(tray) = app.tray_by_id("perch-tray") {
+        let _ = tray.set_title(Some(title));
+    }
 }
