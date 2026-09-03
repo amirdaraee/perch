@@ -4,6 +4,8 @@ use tauri::{
     Manager, WindowEvent,
 };
 
+mod commands;
+
 // A menu-bar popover must appear over whatever Space is active, including a
 // fullscreen app's own Space. Debugging established that neither
 // set_visible_on_all_workspaces() nor setting the raw NSWindowCollectionBehavior
@@ -152,6 +154,11 @@ pub fn run() {
 
             Ok(())
         })
+        .invoke_handler(tauri::generate_handler![
+            commands::live_sessions,
+            commands::usage_summary,
+            commands::reindex
+        ])
         .on_window_event(|window, event| {
             // Closing the popover must not quit the app — Perch lives in the tray.
             if let WindowEvent::CloseRequested { api, .. } = event {

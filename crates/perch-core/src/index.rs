@@ -8,7 +8,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct IndexStats {
     pub projects: usize,
     pub sessions: usize,
