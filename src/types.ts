@@ -25,4 +25,6 @@ export interface UsageSummary {
   week: UsageSlice
   today: UsageSlice
   source: 'estimated' | 'api'
+  /** False when the index holds no turns yet: the zeros mean "nothing indexed", not "no spend". */
+  hasData: boolean
 }
