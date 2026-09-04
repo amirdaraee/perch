@@ -54,6 +54,7 @@ mod tests {
     fn cost_has_two_decimals() {
         assert_eq!(human_cost(0.0), "$0.00");
         assert_eq!(human_cost(8.204), "$8.20");
+        assert_eq!(human_cost(38.0), "$38.00");
     }
 
     #[test]
