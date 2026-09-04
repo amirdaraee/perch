@@ -384,16 +384,29 @@ mod tests {
     }
 
     #[test]
-    fn stop_from_inside_the_callback_does_not_deadlock() {
+    fn stop_from_inside_the_callback_does_not_deadlock_or_panic() {
         // `on_sessions` runs synchronously on the watcher thread. A caller
         // that stashes the handle somewhere reachable from the callback (the
         // FFI layer plausibly will) and calls `stop()` from inside it must
-        // not have that thread join itself. There is no explicit assertion
-        // here: a regression would hang this test forever rather than fail
-        // it, which the test harness itself reports as a failure.
+        // not have that thread join itself.
+        //
+        // On this platform a self-join does not hang: `pthread_join` on your
+        // own thread returns EDEADLK, which `JoinHandle::join()` turns into a
+        // panic ("failed to join thread: Resource deadlock avoided"). That
+        // panic happens entirely on the detached watcher thread; a test that
+        // only sleeps and never observes that thread (as an earlier version
+        // of this test did) passes whether or not the guard in `stop()`
+        // exists. So this version captures what `stop()` actually does --
+        // returns cleanly, or panics -- via `catch_unwind` inside the
+        // callback, sends that outcome back over a channel, and asserts on
+        // it directly. A bounded `recv_timeout` also covers the case where
+        // some other platform's self-join genuinely hangs instead of
+        // panicking: this test then fails via timeout rather than hanging
+        // the test binary itself.
         let tmp = tempfile::tempdir().unwrap();
         let handle_slot: Arc<Mutex<Option<WatcherHandle>>> = Arc::new(Mutex::new(None));
         let slot = handle_slot.clone();
+        let (outcome_tx, outcome_rx) = mpsc::channel::<std::thread::Result<()>>();
         let h = spawn(
             WatcherConfig {
                 sessions_dir: tmp.path().to_path_buf(),
@@ -403,17 +416,20 @@ mod tests {
             Arc::new(AllAlive),
             move |_s| {
                 if let Some(h) = slot.lock().unwrap().take() {
-                    h.stop();
+                    let outcome =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.stop()));
+                    let _ = outcome_tx.send(outcome);
                 }
             },
         );
         *handle_slot.lock().unwrap() = Some(h);
 
-        // Give the watcher thread a moment to run its initial emit (which
-        // triggers the callback above, which calls stop() on itself) and
-        // exit. If stop() deadlocked, this thread would simply run out the
-        // clock without ever observing an exited watcher -- there is nothing
-        // further to assert; reaching the end of the test is the proof.
-        std::thread::sleep(Duration::from_millis(300));
+        let outcome = outcome_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("stop() called from inside its own callback must return within 2s, not hang");
+        assert!(
+            outcome.is_ok(),
+            "stop() called from inside its own callback must not panic (e.g. via a self-join)"
+        );
     }
 }
