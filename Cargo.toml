@@ -18,3 +18,4 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 libc = "0.2"
+notify = "8"
