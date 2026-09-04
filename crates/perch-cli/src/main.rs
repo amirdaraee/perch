@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use perch_core::ui::format::{elapsed_or_dash, human_cost, human_tokens};
 use perch_core::{config, db, index, pricing, query};
 use std::path::PathBuf;
 
@@ -30,43 +31,6 @@ enum Command {
     Models,
     /// List live Claude Code sessions.
     Sessions,
-}
-
-fn human_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}k", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
-}
-
-fn human_cost(c: f64) -> String {
-    format!("${c:.2}")
-}
-
-fn human_elapsed(ms: i64) -> String {
-    let s = ms.max(0) / 1000;
-    if s < 60 {
-        format!("{s}s")
-    } else if s < 3600 {
-        format!("{}m", s / 60)
-    } else {
-        format!("{}h", s / 3600)
-    }
-}
-
-/// A non-positive `since` means the record carried no timestamp at all (e.g.
-/// a just-started session with no `statusUpdatedAt` yet) — that is "no data",
-/// not "zero elapsed", so it must not be handed to `human_elapsed` as a
-/// duration.
-fn elapsed_or_dash(now: i64, since: i64) -> String {
-    if since <= 0 {
-        "—".to_string()
-    } else {
-        human_elapsed(now - since)
-    }
 }
 
 fn main() -> Result<()> {
@@ -209,48 +173,4 @@ fn truncate(s: &str, max: usize) -> String {
     }
     let tail: String = s.chars().skip(s.chars().count() - (max - 1)).collect();
     format!("…{tail}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn formats_large_token_counts_compactly() {
-        assert_eq!(human_tokens(0), "0");
-        assert_eq!(human_tokens(999), "999");
-        assert_eq!(human_tokens(1_500), "1.5k");
-        assert_eq!(human_tokens(24_221), "24.2k");
-        assert_eq!(human_tokens(4_100_000), "4.1M");
-    }
-
-    #[test]
-    fn formats_cost_with_two_decimals() {
-        assert_eq!(human_cost(0.0), "$0.00");
-        assert_eq!(human_cost(8.204), "$8.20");
-        assert_eq!(human_cost(38.0), "$38.00");
-    }
-
-    #[test]
-    fn formats_elapsed_durations_compactly() {
-        assert_eq!(human_elapsed(0), "0s");
-        assert_eq!(human_elapsed(45_000), "45s");
-        assert_eq!(human_elapsed(90_000), "1m");
-        assert_eq!(human_elapsed(3_600_000), "1h");
-        assert_eq!(human_elapsed(115_200_000), "32h");
-    }
-
-    #[test]
-    fn a_missing_timestamp_is_a_dash_not_a_giant_duration() {
-        let now = 1_000_000_000;
-        assert_eq!(elapsed_or_dash(now, 0), "—");
-        assert_eq!(elapsed_or_dash(now, -5), "—");
-    }
-
-    #[test]
-    fn a_real_timestamp_formats_the_same_as_human_elapsed() {
-        let now = 1_000_000_000;
-        let since = now - 45_000;
-        assert_eq!(elapsed_or_dash(now, since), human_elapsed(now - since));
-    }
 }
