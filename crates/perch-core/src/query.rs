@@ -157,6 +157,73 @@ pub fn usage_by_model(db: &Db) -> Result<Vec<(String, TurnUsage, f64)>> {
     Ok(out)
 }
 
+#[derive(Debug, Clone)]
+pub struct RecentSession {
+    pub id: String,
+    pub cwd: Option<String>,
+    pub last_activity_at: i64,
+    pub usage: TurnUsage,
+    pub cost_usd: f64,
+}
+
+/// Tokens and estimated cost for one session, priced per model and summed.
+/// An unknown session is simply zero — it is not an error to ask.
+pub fn session_usage(db: &Db, session_id: &str) -> Result<(TurnUsage, f64)> {
+    let args: [&dyn rusqlite::ToSql; 1] = [&session_id];
+    let per_model = usage_rows(
+        db,
+        &format!("SELECT model, {SUMS} FROM turns WHERE session_id = ?1 GROUP BY model"),
+        &args,
+    )?;
+    let mut usage = TurnUsage::default();
+    let mut cost = 0.0;
+    for (model, u) in &per_model {
+        usage = usage.plus(u);
+        cost += cost_of(db, model, u)?;
+    }
+    Ok((usage, cost))
+}
+
+/// The most recently active sessions that are NOT currently live, newest first.
+pub fn recent_sessions(
+    db: &Db,
+    exclude_ids: &[String],
+    limit: usize,
+) -> Result<Vec<RecentSession>> {
+    let mut stmt = db.conn().prepare(
+        "SELECT id, cwd, last_activity_at FROM sessions
+         WHERE last_activity_at IS NOT NULL
+         ORDER BY last_activity_at DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, cwd, last) = row?;
+        if exclude_ids.iter().any(|x| x == &id) {
+            continue;
+        }
+        let (usage, cost_usd) = session_usage(db, &id)?;
+        out.push(RecentSession {
+            id,
+            cwd,
+            last_activity_at: last,
+            usage,
+            cost_usd,
+        });
+        if out.len() == limit {
+            break;
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +364,85 @@ mod tests {
         assert_eq!(rows[0].sessions, 0);
         assert_eq!(rows[0].usage.total_tokens(), 0);
         assert!(rows[0].path_is_guess);
+    }
+
+    fn seed_session(db: &Db, pid: i64, id: &str, cwd: &str, last: i64, input: u64) {
+        db.upsert_session(&SessionRecord {
+            id: id.into(),
+            project_id: pid,
+            file_path: format!("/tmp/{id}.jsonl"),
+            file_size: 0,
+            indexed_offset: 0,
+            started_at: Some(last - 1000),
+            last_activity_at: Some(last),
+            cwd: Some(cwd.into()),
+            git_branch: None,
+            cc_version: None,
+            message_count: 1,
+        })
+        .unwrap();
+        db.insert_turns(
+            id,
+            &[Turn {
+                ts: last,
+                model: "claude-fable-5".into(),
+                usage: TurnUsage {
+                    input,
+                    ..Default::default()
+                },
+            }],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn session_usage_prices_per_model() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let pid = db
+            .upsert_project("-Users-a-one", "/Users/a/one", false)
+            .unwrap();
+        seed_session(&db, pid, "s-a", "/Users/a/one", 10_000, 2_000_000);
+        let (u, cost) = session_usage(&db, "s-a").unwrap();
+        assert_eq!(u.input, 2_000_000);
+        assert!((cost - 30.0).abs() < 1e-9, "2 MTok at fable input 15.0");
+    }
+
+    #[test]
+    fn session_usage_for_unknown_session_is_zero_not_error() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let (u, cost) = session_usage(&db, "nope").unwrap();
+        assert_eq!(u.total_tokens(), 0);
+        assert_eq!(cost, 0.0);
+    }
+
+    #[test]
+    fn recent_sessions_are_newest_first_and_skip_live_ones() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let pid = db
+            .upsert_project("-Users-a-one", "/Users/a/one", false)
+            .unwrap();
+        seed_session(&db, pid, "old", "/Users/a/one", 1_000, 1);
+        seed_session(&db, pid, "mid", "/Users/a/one", 2_000, 1);
+        seed_session(&db, pid, "new", "/Users/a/one", 3_000, 1);
+        seed_session(&db, pid, "live", "/Users/a/one", 4_000, 1);
+
+        let rows = recent_sessions(&db, &["live".to_string()], 2).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["new", "mid"],
+            "newest first, live excluded, limited to 2"
+        );
+        assert_eq!(rows[0].cwd.as_deref(), Some("/Users/a/one"));
+        assert_eq!(rows[0].usage.input, 1);
+    }
+
+    #[test]
+    fn recent_sessions_with_empty_index_is_empty() {
+        let db = open_in_memory().unwrap();
+        assert!(recent_sessions(&db, &[], 3).unwrap().is_empty());
     }
 }
