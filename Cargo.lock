@@ -2484,6 +2484,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "libc",
+ "notify",
  "rusqlite",
  "serde",
  "serde_json",
