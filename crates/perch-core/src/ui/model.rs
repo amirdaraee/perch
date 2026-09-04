@@ -147,17 +147,27 @@ pub fn build_model(db: Option<&Db>, live: &[LiveSession], now_ms: i64) -> Popove
         None => dashed_stats(),
     };
 
+    // A row- or recent-list-level query failure still degrades honestly (a dash,
+    // an empty list — never a fabricated zero), but must not vanish silently:
+    // flag it here and fold it into `error` below, without clobbering a more
+    // specific message `stats_from` may already have set.
+    let mut data_error = false;
+
     let rows: Vec<SessionRow> = live
         .iter()
         .map(|s| {
             let (status, status_label, since) = status_of(s);
-            let (tokens, cost) =
-                match db.and_then(|d| crate::query::session_usage(d, &s.session_id).ok()) {
-                    Some((u, c)) if u.total_tokens() > 0 => {
-                        (human_tokens(u.total_tokens()), human_cost(c))
-                    }
-                    _ => (DASH.into(), DASH.into()),
-                };
+            let (tokens, cost) = match db.map(|d| crate::query::session_usage(d, &s.session_id)) {
+                Some(Ok((u, c))) if u.total_tokens() > 0 => {
+                    (human_tokens(u.total_tokens()), human_cost(c))
+                }
+                Some(Ok(_)) => (DASH.into(), DASH.into()),
+                Some(Err(_)) => {
+                    data_error = true;
+                    (DASH.into(), DASH.into())
+                }
+                None => (DASH.into(), DASH.into()),
+            };
             SessionRow {
                 id: s.session_id.clone(),
                 pid: s.pid,
@@ -179,29 +189,39 @@ pub fn build_model(db: Option<&Db>, live: &[LiveSession], now_ms: i64) -> Popove
         .collect();
 
     let live_ids: Vec<String> = live.iter().map(|s| s.session_id.clone()).collect();
-    let recent: Vec<RecentRow> = db
-        .and_then(|d| crate::query::recent_sessions(d, &live_ids, RECENT_LIMIT).ok())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| {
-            let project = r
-                .cwd
-                .as_deref()
-                .map(project_of)
-                .unwrap_or_else(|| r.id.chars().take(8).collect());
-            RecentRow {
-                id: r.id,
-                name: project.clone(),
-                project,
-                ended_ago: human_elapsed(now_ms - r.last_activity_at),
-                tokens: if r.usage.total_tokens() > 0 {
-                    human_tokens(r.usage.total_tokens())
-                } else {
-                    DASH.into()
-                },
+    let recent: Vec<RecentRow> =
+        match db.map(|d| crate::query::recent_sessions(d, &live_ids, RECENT_LIMIT)) {
+            Some(Ok(found)) => found
+                .into_iter()
+                .map(|r| {
+                    let project = r
+                        .cwd
+                        .as_deref()
+                        .map(project_of)
+                        .unwrap_or_else(|| r.id.chars().take(8).collect());
+                    RecentRow {
+                        id: r.id,
+                        name: project.clone(),
+                        project,
+                        ended_ago: human_elapsed(now_ms - r.last_activity_at),
+                        tokens: if r.usage.total_tokens() > 0 {
+                            human_tokens(r.usage.total_tokens())
+                        } else {
+                            DASH.into()
+                        },
+                    }
+                })
+                .collect(),
+            Some(Err(_)) => {
+                data_error = true;
+                Vec::new()
             }
-        })
-        .collect();
+            None => Vec::new(),
+        };
+
+    if data_error {
+        error.get_or_insert_with(|| "some session data unavailable".to_string());
+    }
 
     PopoverModel {
         stats,
@@ -386,6 +406,7 @@ mod tests {
         assert_eq!(m.stats.day_cost, "$30.00");
         assert_eq!(m.live[0].tokens, "2.0M");
         assert_eq!(m.live[0].cost, "$30.00");
+        assert_eq!(m.error, None, "the healthy path must not report an error");
     }
 
     #[test]
@@ -424,5 +445,126 @@ mod tests {
         assert_eq!(m.recent[0].id, "gone");
         assert_eq!(m.recent[0].project, "proj");
         assert_eq!(m.recent[0].ended_ago, "2s");
+        assert_eq!(m.error, None, "the healthy path must not report an error");
+    }
+
+    /// Break only `recent_sessions` (it selects `sessions.cwd`, renamed away
+    /// here) while leaving `turns` intact, so `stats_from` and per-row
+    /// `session_usage` (both read only `turns`) stay healthy. Dropping the
+    /// `sessions` table outright would fail on its own — `turns.session_id`
+    /// has a live foreign key into it — so a column rename is used instead
+    /// to isolate the failure to the one query. Proves a failure isolated to
+    /// the recent-list query is surfaced, not swallowed by `.ok()`.
+    #[test]
+    fn recent_sessions_failure_is_surfaced_without_breaking_stats_or_rows() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let pid = db
+            .upsert_project("-Users-a-proj", "/Users/a/proj", false)
+            .unwrap();
+        db.upsert_session(&SessionRecord {
+            id: "a".into(),
+            project_id: pid,
+            file_path: "/tmp/a.jsonl".into(),
+            file_size: 0,
+            indexed_offset: 0,
+            started_at: Some(1_000),
+            last_activity_at: Some(9_000),
+            cwd: Some("/Users/a/proj".into()),
+            git_branch: None,
+            cc_version: None,
+            message_count: 1,
+        })
+        .unwrap();
+        db.insert_turns(
+            "a",
+            &[Turn {
+                ts: 9_000,
+                model: "claude-fable-5".into(),
+                usage: TurnUsage {
+                    input: 2_000_000,
+                    ..Default::default()
+                },
+            }],
+        )
+        .unwrap();
+        db.conn()
+            .execute("ALTER TABLE sessions RENAME COLUMN cwd TO cwd_renamed", [])
+            .unwrap();
+
+        let s = live(
+            7,
+            "a",
+            "alpha",
+            "/Users/a/proj",
+            SessionStatus::Working,
+            "interactive",
+        );
+        let m = build_model(Some(&db), &[s], 10_000);
+        assert_eq!(
+            m.error.as_deref(),
+            Some("some session data unavailable"),
+            "a recent_sessions failure must not vanish silently"
+        );
+        assert!(
+            m.stats.has_data,
+            "stats reads only `turns`, which is intact"
+        );
+        assert_eq!(m.stats.window_tokens, "2.0M");
+        assert_eq!(
+            m.live[0].tokens, "2.0M",
+            "per-row usage reads only `turns`, which is intact"
+        );
+        assert!(
+            m.recent.is_empty(),
+            "degrades to an empty list, not a panic"
+        );
+    }
+
+    /// Break `turns` itself, which both `stats_from` and the row/recent
+    /// queries depend on. `stats_from` runs first and sets the specific
+    /// "index unavailable" message; the row- and recent-level failures that
+    /// follow must not clobber it with the generic message.
+    #[test]
+    fn a_more_specific_stats_error_is_not_clobbered_by_row_level_failures() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let pid = db
+            .upsert_project("-Users-a-proj", "/Users/a/proj", false)
+            .unwrap();
+        db.upsert_session(&SessionRecord {
+            id: "a".into(),
+            project_id: pid,
+            file_path: "/tmp/a.jsonl".into(),
+            file_size: 0,
+            indexed_offset: 0,
+            started_at: Some(1_000),
+            last_activity_at: Some(9_000),
+            cwd: Some("/Users/a/proj".into()),
+            git_branch: None,
+            cc_version: None,
+            message_count: 1,
+        })
+        .unwrap();
+        db.conn().execute("DROP TABLE turns", []).unwrap();
+
+        let s = live(
+            7,
+            "a",
+            "alpha",
+            "/Users/a/proj",
+            SessionStatus::Working,
+            "interactive",
+        );
+        let m = build_model(Some(&db), &[s], 10_000);
+        let msg = m.error.expect("a broken index must report an error");
+        assert!(
+            msg.starts_with("index unavailable"),
+            "the specific stats_from message must win, got: {msg}"
+        );
+        assert!(!m.stats.has_data);
+        assert_eq!(m.stats.window_tokens, "—");
+        assert_eq!(m.live[0].tokens, "—");
+        assert!(m.recent.is_empty());
     }
 }
