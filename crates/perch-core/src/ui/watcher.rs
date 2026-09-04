@@ -42,6 +42,7 @@ enum Event {
 pub struct WatcherHandle {
     events: mpsc::Sender<Event>,
     thread: Option<std::thread::JoinHandle<()>>,
+    thread_id: std::thread::ThreadId,
 }
 
 impl WatcherHandle {
@@ -51,11 +52,35 @@ impl WatcherHandle {
     }
 
     /// Stop the watcher thread and block until it has exited.
+    ///
+    /// `on_sessions` runs synchronously on the watcher thread, so calling
+    /// `stop()` from inside that callback would otherwise deadlock: this
+    /// thread would join itself. That case is detected and tolerated here —
+    /// the `Stop` command is still sent (and will be processed once the
+    /// callback returns control to the run loop), but the join is skipped
+    /// rather than waiting forever. Called from any other thread, `stop()`
+    /// blocks until the watcher thread has actually exited.
     pub fn stop(mut self) {
         let _ = self.events.send(Event::Cmd(Cmd::Stop));
+        if std::thread::current().id() == self.thread_id {
+            return;
+        }
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+    }
+}
+
+impl Drop for WatcherHandle {
+    /// Safety net for a handle dropped without calling `stop()`: the run
+    /// loop holds its own clone of this sender (for the filesystem-watch
+    /// callback), so the channel never disconnects on its own — without this,
+    /// the thread, and the live OS-level notify watch it holds, would leak
+    /// forever. `Drop` must not block, so this only asks the thread to exit;
+    /// it does not join. Calling `stop()` explicitly remains the way to wait
+    /// for a clean, joined shutdown.
+    fn drop(&mut self) {
+        let _ = self.events.send(Event::Cmd(Cmd::Stop));
     }
 }
 
@@ -69,9 +94,11 @@ where
     let (ev_tx, ev_rx) = mpsc::channel::<Event>();
     let fs_tx = ev_tx.clone();
     let thread = std::thread::spawn(move || run(cfg, probe, on_sessions, fs_tx, ev_rx));
+    let thread_id = thread.thread().id();
     WatcherHandle {
         events: ev_tx,
         thread: Some(thread),
+        thread_id,
     }
 }
 
@@ -101,7 +128,7 @@ fn run<F>(
     // then fails with `path_not_found`. Fall through to a poll-only loop and
     // retry `watch()` on every tick. The directory is never created here —
     // Perch is strictly read-only with respect to the Claude Code directory.
-    let mut watching = try_watch(watcher.as_mut(), &dir, true);
+    let mut watching = try_watch(watcher.as_mut(), &dir, cfg.poll, false);
 
     emit(&*probe);
     let mut last = Instant::now();
@@ -141,7 +168,7 @@ fn run<F>(
                 // last tick. One success promotes us back to the normal
                 // debounced loop.
                 if !watching {
-                    watching = try_watch(watcher.as_mut(), &dir, false);
+                    watching = try_watch(watcher.as_mut(), &dir, cfg.poll, true);
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -150,20 +177,34 @@ fn run<F>(
 }
 
 /// Never creates the directory: if it is absent, `watch` fails and we poll instead.
+///
+/// `is_retry` distinguishes the initial attempt from a later poll-tick retry:
+/// the initial attempt logs its failure once (with the poll interval, so a
+/// caller knows the cadence to expect); a later retry stays silent on repeated
+/// failure (already logged), but logs once, on success, the `false -> true`
+/// promotion back onto the filesystem watch.
 fn try_watch(
     watcher: Option<&mut notify::RecommendedWatcher>,
     dir: &Path,
-    log_failure: bool,
+    poll: Duration,
+    is_retry: bool,
 ) -> bool {
     let Some(w) = watcher else { return false };
     match w.watch(dir, RecursiveMode::NonRecursive) {
-        Ok(()) => true,
-        Err(err) => {
-            if log_failure {
+        Ok(()) => {
+            if is_retry {
                 eprintln!(
-                    "perch: watcher: failed to watch {}: {err} — polling every {:?} and retrying",
-                    dir.display(),
-                    Duration::from_secs(5)
+                    "perch: watcher: now watching {} (was polling)",
+                    dir.display()
+                );
+            }
+            true
+        }
+        Err(err) => {
+            if !is_retry {
+                eprintln!(
+                    "perch: watcher: failed to watch {}: {err} — polling every {poll:?} and retrying",
+                    dir.display()
                 );
             }
             false
@@ -175,6 +216,7 @@ fn try_watch(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+    use std::sync::Mutex;
 
     struct AllAlive;
     impl ProcessProbe for AllAlive {
@@ -193,22 +235,27 @@ mod tests {
         ).unwrap();
     }
 
-    fn cfg(dir: &Path) -> WatcherConfig {
-        WatcherConfig {
-            sessions_dir: dir.to_path_buf(),
-            debounce: Duration::from_millis(50),
-            poll: Duration::from_millis(300),
-        }
-    }
-
     #[test]
     fn emits_once_on_start_and_again_on_change() {
         let tmp = tempfile::tempdir().unwrap();
         write_record(tmp.path(), 1, "one");
         let (tx, rx) = mpsc::channel();
-        let h = spawn(cfg(tmp.path()), Arc::new(AllAlive), move |s| {
-            let _ = tx.send(s);
-        });
+        // Poll is 30s -- far longer than this test's own deadline below -- so
+        // the second emit this test waits for can only have arrived via the
+        // filesystem watch + debounce path, not the poll backstop. A
+        // poll-only implementation that silently ignored filesystem events
+        // could not pass this test.
+        let h = spawn(
+            WatcherConfig {
+                sessions_dir: tmp.path().to_path_buf(),
+                debounce: Duration::from_millis(50),
+                poll: Duration::from_secs(30),
+            },
+            Arc::new(AllAlive),
+            move |s| {
+                let _ = tx.send(s);
+            },
+        );
 
         let first = rx
             .recv_timeout(Duration::from_secs(2))
@@ -228,7 +275,7 @@ mod tests {
         }
         assert!(
             seen.contains(&2),
-            "a new record must surface via watch or poll"
+            "a new record must surface via the filesystem watch (poll is 30s, far longer than this test's 3s deadline)"
         );
         h.stop();
     }
@@ -238,9 +285,21 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("sessions");
         let (tx, rx) = mpsc::channel();
-        let h = spawn(cfg(&missing), Arc::new(AllAlive), move |s| {
-            let _ = tx.send(s);
-        });
+        // A 2s poll: long enough that, after promotion, a change surfacing
+        // well under that interval can only be explained by the filesystem
+        // watch having taken over -- not by "the next poll happened to catch
+        // it", which a broken promotion retry could also produce.
+        let h = spawn(
+            WatcherConfig {
+                sessions_dir: missing.clone(),
+                debounce: Duration::from_millis(50),
+                poll: Duration::from_secs(2),
+            },
+            Arc::new(AllAlive),
+            move |s| {
+                let _ = tx.send(s);
+            },
+        );
 
         let first = rx
             .recv_timeout(Duration::from_secs(2))
@@ -251,20 +310,54 @@ mod tests {
             "watcher must never create the sessions dir"
         );
 
-        // Directory appears later: the retry should pick up the record within a few polls.
+        // Directory appears later: the retry should pick up the record on
+        // the next poll tick.
         std::fs::create_dir_all(&missing).unwrap();
         write_record(&missing, 3, "three");
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let mut got = false;
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut got_first = false;
         while Instant::now() < deadline {
             if let Ok(s) = rx.recv_timeout(Duration::from_millis(200)) {
                 if s.len() == 1 {
-                    got = true;
+                    got_first = true;
                     break;
                 }
             }
         }
-        assert!(got, "record written after the dir appears must surface");
+        assert!(
+            got_first,
+            "record written after the dir appears must surface"
+        );
+
+        // Prove promotion actually happened, rather than inferring it from
+        // "an update eventually arrived": a further change must now surface
+        // well inside the 2s poll interval, which is only possible if the
+        // retry above actually switched us onto the filesystem watch.
+        //
+        // The retry's `try_watch()` call lands just *after* the emit that
+        // reported `got_first`, so there is a brief window right at
+        // promotion where a single write can race the watch registration
+        // and be missed. Rather than papering over that with a blind sleep,
+        // keep nudging the file (each write distinct, so each is a real
+        // filesystem event) until one is observed — deterministic once the
+        // watch is truly live, and still bounded well under the poll.
+        let promoted_deadline = Instant::now() + Duration::from_millis(1500);
+        let mut promoted = false;
+        let mut attempt = 0;
+        while Instant::now() < promoted_deadline {
+            attempt += 1;
+            write_record(&missing, 4, &format!("four-{attempt}"));
+            if let Ok(s) = rx.recv_timeout(Duration::from_millis(100)) {
+                if s.len() == 2 {
+                    promoted = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            promoted,
+            "a change after promotion must surface via the watch, well under the 2s poll interval"
+        );
         h.stop();
     }
 
@@ -288,5 +381,39 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(1))
             .expect("refresh must not wait for the 30s poll");
         h.stop();
+    }
+
+    #[test]
+    fn stop_from_inside_the_callback_does_not_deadlock() {
+        // `on_sessions` runs synchronously on the watcher thread. A caller
+        // that stashes the handle somewhere reachable from the callback (the
+        // FFI layer plausibly will) and calls `stop()` from inside it must
+        // not have that thread join itself. There is no explicit assertion
+        // here: a regression would hang this test forever rather than fail
+        // it, which the test harness itself reports as a failure.
+        let tmp = tempfile::tempdir().unwrap();
+        let handle_slot: Arc<Mutex<Option<WatcherHandle>>> = Arc::new(Mutex::new(None));
+        let slot = handle_slot.clone();
+        let h = spawn(
+            WatcherConfig {
+                sessions_dir: tmp.path().to_path_buf(),
+                debounce: Duration::from_millis(10),
+                poll: Duration::from_millis(50),
+            },
+            Arc::new(AllAlive),
+            move |_s| {
+                if let Some(h) = slot.lock().unwrap().take() {
+                    h.stop();
+                }
+            },
+        );
+        *handle_slot.lock().unwrap() = Some(h);
+
+        // Give the watcher thread a moment to run its initial emit (which
+        // triggers the callback above, which calls stop() on itself) and
+        // exit. If stop() deadlocked, this thread would simply run out the
+        // clock without ever observing an exited watcher -- there is nothing
+        // further to assert; reaching the end of the test is the proof.
+        std::thread::sleep(Duration::from_millis(300));
     }
 }
