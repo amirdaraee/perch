@@ -342,8 +342,9 @@ mod tests {
 
     #[test]
     fn missing_config_dir_is_a_typed_error() {
-        let data_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("PERCH_DATA_DIR", data_dir.path());
+        // No PERCH_DATA_DIR needed: `Perch::new` rejects a non-existent
+        // config dir before it ever resolves the app-data path, so this
+        // test has no reason to touch that (process-global) env var.
         let err = Perch::new(Some("/definitely/not/here".into()))
             .err()
             .expect("must fail");
