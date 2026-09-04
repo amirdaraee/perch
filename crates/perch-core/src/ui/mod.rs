@@ -2,3 +2,4 @@
 //! platform renders the same thing.
 pub mod format;
 pub mod model;
+pub mod watcher;
