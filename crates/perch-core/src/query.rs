@@ -59,6 +59,18 @@ fn cost_of(db: &Db, model: &str, usage: &TurnUsage) -> Result<f64> {
     })
 }
 
+/// Reduce per-model usage rows into a total: tokens summed across models, and
+/// cost summed after pricing each model's tokens at that model's own rate.
+fn priced_usage(db: &Db, per_model: &[(String, TurnUsage)]) -> Result<(TurnUsage, f64)> {
+    let mut usage = TurnUsage::default();
+    let mut cost = 0.0;
+    for (model, u) in per_model {
+        usage = usage.plus(u);
+        cost += cost_of(db, model, u)?;
+    }
+    Ok((usage, cost))
+}
+
 pub fn project_summaries(db: &Db) -> Result<Vec<ProjectSummary>> {
     let mut stmt = db.conn().prepare(
         "SELECT id, slug, real_path, display_name, parent_project_id, path_is_guess
@@ -95,12 +107,7 @@ pub fn project_summaries(db: &Db) -> Result<Vec<ProjectSummary>> {
             &[&id],
         )?;
 
-        let mut usage = TurnUsage::default();
-        let mut cost = 0.0;
-        for (model, u) in &per_model {
-            usage = usage.plus(u);
-            cost += cost_of(db, model, u)?;
-        }
+        let (usage, cost) = priced_usage(db, &per_model)?;
 
         let last_activity_at: Option<i64> = db.conn().query_row(
             "SELECT MAX(ts) FROM turns
@@ -133,14 +140,7 @@ pub fn usage_since(db: &Db, since_ms: i64) -> Result<(TurnUsage, f64)> {
         &format!("SELECT model, {SUMS} FROM turns WHERE ts >= ?1 GROUP BY model"),
         &[&since_ms],
     )?;
-
-    let mut usage = TurnUsage::default();
-    let mut cost = 0.0;
-    for (model, u) in &per_model {
-        usage = usage.plus(u);
-        cost += cost_of(db, model, u)?;
-    }
-    Ok((usage, cost))
+    priced_usage(db, &per_model)
 }
 
 pub fn usage_by_model(db: &Db) -> Result<Vec<(String, TurnUsage, f64)>> {
@@ -175,13 +175,7 @@ pub fn session_usage(db: &Db, session_id: &str) -> Result<(TurnUsage, f64)> {
         &format!("SELECT model, {SUMS} FROM turns WHERE session_id = ?1 GROUP BY model"),
         &args,
     )?;
-    let mut usage = TurnUsage::default();
-    let mut cost = 0.0;
-    for (model, u) in &per_model {
-        usage = usage.plus(u);
-        cost += cost_of(db, model, u)?;
-    }
-    Ok((usage, cost))
+    priced_usage(db, &per_model)
 }
 
 /// The most recently active sessions that are NOT currently live, newest first.
@@ -190,6 +184,9 @@ pub fn recent_sessions(
     exclude_ids: &[String],
     limit: usize,
 ) -> Result<Vec<RecentSession>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let mut stmt = db.conn().prepare(
         "SELECT id, cwd, last_activity_at FROM sessions
          WHERE last_activity_at IS NOT NULL
@@ -397,15 +394,61 @@ mod tests {
 
     #[test]
     fn session_usage_prices_per_model() {
+        // claude-fable-5 and claude-opus-5 have byte-identical default rates,
+        // so a single-model fixture can't prove per-model pricing is applied
+        // (a bug that resolved the wrong model's price would still pass).
+        // Use two models with genuinely different input rates instead:
+        // fable at $15.0/MTok and sonnet at $3.0/MTok.
         let db = open_in_memory().unwrap();
         seed_default_prices(&db).unwrap();
         let pid = db
             .upsert_project("-Users-a-one", "/Users/a/one", false)
             .unwrap();
-        seed_session(&db, pid, "s-a", "/Users/a/one", 10_000, 2_000_000);
+        db.upsert_session(&SessionRecord {
+            id: "s-a".into(),
+            project_id: pid,
+            file_path: "/tmp/s-a.jsonl".into(),
+            file_size: 0,
+            indexed_offset: 0,
+            started_at: Some(9_000),
+            last_activity_at: Some(10_000),
+            cwd: Some("/Users/a/one".into()),
+            git_branch: None,
+            cc_version: None,
+            message_count: 2,
+        })
+        .unwrap();
+        db.insert_turns(
+            "s-a",
+            &[
+                Turn {
+                    ts: 9_000,
+                    model: "claude-fable-5".into(),
+                    usage: TurnUsage {
+                        input: 2_000_000,
+                        ..Default::default()
+                    },
+                },
+                Turn {
+                    ts: 10_000,
+                    model: "claude-sonnet-5".into(),
+                    usage: TurnUsage {
+                        input: 1_000_000,
+                        ..Default::default()
+                    },
+                },
+            ],
+        )
+        .unwrap();
         let (u, cost) = session_usage(&db, "s-a").unwrap();
-        assert_eq!(u.input, 2_000_000);
-        assert!((cost - 30.0).abs() < 1e-9, "2 MTok at fable input 15.0");
+        assert_eq!(u.input, 3_000_000);
+        // Reachable only if fable's 2 MTok is priced at $15.0/MTok ($30.00)
+        // and sonnet's 1 MTok is priced at its own $3.0/MTok ($3.00), summed.
+        // Pooling both under either rate would give a different total.
+        assert!(
+            (cost - 33.0).abs() < 1e-9,
+            "fable 2 MTok @ 15.0 + sonnet 1 MTok @ 3.0 = 33.00"
+        );
     }
 
     #[test]
@@ -444,5 +487,19 @@ mod tests {
     fn recent_sessions_with_empty_index_is_empty() {
         let db = open_in_memory().unwrap();
         assert!(recent_sessions(&db, &[], 3).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recent_sessions_with_limit_zero_is_empty() {
+        // A database with real sessions must still yield nothing for
+        // limit == 0: an empty database would pass this even with the
+        // `out.len() == limit` break condition that never fires at 0.
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let pid = db
+            .upsert_project("-Users-a-one", "/Users/a/one", false)
+            .unwrap();
+        seed_session(&db, pid, "s-a", "/Users/a/one", 1_000, 1);
+        assert!(recent_sessions(&db, &[], 0).unwrap().is_empty());
     }
 }
