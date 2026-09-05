@@ -22,7 +22,10 @@ final class PerchEngine: ObservableObject {
             model = p.current()
             p.start(listener: l)
         } catch {
-            startupError = String(describing: error)
+            // Rust's `PerchError` already carries a finished, user-facing
+            // message via `LocalizedError` (UniFFI exposes it); `String(describing:)`
+            // would instead dump the Swift enum case, e.g. `NoConfigDir(path: "...")`.
+            startupError = error.localizedDescription
         }
     }
 
