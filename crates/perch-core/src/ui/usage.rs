@@ -200,6 +200,7 @@ mod tests {
             cwd: Some("/a/proj".into()),
             git_branch: None,
             cc_version: None,
+            title: None,
             message_count: 1,
         })
         .unwrap();

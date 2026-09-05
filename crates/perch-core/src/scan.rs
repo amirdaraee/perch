@@ -99,6 +99,9 @@ pub fn scan_from(path: &Path, offset: u64) -> std::io::Result<ScanOutcome> {
         if parsed.cc_version.is_some() {
             out.meta.cc_version = parsed.cc_version.clone();
         }
+        if parsed.ai_title.is_some() {
+            out.meta.ai_title = parsed.ai_title.clone();
+        }
         if let Some(ts) = parsed.ts {
             out.meta.first_ts = Some(out.meta.first_ts.map_or(ts, |f| f.min(ts)));
             out.meta.last_ts = Some(out.meta.last_ts.map_or(ts, |l| l.max(ts)));
@@ -367,6 +370,39 @@ mod tests {
             Some("3.0.0"),
             "cc_version must be the LAST one seen"
         );
+    }
+
+    /// A transcript may carry several `ai-title` lines as the title is
+    /// refined; the last one wins.
+    #[test]
+    fn last_ai_title_wins_within_a_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.jsonl");
+        write_lines(
+            &p,
+            &[
+                assistant("2026-08-18T10:00:00.000Z", 1, 2),
+                r#"{"type":"ai-title","aiTitle":"first draft title"}"#.to_string(),
+                assistant("2026-08-18T10:01:00.000Z", 3, 4),
+                r#"{"type":"ai-title","aiTitle":"final title"}"#.to_string(),
+            ],
+        );
+
+        let out = scan_from(&p, 0).unwrap();
+        assert_eq!(out.meta.ai_title.as_deref(), Some("final title"));
+    }
+
+    /// A scanned range with no `ai-title` line yields `None` for this pass —
+    /// the caller (the DB upsert) is responsible for not letting that null out
+    /// a title stored by an earlier pass.
+    #[test]
+    fn scan_with_no_ai_title_line_yields_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.jsonl");
+        write_lines(&p, &[assistant("2026-08-18T10:00:00.000Z", 1, 2)]);
+
+        let out = scan_from(&p, 0).unwrap();
+        assert_eq!(out.meta.ai_title, None);
     }
 
     #[test]

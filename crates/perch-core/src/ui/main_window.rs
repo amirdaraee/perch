@@ -267,7 +267,13 @@ pub fn build_project_detail(
                 parts.push(b.clone());
             }
             SessionHistoryRow {
-                name: h.id.chars().take(8).collect(),
+                // The transcript's own title, when Claude Code has written
+                // one; otherwise the 8-char UUID prefix history rows have
+                // always shown.
+                name: h
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| h.id.chars().take(8).collect()),
                 detail_line: parts.join(" · "),
                 id: h.id,
                 started,
@@ -325,6 +331,7 @@ mod tests {
             cwd: Some(path.into()),
             git_branch: Some("main".into()),
             cc_version: None,
+            title: None,
             message_count: 3,
         })
         .unwrap();
@@ -400,6 +407,7 @@ mod tests {
             cwd: Some("/a/rs".into()),
             git_branch: None,
             cc_version: None,
+            title: None,
             message_count: 0,
         })
         .unwrap();
@@ -451,6 +459,7 @@ mod tests {
             cwd: Some("/a/proj".into()),
             git_branch: None,
             cc_version: None,
+            title: None,
             message_count: 1,
         })
         .unwrap();
@@ -529,6 +538,7 @@ mod tests {
             cwd: Some("/a/proj".into()),
             git_branch: None,
             cc_version: None,
+            title: None,
             message_count: 1,
         })
         .unwrap();
@@ -553,6 +563,61 @@ mod tests {
     }
 
     #[test]
+    fn a_session_row_uses_the_stored_title_as_its_name() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let now = 100 * DAY;
+        let pid = db.upsert_project("-a-p", "/a/proj", false).unwrap();
+        db.upsert_session(&SessionRecord {
+            id: "6dda468e-ae88-443b-8bf0-4f97f745b455".into(),
+            project_id: pid,
+            file_path: "/tmp/s.jsonl".into(),
+            file_size: 0,
+            indexed_offset: 0,
+            started_at: Some(now - 1000),
+            last_activity_at: Some(now - 500),
+            cwd: Some("/a/proj".into()),
+            git_branch: None,
+            cc_version: None,
+            title: Some("Claude projects dashboard".into()),
+            message_count: 1,
+        })
+        .unwrap();
+
+        let d = build_project_detail(&db, pid, &[], now).unwrap();
+        assert_eq!(d.sessions[0].name, "Claude projects dashboard");
+    }
+
+    #[test]
+    fn a_session_row_with_no_title_falls_back_to_the_uuid_prefix() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let now = 100 * DAY;
+        let pid = db.upsert_project("-a-p", "/a/proj", false).unwrap();
+        db.upsert_session(&SessionRecord {
+            id: "6dda468e-ae88-443b-8bf0-4f97f745b455".into(),
+            project_id: pid,
+            file_path: "/tmp/s.jsonl".into(),
+            file_size: 0,
+            indexed_offset: 0,
+            started_at: Some(now - 1000),
+            last_activity_at: Some(now - 500),
+            cwd: Some("/a/proj".into()),
+            git_branch: None,
+            cc_version: None,
+            title: None,
+            message_count: 1,
+        })
+        .unwrap();
+
+        let d = build_project_detail(&db, pid, &[], now).unwrap();
+        assert_eq!(
+            d.sessions[0].name, "6dda468e",
+            "no title: fall back to the first 8 chars of the session id"
+        );
+    }
+
+    #[test]
     fn a_session_with_no_start_or_end_omits_the_duration_fragment_entirely() {
         let db = open_in_memory().unwrap();
         seed_default_prices(&db).unwrap();
@@ -569,6 +634,7 @@ mod tests {
             cwd: Some("/a/proj".into()),
             git_branch: None,
             cc_version: None,
+            title: None,
             message_count: 0,
         })
         .unwrap();
