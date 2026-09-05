@@ -31,6 +31,31 @@ final class PerchEngine: ObservableObject {
 
     func refresh() { perch?.refresh() }
     func stop() { perch?.stop() }
+
+    /// Reads run off the main thread: a large index makes these slow, and this
+    /// is called while AppKit is preparing to show a window.
+    func mainWindow() async -> MainWindowModel? {
+        guard let perch else { return nil }
+        return await Task.detached(priority: .userInitiated) { perch.mainWindow() }.value
+    }
+
+    func projectDetail(_ id: Int64) async -> Result<ProjectDetail, Error> {
+        guard let perch else { return .failure(EngineUnavailable()) }
+        return await Task.detached(priority: .userInitiated) {
+            Result { try perch.projectDetail(projectId: id) }
+        }.value
+    }
+
+    func usage() async -> Result<UsageModel, Error> {
+        guard let perch else { return .failure(EngineUnavailable()) }
+        return await Task.detached(priority: .userInitiated) {
+            Result { try perch.usage() }
+        }.value
+    }
+}
+
+struct EngineUnavailable: LocalizedError {
+    var errorDescription: String? { "Perch's engine is not running." }
 }
 
 /// Rust calls this on its watcher thread; hop to the main actor before touching UI.
