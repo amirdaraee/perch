@@ -11,6 +11,7 @@ pub mod platform;
 pub mod pricing;
 pub mod query;
 pub mod scan;
+pub mod settings;
 pub mod transcript;
 pub mod ui;
 
