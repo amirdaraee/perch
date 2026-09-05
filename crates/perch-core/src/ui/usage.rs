@@ -4,7 +4,6 @@
 use crate::db::Db;
 use crate::query::{self, DAY_MS};
 use crate::ui::format::{human_cost, human_tokens};
-use rusqlite::params;
 
 const CHART_DAYS: usize = 14;
 const TOP_N: usize = 8;
@@ -41,7 +40,8 @@ pub struct RankedProject {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ModelUsage {
     pub model: String,
-    pub tokens: String,
+    pub tokens: u64,
+    pub tokens_label: String,
     pub cost: String,
 }
 
@@ -79,19 +79,15 @@ fn burn_rate(window_tokens: u64, elapsed_ms: i64) -> Option<String> {
     Some(format!("≈{}/h at this pace", human_tokens(per_hour)))
 }
 
-/// How long ago the oldest turn since `since_ms` happened, relative to
-/// `now_ms` — i.e. how much of the trailing window Perch actually has turns
-/// for. Zero when the window is empty.
-fn observed_elapsed_ms(db: &Db, since_ms: i64, now_ms: i64) -> anyhow::Result<i64> {
-    let earliest: Option<i64> = db.conn().query_row(
-        "SELECT MIN(ts) FROM turns WHERE ts >= ?1",
-        params![since_ms],
-        |r| r.get(0),
-    )?;
-    Ok(match earliest {
+/// How long ago the oldest observed turn happened, relative to `now_ms` — i.e.
+/// how much of the trailing window Perch actually has turns for. Zero when
+/// the window is empty. The database access itself lives in
+/// `query::oldest_turn_since`; this just turns that timestamp into a duration.
+fn observed_elapsed_ms(oldest_ts: Option<i64>, now_ms: i64) -> i64 {
+    match oldest_ts {
         Some(ts) => now_ms - ts,
         None => 0,
-    })
+    }
 }
 
 pub fn build_usage(db: &Db, now_ms: i64) -> anyhow::Result<UsageModel> {
@@ -134,17 +130,27 @@ pub fn build_usage(db: &Db, now_ms: i64) -> anyhow::Result<UsageModel> {
         .collect();
 
     let mut by_model_rows = query::usage_by_model(db)?;
-    by_model_rows.sort_by_key(|a| std::cmp::Reverse(a.1.total_tokens()));
+    // `usage_by_model` is unordered by omission (no `ORDER BY` in its SQL), so
+    // rank here — ties broken by model name, the same way `top_projects`
+    // breaks ties, so two models with identical totals still render in a
+    // deterministic order rather than whatever SQLite happened to return.
+    by_model_rows.sort_by(|a, b| {
+        b.1.total_tokens()
+            .cmp(&a.1.total_tokens())
+            .then_with(|| a.0.cmp(&b.0))
+    });
     let by_model = by_model_rows
         .into_iter()
         .map(|(model, u, cost)| ModelUsage {
             model,
-            tokens: human_tokens(u.total_tokens()),
+            tokens: u.total_tokens(),
+            tokens_label: human_tokens(u.total_tokens()),
             cost: human_cost(cost),
         })
         .collect();
 
-    let elapsed_in_window = observed_elapsed_ms(db, window_since, now_ms)?;
+    let elapsed_in_window =
+        observed_elapsed_ms(query::oldest_turn_since(db, window_since)?, now_ms);
 
     let hero = vec![
         HeroStat {
@@ -302,20 +308,29 @@ mod tests {
             models[0], "claude-fable-5",
             "ranked by tokens, biggest first"
         );
+        assert_eq!(m.by_model[0].tokens, 2_000_000, "chart value is a number");
+        assert_eq!(m.by_model[0].tokens_label, "2.0M");
         assert_eq!(m.by_model[0].cost, "$30.00");
     }
 
+    /// This scenario is deliberately built so the rejected `rem_euclid`-based
+    /// elapsed time and the oldest-observed-turn elapsed time land on
+    /// *opposite* sides of the 30-minute floor: `now` is chosen so
+    /// `now.rem_euclid(WINDOW_MS)` is a comfortable 2 hours (which the old,
+    /// epoch-assuming basis would treat as plenty of history), while the only
+    /// turn Perch has actually seen is 5 minutes old. If the implementation
+    /// ever regresses to the epoch-aligned basis, this turns `Some(..)` and
+    /// the assertion below fails — a same-side-of-the-floor scenario (as the
+    /// original brief's) would not have caught that.
     #[test]
     fn burn_rate_is_absent_when_the_window_is_too_young_to_project() {
         let db = open_in_memory().unwrap();
         seed_default_prices(&db).unwrap();
-        // Usage exists, but the oldest turn inside the window is only one
-        // minute old — not enough history to project an hourly rate from.
-        let now = 100 * DAY_MS + 300_000;
+        let now = 7_200_000; // now.rem_euclid(WINDOW_MS) == 7_200_000 (2h)
         seed(
             &db,
             "s1",
-            now - 60_000,
+            now - 300_000, // oldest (only) turn is 5 minutes old
             "claude-fable-5",
             TurnUsage {
                 input: 1_000,
@@ -325,19 +340,29 @@ mod tests {
         let m = build_usage(&db, now).unwrap();
         assert!(
             m.burn_rate.is_none(),
-            "one minute of history is not enough to project from"
+            "the oldest turn Perch has seen in this window is 5 minutes old \
+             (well under the 30-minute floor), even though now.rem_euclid(WINDOW_MS) \
+             is 2 hours — proving elapsed time is measured from observed history, \
+             not from an epoch-aligned boundary"
         );
     }
 
+    /// Mirrors the test above in the other direction: `now` is chosen so
+    /// `now.rem_euclid(WINDOW_MS)` is only 10 minutes (which the old basis
+    /// would wrongly call too young to project), while the turn Perch
+    /// actually observed is a full hour old. The exact projected rate is
+    /// asserted too, not just its shape, so a regression to the rejected
+    /// basis (which would compute a different elapsed time, or `None`) is
+    /// caught even if the shape-only checks would have passed.
     #[test]
     fn burn_rate_appears_once_the_window_has_enough_history() {
         let db = open_in_memory().unwrap();
         seed_default_prices(&db).unwrap();
-        let now = 100 * DAY_MS + 2 * 3_600_000; // two hours into the window
+        let now = 600_000; // now.rem_euclid(WINDOW_MS) == 600_000 (10m)
         seed(
             &db,
             "s1",
-            now - 3_600_000,
+            now - 3_600_000, // oldest (only) turn is 1 hour old
             "claude-fable-5",
             TurnUsage {
                 input: 2_000_000,
@@ -345,8 +370,15 @@ mod tests {
             },
         );
         let m = build_usage(&db, now).unwrap();
-        let rate = m.burn_rate.expect("one hour of history is projectable");
-        assert!(rate.contains("/h"), "reads as a rate: {rate}");
+        let rate = m.burn_rate.expect(
+            "the oldest turn Perch has seen in this window is 1 hour old \
+             (over the 30-minute floor), even though now.rem_euclid(WINDOW_MS) \
+             is only 10 minutes",
+        );
+        // 2,000,000 tokens observed over exactly 1 hour of history projects
+        // to exactly 2,000,000/h — pinning the actual figure, not just that
+        // it reads as a rate.
+        assert_eq!(rate, "≈2.0M/h at this pace");
         assert!(
             !rate.contains('%'),
             "never a percentage of a ceiling Perch does not know"
