@@ -17,19 +17,22 @@ Status legend: **now** = next task · **next** = this milestone or the following
 - Live sessions: working / idle / waiting-with-reason, updates within a second, 5 s backstop.
 - Popover: three usage stats (window · week · 24h, marked *est*), session rows, Escape.
 - CI: no-network audit of every crate and the frontend, with self-testing guards.
-
----
+- **Native macOS app.** Replaced the Tauri popover's fullscreen-visibility workaround with a
+  real, tracked `NSMenu` on the status item — the structurally correct fix, not yet confirmed
+  by a human on a real display. Engine is the same Rust view-model, exposed to Swift via
+  UniFFI; the app is a SwiftPM executable built by `scripts/build-xcframework.sh` plus
+  `make bundle`. The Tauri app remains until this reaches parity.
+- **Richer session rows.** Second line: project · kind · Claude Code version, per-session
+  tokens and ≈$ joined from the index, blocked sessions sorted first.
+- **Recent section.** Last ended sessions with project and "ended 2h ago".
+- **Taller popover**, list scrolls, hosted as SwiftUI cards inside the native menu.
+- **Re-index on show**, not only on launch, so a long-running Perch never shows stale totals.
 
 ## Now
 
-- **Menu bar stays visible while the popover is open.** A detached panel does not hold the
-  fullscreen menu bar; a popover *owned by the status item* does. Host the webview in an
-  `NSPopover` anchored to our `NSStatusBarButton` (reachable via our own `NSStatusBarWindow`).
-- **Richer session rows.** Second line: project · kind · Claude Code version. Per-session
-  tokens and ≈$ joined from the index (the approved mockup had `working · 128k tok`).
-- **Recent section.** Last three ended sessions with project and "ended 2h ago".
-- **Taller popover** (~560 px), list scrolls.
-- **Re-index on show**, not only on launch, so a long-running Perch never shows stale totals.
+- **Settings window**: refresh interval, notification toggles, menu-bar display mode,
+  preferred terminal for resume, `CLAUDE_CONFIG_DIR` override (a Finder-launched app does not
+  inherit shell env — this is the fix).
 
 ## Next — sessions & projects (Perch's own ground)
 
@@ -68,9 +71,6 @@ Status legend: **now** = next task · **next** = this milestone or the following
 
 ## Next — settings & polish
 
-- **Settings window**: refresh interval, notification toggles, menu-bar display mode,
-  preferred terminal for resume, `CLAUDE_CONFIG_DIR` override (a Finder-launched app does not
-  inherit shell env — this is the fix).
 - **Launch at login.**
 - **Light-mode palette** — the popover is dark-only today.
 - **Keyboard**: ⌥-click the tray for the menu; ↑↓ to move between sessions, ⏎ to jump.
@@ -78,6 +78,8 @@ Status legend: **now** = next task · **next** = this milestone or the following
   empty popover.
 - **Demo mode** (`--demo`) with synthetic sessions/projects — needed for README screenshots
   without leaking real project names, and for deterministic UI tests.
+- **Remove the Tauri app and React frontend** once the native app has jump-to-session and
+  resume, its last two gaps versus the popover it replaces.
 
 ## Later
 
