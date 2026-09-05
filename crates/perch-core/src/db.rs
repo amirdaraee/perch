@@ -81,6 +81,12 @@ fn init(conn: Connection) -> Result<Db> {
     // `PRAGMA journal_mode` returns a row, so it must go through execute_batch —
     // pragma_update errors with ExecuteReturnedResults on statements that yield rows.
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;")?;
+    // rusqlite's default busy timeout is 0, so a concurrent writer (the
+    // retained Tauri app resolves this same file) makes SQLITE_BUSY come
+    // back immediately instead of after a real wait. Both apps write here
+    // until the Tauri app is removed, so give a lock a few seconds to clear
+    // before surfacing as an error.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch(SCHEMA)?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(Db { conn })
