@@ -11,6 +11,44 @@ extension Color {
     static let perchBackground = Color(red: 0.39, green: 0.39, blue: 0.40)
 }
 
+extension Color {
+    /// Convenience for the fixed hex values the design spec hands us —
+    /// keeps `PerchChartPalette` below readable as the literal hex it was
+    /// validated at, rather than hand-converted RGB fractions.
+    init(hex: UInt32) {
+        self.init(
+            red: Double((hex >> 16) & 0xFF) / 255,
+            green: Double((hex >> 8) & 0xFF) / 255,
+            blue: Double(hex & 0xFF) / 255
+        )
+    }
+}
+
+/// The Usage view's categorical chart palette — five hues in a fixed order,
+/// validated (dataviz skill, `references/palette.md`, dark-surface
+/// categorical slots 1-5) for lightness band, chroma floor, colour-vision-
+/// deficiency separation, and contrast. Never substitute or reorder these:
+/// a chart's colour identity must stay stable across renders, and the
+/// values already passed every check.
+///
+/// `order` is both the stacking order (input closest to the baseline) and
+/// the legend order; index into it by token class rather than cycling.
+enum PerchChartPalette {
+    static let input = Color(hex: 0x3987e5)
+    static let output = Color(hex: 0xd95926)
+    static let cacheRead = Color(hex: 0x199e70)
+    static let cacheWrite = Color(hex: 0xc98500)
+    static let thinking = Color(hex: 0xd55181)
+
+    static let order: [(label: String, color: Color)] = [
+        ("Input", input),
+        ("Output", output),
+        ("Cache read", cacheRead),
+        ("Cache write", cacheWrite),
+        ("Thinking", thinking),
+    ]
+}
+
 private enum PerchCardMetrics {
     /// The popover's fixed width (brief: ~360 pt, widened from the mockup's 340).
     static let width: CGFloat = 360
