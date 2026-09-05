@@ -54,6 +54,10 @@ pub struct PopoverModel {
     pub recent: Vec<RecentRow>,
     pub tray_title: String,
     pub error: Option<String>,
+    /// The finished "N sessions are waiting on you" sentence, or `None` when
+    /// nothing is waiting. A shell renders this verbatim — it must not count
+    /// or pluralise itself (spec: Rust owns everything except drawing).
+    pub waiting_banner: Option<String>,
 }
 
 const DASH: &str = "—";
@@ -84,6 +88,16 @@ fn status_of(s: &LiveSession) -> (Status, String, i64) {
         SessionStatus::Idle => (Status::Idle, "idle".into(), s.status_updated_at),
         SessionStatus::Ended => (Status::Idle, "ended".into(), s.status_updated_at),
         SessionStatus::Working => (Status::Working, "working".into(), s.status_updated_at),
+    }
+}
+
+/// The waiting-sessions banner sentence, or `None` when nothing is waiting.
+/// Pluralisation lives here so no shell has to re-derive it from a count.
+fn waiting_banner(waiting: usize) -> Option<String> {
+    match waiting {
+        0 => None,
+        1 => Some("1 session is waiting on you".to_string()),
+        n => Some(format!("{n} sessions are waiting on you")),
     }
 }
 
@@ -223,12 +237,15 @@ pub fn build_model(db: Option<&Db>, live: &[LiveSession], now_ms: i64) -> Popove
         error.get_or_insert_with(|| "some session data unavailable".to_string());
     }
 
+    let waiting = rows.iter().filter(|r| r.status == Status::Waiting).count();
+
     PopoverModel {
         stats,
         live: rows,
         recent,
         tray_title: tray_title(live),
         error,
+        waiting_banner: waiting_banner(waiting),
     }
 }
 
@@ -355,6 +372,43 @@ mod tests {
         assert_eq!(tray_title(&[]), "");
         assert_eq!(tray_title(std::slice::from_ref(&b)), "1");
         assert_eq!(tray_title(&[w, b]), "1 ⏳");
+    }
+
+    #[test]
+    fn waiting_banner_is_pluralised_by_count() {
+        let cases: &[(usize, Option<&str>)] = &[
+            (0, None),
+            (1, Some("1 session is waiting on you")),
+            (2, Some("2 sessions are waiting on you")),
+            (5, Some("5 sessions are waiting on you")),
+        ];
+        for &(count, expected) in cases {
+            assert_eq!(
+                waiting_banner(count),
+                expected.map(str::to_string),
+                "count={count}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_model_surfaces_the_waiting_banner() {
+        let mut w = live(1, "a", "a", "/x", SessionStatus::Working, "interactive");
+        w.status = SessionStatus::Waiting {
+            reason: None,
+            since_ms: 1,
+        };
+        let b = live(2, "b", "b", "/x", SessionStatus::Working, "interactive");
+
+        assert_eq!(build_model(None, &[], 10_000).waiting_banner, None);
+        assert_eq!(
+            build_model(None, std::slice::from_ref(&b), 10_000).waiting_banner,
+            None
+        );
+        assert_eq!(
+            build_model(None, &[w], 10_000).waiting_banner,
+            Some("1 session is waiting on you".to_string())
+        );
     }
 
     #[test]

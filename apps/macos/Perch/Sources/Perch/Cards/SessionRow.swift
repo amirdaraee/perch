@@ -17,13 +17,12 @@ struct SessionRowView: View {
                 }
                 Text(row.statusLabel)
                     .font(.caption)
-                    .foregroundStyle(row.status == .waiting ? Color(red: 1, green: 0.84, blue: 0.04) : .secondary)
+                    .foregroundStyle(row.status == .waiting ? Color.perchWaiting : .secondary)
                 Text(detailLine)
                     .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
             }
         }
-        .padding(.horizontal, 14).padding(.vertical, 6)
-        .frame(width: 360, alignment: .leading)
+        .perchCard(verticalPadding: 6)
     }
 
     private var detailLine: String {
@@ -39,10 +38,10 @@ struct SessionRowView: View {
 
     private var dotColor: Color {
         switch row.status {
-        case .waiting: Color(red: 1, green: 0.84, blue: 0.04)
-        case .working: Color(red: 0.19, green: 0.82, blue: 0.35)
-        case .idle: Color(red: 0.19, green: 0.82, blue: 0.35).opacity(0.55)
-        case .background: Color(red: 0.39, green: 0.39, blue: 0.40)
+        case .waiting: .perchWaiting
+        case .working: .perchWorking
+        case .idle: .perchWorking.opacity(0.55)
+        case .background: .perchBackground
         }
     }
 }

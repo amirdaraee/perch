@@ -10,7 +10,7 @@ struct RecentCard: View {
             Text("Recent").font(.caption2).foregroundStyle(.secondary).textCase(.uppercase)
             ForEach(rows, id: \.id) { r in
                 HStack {
-                    Circle().fill(Color(red: 0.39, green: 0.39, blue: 0.40)).frame(width: 8, height: 8)
+                    Circle().fill(Color.perchBackground).frame(width: 8, height: 8)
                     Text(r.project).lineLimit(1)
                     Spacer()
                     Text(r.tokens == "—" ? "ended \(r.endedAgo) ago" : "\(r.tokens) · ended \(r.endedAgo) ago")
@@ -18,7 +18,6 @@ struct RecentCard: View {
                 }
             }
         }
-        .padding(.horizontal, 14).padding(.vertical, 8)
-        .frame(width: 360, alignment: .leading)
+        .perchCard()
     }
 }
