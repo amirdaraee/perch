@@ -127,6 +127,15 @@ fn migrate(conn: &Connection, existing_version: i32) -> Result<()> {
         if !has_title {
             conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT", [])?;
         }
+        // Unlike `has_title` above, this reset has no "is this actually a v1
+        // database" guard of its own — it runs for every `existing_version <
+        // 2`, which includes a brand-new database (`user_version` starts at
+        // 0). That is harmless only because `migrate` is called from `init`
+        // immediately after `SCHEMA` creates the tables and before any row
+        // can exist: `sessions` and `turns` are still empty, so the reset and
+        // delete are no-ops. If this call is ever moved to run later, after
+        // real data could already be present, this becomes a silent
+        // data-loss path and needs its own guard.
         conn.execute_batch("UPDATE sessions SET indexed_offset = 0; DELETE FROM turns;")?;
     }
     Ok(())
@@ -549,16 +558,20 @@ mod tests {
 
         assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
 
-        // `title` column exists and is settable.
-        db.upsert_session(&session("s1", 1, 500)).unwrap();
-
-        // Offsets reset, turns cleared: the next index pass rescans from zero.
+        // Offset reset and turns cleared, read BEFORE any new write touches
+        // this session — otherwise a later `upsert_session` call could set
+        // the offset back to a nonzero value and this would pass whether or
+        // not the migration ever reset it.
         assert_eq!(
             db.session_offset("s1").unwrap(),
-            500,
-            "upsert_session above just set it back to 500; check it moved through 0 first"
+            0,
+            "the migration must reset the offset so the next index pass rescans from zero"
         );
         assert_eq!(db.turn_count().unwrap(), 0, "turns must be cleared");
+
+        // `title` column exists and is settable.
+        db.upsert_session(&session("s1", 1, 500)).unwrap();
+        assert_eq!(db.session_offset("s1").unwrap(), 500);
 
         // The user's note survives untouched.
         assert_eq!(
