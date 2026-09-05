@@ -244,6 +244,7 @@ pub struct HistorySession {
     pub last_activity_at: Option<i64>,
     pub git_branch: Option<String>,
     pub message_count: u64,
+    pub title: Option<String>,
     pub usage: TurnUsage,
     pub cost_usd: f64,
 }
@@ -253,7 +254,7 @@ pub struct HistorySession {
 /// window's job is to show what exists.
 pub fn session_history(db: &Db, project_id: i64) -> Result<Vec<HistorySession>> {
     let mut stmt = db.conn().prepare(
-        "SELECT id, started_at, last_activity_at, git_branch, message_count
+        "SELECT id, started_at, last_activity_at, git_branch, message_count, title
          FROM sessions WHERE project_id = ?1
          -- `last_activity_at IS NULL` is 0 for dated rows and 1 for NULL ones,
          -- so ordering by it first pushes NULLs after every dated row, which
@@ -267,12 +268,13 @@ pub fn session_history(db: &Db, project_id: i64) -> Result<Vec<HistorySession>> 
             r.get::<_, Option<i64>>(2)?,
             r.get::<_, Option<String>>(3)?,
             r.get::<_, i64>(4)? as u64,
+            r.get::<_, Option<String>>(5)?,
         ))
     })?;
 
     let mut out = Vec::new();
     for row in rows {
-        let (id, started_at, last_activity_at, git_branch, message_count) = row?;
+        let (id, started_at, last_activity_at, git_branch, message_count, title) = row?;
         let (usage, cost_usd) = session_usage(db, &id)?;
         out.push(HistorySession {
             id,
@@ -280,6 +282,7 @@ pub fn session_history(db: &Db, project_id: i64) -> Result<Vec<HistorySession>> 
             last_activity_at,
             git_branch,
             message_count,
+            title,
             usage,
             cost_usd,
         });
@@ -478,6 +481,7 @@ mod tests {
             cwd: None,
             git_branch: None,
             cc_version: None,
+            title: None,
             message_count: 2,
         })
         .unwrap();
@@ -608,6 +612,7 @@ mod tests {
             cwd: Some(cwd.into()),
             git_branch: None,
             cc_version: None,
+            title: None,
             message_count: 1,
         })
         .unwrap();
@@ -648,6 +653,7 @@ mod tests {
             cwd: Some("/Users/a/one".into()),
             git_branch: None,
             cc_version: None,
+            title: None,
             message_count: 2,
         })
         .unwrap();
@@ -757,6 +763,40 @@ mod tests {
     }
 
     #[test]
+    fn session_history_carries_the_stored_title() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let pid = db.upsert_project("-a-p", "/a/p", false).unwrap();
+        seed_session(&db, pid, "titled", "/a/p", 1_000, 1);
+        let mut s = crate::model::SessionRecord {
+            id: "titled".into(),
+            project_id: pid,
+            file_path: "/tmp/titled.jsonl".into(),
+            file_size: 0,
+            indexed_offset: 0,
+            started_at: Some(1_000),
+            last_activity_at: Some(1_000),
+            cwd: Some("/a/p".into()),
+            git_branch: None,
+            cc_version: None,
+            title: Some("Claude projects dashboard".into()),
+            message_count: 1,
+        };
+        db.upsert_session(&s).unwrap();
+
+        let rows = session_history(&db, pid).unwrap();
+        assert_eq!(rows[0].title.as_deref(), Some("Claude projects dashboard"));
+
+        // A session with no title yields `None`, not an empty string.
+        s.id = "untitled".into();
+        s.title = None;
+        db.upsert_session(&s).unwrap();
+        let rows = session_history(&db, pid).unwrap();
+        let untitled = rows.iter().find(|r| r.id == "untitled").unwrap();
+        assert_eq!(untitled.title, None);
+    }
+
+    #[test]
     fn session_history_for_a_project_with_no_sessions_is_empty_not_an_error() {
         let db = open_in_memory().unwrap();
         let pid = db.upsert_project("-a-p", "/a/p", false).unwrap();
@@ -784,6 +824,7 @@ mod tests {
             cwd: Some("/a/p".into()),
             git_branch: None,
             cc_version: None,
+            title: None,
             message_count: 0,
         })
         .unwrap();

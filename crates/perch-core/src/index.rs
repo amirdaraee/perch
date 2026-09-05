@@ -103,6 +103,7 @@ pub fn index_all(db: &Db, projects_root: &Path) -> Result<IndexStats> {
                     cwd: outcome.meta.cwd.clone(),
                     git_branch: outcome.meta.git_branch.clone(),
                     cc_version: outcome.meta.cc_version.clone(),
+                    title: outcome.meta.ai_title.clone(),
                     message_count: existing_messages + outcome.meta.message_count,
                 },
                 &outcome.turns,
