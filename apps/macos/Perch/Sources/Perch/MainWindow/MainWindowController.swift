@@ -27,6 +27,12 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         if let window {
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
+            // Otherwise picking "Open Perch" while the window is minimized
+            // brings the app frontmost with nothing visibly happening — the
+            // window is still sitting in the Dock, miniaturized.
+            if window.isMiniaturized {
+                window.deminiaturize(nil)
+            }
             window.makeKeyAndOrderFront(nil)
             (window.contentView as? NSHostingView<MainWindowRoot>)?.rootView =
                 MainWindowRoot(engine: engine, refreshToken: refreshToken)

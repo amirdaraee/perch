@@ -231,10 +231,20 @@ pub fn build_project_detail(
     let sparkline = days
         .iter()
         .enumerate()
-        .map(|(i, d)| SparkPoint {
-            day_index: i as i32,
-            tokens: d.usage.total_tokens(),
-            label: format!("{} ago", human_elapsed(now_ms - d.day_start_ms)),
+        .map(|(i, d)| {
+            let days_ago = SPARK_DAYS - 1 - i;
+            SparkPoint {
+                day_index: i as i32,
+                tokens: d.usage.total_tokens(),
+                // Same scheme as `ui::usage`'s daily chart over the identical
+                // 14-day window — "Today", "1d" … "13d" — not `human_elapsed`,
+                // which caps at hours and would read "313h ago" for day 0.
+                label: if days_ago == 0 {
+                    "Today".to_string()
+                } else {
+                    format!("{days_ago}d")
+                },
+            }
         })
         .collect();
 
@@ -249,7 +259,10 @@ pub fn build_project_detail(
                 (Some(a), Some(b)) if b >= a => human_elapsed(b - a),
                 _ => "—".to_string(),
             };
-            let mut parts = vec![format!("{tokens} · {cost}"), format!("{duration} long")];
+            let mut parts = vec![format!("{tokens} · {cost}")];
+            if duration != "—" {
+                parts.push(format!("{duration} long"));
+            }
             if let Some(b) = &h.git_branch {
                 parts.push(b.clone());
             }
@@ -471,9 +484,13 @@ mod tests {
         assert_eq!(d.sparkline[13].day_index, 13);
         assert!(d.sparkline[13].tokens > 0, "today has the activity");
         assert!(d.sparkline[0].tokens == 0, "thirteen days ago was quiet");
-        assert!(
-            !d.sparkline[0].label.is_empty(),
-            "every point carries its own label"
+        assert_eq!(
+            d.sparkline[0].label, "13d",
+            "oldest day reads as a day count, not \"313h ago\""
+        );
+        assert_eq!(
+            d.sparkline[13].label, "Today",
+            "newest day reads as Today, matching ui::usage's scheme"
         );
     }
 
@@ -533,6 +550,37 @@ mod tests {
         assert!(d.sessions[0].is_live);
         assert!(!d.sessions[1].is_live, "the older one has ended");
         assert_eq!(d.sessions[1].branch.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn a_session_with_no_start_or_end_omits_the_duration_fragment_entirely() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let now = 100 * DAY;
+        let pid = db.upsert_project("-a-p", "/a/proj", false).unwrap();
+        db.upsert_session(&SessionRecord {
+            id: "nodur".into(),
+            project_id: pid,
+            file_path: "/tmp/nodur.jsonl".into(),
+            file_size: 0,
+            indexed_offset: 0,
+            started_at: None,
+            last_activity_at: None,
+            cwd: Some("/a/proj".into()),
+            git_branch: None,
+            cc_version: None,
+            message_count: 0,
+        })
+        .unwrap();
+
+        let d = build_project_detail(&db, pid, &[], now).unwrap();
+        let row = &d.sessions[0];
+        assert_eq!(row.duration, "—");
+        assert!(
+            !row.detail_line.contains("long"),
+            "an unknown duration must not render as \"— long\": {}",
+            row.detail_line
+        );
     }
 
     #[test]

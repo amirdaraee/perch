@@ -24,12 +24,29 @@ extension Color {
     }
 }
 
-/// The Usage view's categorical chart palette — five hues in a fixed order,
+/// The daily stacked bar's token classes. Typed so Swift maps a `DailyBar`
+/// field to a chart segment by case, not by matching a display string —
+/// a typo in a string literal would silently render as zero.
+///
+/// Deliberately excludes thinking: `TurnUsage::total_tokens()`
+/// (`crates/perch-core/src/model.rs`) excludes it too, since thinking tokens
+/// are a subset of output, not an additional billable class. `DailyBar`
+/// still carries `thinking` as real data; it is just never stacked.
+enum PerchTokenClass: CaseIterable {
+    case input, output, cacheRead, cacheWrite
+}
+
+/// The Usage view's categorical chart palette — four hues in a fixed order,
 /// validated (dataviz skill, `references/palette.md`, dark-surface
-/// categorical slots 1-5) for lightness band, chroma floor, colour-vision-
-/// deficiency separation, and contrast. Never substitute or reorder these:
-/// a chart's colour identity must stay stable across renders, and the
-/// values already passed every check.
+/// categorical slots 1-4) for lightness band, chroma floor, colour-vision-
+/// deficiency separation, and contrast (≥3:1 in both light and dark). Never
+/// substitute or reorder these: a chart's colour identity must stay stable
+/// across renders, and the values already passed every check.
+///
+/// Cache write is `0xb87a00`, not the originally shipped `0xc98500` — the
+/// dataviz validator found the old value missed light-mode contrast at
+/// 2.99:1; `0xb87a00` passes all six checks in both appearances, so no
+/// appearance-aware variant is needed.
 ///
 /// `order` is both the stacking order (input closest to the baseline) and
 /// the legend order; index into it by token class rather than cycling.
@@ -37,15 +54,13 @@ enum PerchChartPalette {
     static let input = Color(hex: 0x3987e5)
     static let output = Color(hex: 0xd95926)
     static let cacheRead = Color(hex: 0x199e70)
-    static let cacheWrite = Color(hex: 0xc98500)
-    static let thinking = Color(hex: 0xd55181)
+    static let cacheWrite = Color(hex: 0xb87a00)
 
-    static let order: [(label: String, color: Color)] = [
-        ("Input", input),
-        ("Output", output),
-        ("Cache read", cacheRead),
-        ("Cache write", cacheWrite),
-        ("Thinking", thinking),
+    static let order: [(label: String, key: PerchTokenClass, color: Color)] = [
+        ("Input", .input, input),
+        ("Output", .output, output),
+        ("Cache read", .cacheRead, cacheRead),
+        ("Cache write", .cacheWrite, cacheWrite),
     ]
 }
 
