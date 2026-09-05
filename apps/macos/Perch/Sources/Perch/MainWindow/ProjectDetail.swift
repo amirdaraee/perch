@@ -150,12 +150,36 @@ struct ProjectDetailPane: View {
                         y: .value("Tokens", point.tokens)
                     )
                     .foregroundStyle(Color.perchWorking)
+                    // `label` is Rust's already-final day label — never formatted here.
+                    .accessibilityLabel(point.label)
                 }
-                .chartXAxis(.hidden)
+                .chartXAxis {
+                    // A handful of labelled ticks give the bars a day, without
+                    // crowding 14 of them onto one axis.
+                    AxisMarks(values: axisDayIndices(detail)) { value in
+                        AxisTick()
+                        if let day = value.as(Int32.self), let label = dayLabel(for: day, in: detail) {
+                            AxisValueLabel(label)
+                        }
+                    }
+                }
                 .chartYAxis(.hidden)
                 .frame(height: 70)
             }
         }
+    }
+
+    /// First, middle, and last day of the sparkline — enough for context
+    /// without crowding the axis with all 14 labels.
+    private func axisDayIndices(_ detail: ProjectDetail) -> [Int32] {
+        let days = detail.sparkline.map(\.dayIndex).sorted()
+        guard let first = days.first, let last = days.last else { return [] }
+        guard days.count > 2 else { return days }
+        return [first, days[days.count / 2], last]
+    }
+
+    private func dayLabel(for dayIndex: Int32, in detail: ProjectDetail) -> String? {
+        detail.sparkline.first { $0.dayIndex == dayIndex }?.label
     }
 
     @ViewBuilder
@@ -217,10 +241,14 @@ struct ProjectDetailPane: View {
 
     /// Every terminal launch funnels through here so failures surface
     /// consistently — a launch that silently does nothing is the worst
-    /// outcome (spec §7).
+    /// outcome (spec §7). `make` returns `nil` only when the engine itself
+    /// isn't running; that must surface too, not silently no-op.
     private func launch(_ make: () async -> TerminalCommand?) async {
         actionError = nil
-        guard let command = await make() else { return }
+        guard let command = await make() else {
+            actionError = EngineUnavailable().localizedDescription
+            return
+        }
         do { try Launcher.run(command) } catch { self.actionError = error.localizedDescription }
     }
 
@@ -238,9 +266,16 @@ struct ProjectDetailPane: View {
     /// Adopts the refreshed model an edit method returns, rather than
     /// re-fetching or guessing what changed, and tells the sidebar to
     /// refresh so a pin/archive edit can move the project between groups.
+    ///
+    /// These edits run as independent, uncancelled `Task`s (not scoped to
+    /// `.task(id:)`), so a late response can still arrive after the user
+    /// has switched to a different project. `d.id == projectId` guards
+    /// against that stale response silently overwriting the now-visible
+    /// project's note, totals, or pin state.
     private func apply(_ result: Result<ProjectDetail, Error>) async {
         switch result {
         case .success(let d):
+            guard d.id == projectId else { return }
             detail = d
             noteDraft = d.note
             await onChanged()
