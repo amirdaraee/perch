@@ -24,21 +24,20 @@ Status legend: **now** = next task · **next** = this milestone or the following
   `make bundle`. The Tauri app remains until this reaches parity.
 - **Richer session rows.** Second line: project · kind · Claude Code version, per-session
   tokens and ≈$ joined from the index, blocked sessions sorted first.
-- **Recent section.** Last ended sessions with project and "ended 2h ago".
+- **Recent section.** Last three ended sessions with project and "ended 2h ago".
 - **Taller popover**, list scrolls, hosted as SwiftUI cards inside the native menu.
-- **Re-index on show**, not only on launch, so a long-running Perch never shows stale totals.
+- **Re-indexes on show**, not only on launch, so a long-running Perch never shows stale totals.
+
+---
 
 ## Now
-
-- **Settings window**: refresh interval, notification toggles, menu-bar display mode,
-  preferred terminal for resume, `CLAUDE_CONFIG_DIR` override (a Finder-launched app does not
-  inherit shell env — this is the fix).
-
-## Next — sessions & projects (Perch's own ground)
 
 - **Waiting-on-you notification.** macOS alert when a session has been `waiting` longer than
   N minutes (default 10), once per episode, background sessions excluded by default. This is
   the feature that solves the 32-hour-blocked-session problem the project started from.
+
+## Next — sessions & projects (Perch's own ground)
+
 - **Jump to session.** Focus the terminal or IDE window that owns the session (walk the process
   tree from the pid). Fallback: reveal the cwd in Finder.
 - **Resume ended session.** `claude --resume <id>` in the user's preferred terminal.
@@ -71,6 +70,9 @@ Status legend: **now** = next task · **next** = this milestone or the following
 
 ## Next — settings & polish
 
+- **Settings window**: refresh interval, notification toggles, menu-bar display mode,
+  preferred terminal for resume, `CLAUDE_CONFIG_DIR` override (a Finder-launched app does not
+  inherit shell env — this is the fix).
 - **Launch at login.**
 - **Light-mode palette** — the popover is dark-only today.
 - **Keyboard**: ⌥-click the tray for the menu; ↑↓ to move between sessions, ⏎ to jump.
