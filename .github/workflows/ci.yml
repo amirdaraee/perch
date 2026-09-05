@@ -12,15 +12,19 @@ jobs:
       matrix:
         # `src-tauri` (the app crate) links against webkit2gtk and friends, which
         # only macos-latest has available. ubuntu-latest can't build it, so Linux
-        # is scoped to the portable data-layer crates (perch-core, perch-cli)
-        # rather than the whole workspace. macOS keeps proving the full workspace
-        # builds; Linux keeps proving the data layer stays portable and doesn't
-        # quietly grow a dependency on the app crate or its platform-only deps.
+        # is scoped to the portable data-layer crates (perch-core, perch-cli,
+        # perch-ffi) rather than the whole workspace. perch-ffi is included
+        # because it's the UniFFI surface the native macOS app is built on, and
+        # it must keep compiling on Linux for the same reason perch-core does:
+        # so a later Linux/Windows shell can reuse it. macOS keeps proving the
+        # full workspace builds; Linux keeps proving the data layer stays
+        # portable and doesn't quietly grow a dependency on the app crate or its
+        # platform-only deps.
         include:
           - os: macos-latest
             cargo-scope: --workspace
           - os: ubuntu-latest
-            cargo-scope: -p perch-core -p perch-cli
+            cargo-scope: -p perch-core -p perch-cli -p perch-ffi
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -60,12 +64,12 @@ jobs:
         # macOS-only `[target.'cfg(...)']` sections declare when run where
         # they apply. macOS proves the full workspace graph, including the
         # app crate, is clean; Linux keeps proving the portable data-layer
-        # crates stay clean on their own.
+        # crates (including perch-ffi) stay clean on their own.
         include:
           - os: macos-latest
             cargo-scope: --workspace
           - os: ubuntu-latest
-            cargo-scope: -p perch-core -p perch-cli
+            cargo-scope: -p perch-core -p perch-cli -p perch-ffi
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -170,24 +174,29 @@ jobs:
 
           echo "no raw sockets found in crates/*/src or $SRC_TAURI_SRC_DIR"
 
-      - name: Assert perch-core and the app crate never write to the filesystem
+      - name: Assert perch-core, perch-ffi, and the app crate never write to the filesystem
         run: |
           set -uo pipefail
 
           # The README's other headline promise: Perch never writes to, moves, or
           # deletes anything in your Claude Code directory. perch-core is the only
-          # crate that reads that directory, and src-tauri (the app crate) is
-          # exactly where a stray write would plausibly be added first — both
-          # must hold no filesystem-writing API outside of Perch's own data.
+          # crate that reads that directory; perch-ffi is the UniFFI surface that
+          # now resolves Perch's own data path (app_data_db) and drives indexing
+          # for the native macOS app, so a stray write there would be exactly as
+          # bad; and src-tauri (the app crate) is exactly where a stray write
+          # would plausibly be added first. All three must hold no
+          # filesystem-writing API outside of Perch's own data.
           #
           # `create_dir_all` is deliberately NOT in this list, and db.rs
           # (perch-core) is deliberately excluded: it creates the parent
           # directory of Perch's OWN index database and opens that database,
-          # which is Perch's file, not Claude Code's. Nothing under src-tauri/src
-          # is excluded — commands.rs performs no writes of its own (it delegates
-          # to db::open), and it is the file most likely to gain one, so it is
-          # audited like every other module.
+          # which is Perch's file, not Claude Code's. Nothing under
+          # crates/perch-ffi/src or src-tauri/src is excluded — commands.rs
+          # performs no writes of its own (it delegates to db::open), and it is
+          # the file most likely to gain one, so it is audited like every other
+          # module.
           WRITES='fs::write|fs::remove_file|fs::remove_dir|File::create|OpenOptions'
+          FFI_SRC_DIR=crates/perch-ffi/src
           SRC_TAURI_SRC_DIR=src-tauri/src
 
           # Only the production half of each file is audited. Test modules write
@@ -229,19 +238,44 @@ jobs:
           fi
           rm -rf "$SELFTEST_ROOT"
 
+          # Positive control for the perch-ffi coverage: a fixture placed as if
+          # it were crates/perch-ffi/src/x.rs (never the real source tree — this
+          # lives entirely under /tmp) must trip the guard. No exclusion is
+          # needed here (unlike perch-core's db.rs): perch-ffi has no file of
+          # its own that opens or creates Perch's database — it calls
+          # perch-core's db::open for that — so nothing in its source is a
+          # legitimate write to exclude.
+          SELFTEST_ROOT=/tmp/no-network-selftest-write-ffi
+          rm -rf "$SELFTEST_ROOT"
+          mkdir -p "$SELFTEST_ROOT/$FFI_SRC_DIR"
+          printf 'fn main() { File::create("/tmp/x").unwrap(); }\n' \
+            > "$SELFTEST_ROOT/$FFI_SRC_DIR/x.rs"
+          offending=0
+          for f in $(cd "$SELFTEST_ROOT" && find "$FFI_SRC_DIR" -name '*.rs'); do
+            if prod "$SELFTEST_ROOT/$f" | grep -qE "$WRITES"; then
+              offending=1
+            fi
+          done
+          if [ "$offending" -ne 1 ]; then
+            echo "::error::Guard self-test failed: the write guard no longer reaches $FFI_SRC_DIR."
+            exit 1
+          fi
+          rm -rf "$SELFTEST_ROOT"
+
           offenders=0
           for f in $(find crates/perch-core/src -name '*.rs' ! -name 'db.rs') \
+                   $(find "$FFI_SRC_DIR" -name '*.rs') \
                    $(find "$SRC_TAURI_SRC_DIR" -name '*.rs'); do
             if prod "$f" | grep -E "$WRITES"; then
               offenders=1
             fi
           done
           if [ "$offenders" -ne 0 ]; then
-            echo "::error::perch-core or the app crate gained a filesystem-writing call. Perch is read-only with respect to ~/.claude."
+            echo "::error::perch-core, perch-ffi, or the app crate gained a filesystem-writing call. Perch is read-only with respect to ~/.claude."
             exit 1
           fi
 
-          echo "no filesystem writes found in perch-core (db.rs excluded) or $SRC_TAURI_SRC_DIR (nothing excluded)"
+          echo "no filesystem writes found in perch-core (db.rs excluded), $FFI_SRC_DIR, or $SRC_TAURI_SRC_DIR (nothing excluded)"
 
       - name: Assert forbidden crates are unreachable in the resolved dependency graph
         run: |
@@ -368,3 +402,75 @@ jobs:
           fi
 
           echo "frontend outbound surface clean (CSP pinned; no network APIs or absolute URLs in src/ or index.html)"
+
+      - name: Assert the native macOS app has no outbound network surface
+        run: |
+          set -uo pipefail
+
+          # The Swift app is a second UI surface (the native replacement for
+          # the popover), so it gets the same promise as the frontend guard
+          # above: no network APIs, no absolute http(s) URLs. Scoped to
+          # Sources/Perch (the hand-written app) and NOT Sources/PerchFFI,
+          # which is UniFFI's generated bindings — produced by
+          # scripts/build-xcframework.sh, git-ignored, and simply absent on a
+          # fresh checkout, so scanning it would find either nothing or code
+          # nobody hand-writes.
+          SWIFT_APP_SRC_DIR=apps/macos/Perch/Sources/Perch
+
+          # "Network framework use" means `import Network` (the module Apple
+          # ships NWConnection etc. in), not the literal string
+          # "Network.framework" — that string names the compiled binary
+          # framework, which never appears in Swift source itself.
+          NET_SWIFT='URLSession|NSURLConnection|NWConnection|import[[:space:]]+Network\b|https?://'
+
+          swift_hits() {
+            # -H forces the filename prefix even when only one file matches
+            # (grep omits it for a single-file argument list otherwise) —
+            # without it, the self-test below can't find the offending path
+            # in the output, and a real hit would be unattributable too.
+            find "$SWIFT_APP_SRC_DIR" -name '*.swift' -print0 | xargs -0 grep -nHE "$NET_SWIFT"
+          }
+
+          # Positive control: the pattern must actually detect a known offender.
+          printf 'let s = URLSession.shared.dataTask(with: URL(string: "https://example.com")!)\n' \
+            > /tmp/swift-net-selftest.swift
+          if ! grep -qE "$NET_SWIFT" /tmp/swift-net-selftest.swift; then
+            echo "::error::Guard self-test failed: the Swift network pattern no longer detects a known offender."
+            exit 1
+          fi
+
+          # Positive control for the coverage: a fixture placed as if it were
+          # a nested file under Sources/Perch (never the real tree — this
+          # lives entirely under /tmp) must be found through the exact
+          # swift_hits path the real check uses below.
+          SELFTEST_ROOT=/tmp/no-network-selftest-swift
+          rm -rf "$SELFTEST_ROOT"
+          mkdir -p "$SELFTEST_ROOT/$SWIFT_APP_SRC_DIR/Nested"
+          printf 'import Network\nlet c = NWConnection(host: "example.com", port: 443)\n' \
+            > "$SELFTEST_ROOT/$SWIFT_APP_SRC_DIR/Nested/x.swift"
+          if ! ( cd "$SELFTEST_ROOT" && swift_hits ) | grep -q "$SWIFT_APP_SRC_DIR/Nested/x.swift"; then
+            echo "::error::Guard self-test failed: the Swift scan no longer reaches a nested $SWIFT_APP_SRC_DIR/**/*.swift."
+            exit 1
+          fi
+          rm -rf "$SELFTEST_ROOT"
+
+          hits=$(swift_hits)
+          if [ -n "$hits" ]; then
+            printf '%s\n' "$hits"
+            echo "::error::The native macOS app gained an outbound network call or an absolute URL. It talks only to perch-ffi."
+            exit 1
+          fi
+
+          echo "native app outbound surface clean (no network APIs or absolute URLs in $SWIFT_APP_SRC_DIR)"
+
+  native-app:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: scripts/build-xcframework.sh
+      - run: swift build -c release
+        working-directory: apps/macos/Perch
