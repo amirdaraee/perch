@@ -56,6 +56,7 @@ struct MainWindowRoot: View {
             NowPane(model: model)
         case .project(let id):
             ProjectDetailPane(engine: engine, projectId: id, onChanged: { await reload() })
+                .id(id)
         }
     }
 
