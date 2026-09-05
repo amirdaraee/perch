@@ -37,6 +37,16 @@ struct ProjectDetailPane: View {
             }
         }
         .task(id: projectId) { await load() }
+        // The note otherwise only saves on focus loss, but `.id(id)` at this
+        // pane's call site (`Sidebar.swift`) tears the whole pane — and its
+        // `@State noteDraft` — down the instant the selection changes,
+        // before a text field can ever resign focus. `saveNoteIfChanged`
+        // already no-ops when the draft matches the loaded note, so this
+        // never writes on a plain tab switch or a switch back to the same
+        // project.
+        .onDisappear {
+            Task { await saveNoteIfChanged() }
+        }
     }
 
     // MARK: - Layout
@@ -268,10 +278,16 @@ struct ProjectDetailPane: View {
     /// refresh so a pin/archive edit can move the project between groups.
     ///
     /// These edits run as independent, uncancelled `Task`s (not scoped to
-    /// `.task(id:)`), so a late response can still arrive after the user
-    /// has switched to a different project. `d.id == projectId` guards
-    /// against that stale response silently overwriting the now-visible
-    /// project's note, totals, or pin state.
+    /// `.task(id:)`), so a late response can still arrive after the user has
+    /// switched to a different project. What actually closes that race is
+    /// `.id(id)` on this pane's call site in `Sidebar.swift`: switching
+    /// projects gives the pane a fresh identity (and fresh `@State`), so a
+    /// stale response has no live `detail`/`noteDraft` left to overwrite.
+    /// `guard d.id == projectId` below is defence-in-depth only — as the
+    /// code stands today it is a tautology (every caller passes
+    /// `projectId: detail.id`, and `detail` only ever comes from a fetch of
+    /// `projectId`), not the mechanism that protects against the race. Do
+    /// not remove `.id(id)` on the strength of this guard alone.
     private func apply(_ result: Result<ProjectDetail, Error>) async {
         switch result {
         case .success(let d):

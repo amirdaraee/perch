@@ -160,8 +160,11 @@ struct UsageView: View {
         .frame(height: 220)
     }
 
+    /// Four classes only — matches `TurnUsage::total_tokens()` and
+    /// `bar.totalLabel`, both of which exclude thinking as a subset of
+    /// output. The stacked bar's height must equal the labelled total.
     private func dailyTotal(_ bar: DailyBar) -> UInt64 {
-        bar.input + bar.output + bar.cacheRead + bar.cacheWrite + bar.thinking
+        bar.input + bar.output + bar.cacheRead + bar.cacheWrite
     }
 
     private func dailySegments(_ daily: [DailyBar]) -> [DailySegment] {
@@ -169,11 +172,20 @@ struct UsageView: View {
             var cumulative: UInt64 = 0
             var rendered: [(label: String, start: UInt64, end: UInt64)] = []
             for entry in PerchChartPalette.order {
-                let value = classValue(entry.label, in: bar)
+                let value = classValue(entry.key, in: bar)
                 guard value > 0 else { continue }
                 rendered.append((entry.label, cumulative, cumulative + value))
                 cumulative += value
             }
+            // The stacked height must equal the number `totalLabel` was
+            // rendered from — this is exactly the double-counting bug the
+            // four-class fix above closes (thinking used to push `cumulative`
+            // past `dailyTotal(bar)`, so the bar drew taller than its own
+            // annotation).
+            assert(
+                cumulative == dailyTotal(bar),
+                "stacked bar height (\(cumulative)) must equal the labelled total (\(dailyTotal(bar)))"
+            )
             return rendered.enumerated().map { index, seg in
                 DailySegment(
                     dayIndex: bar.dayIndex,
@@ -189,14 +201,15 @@ struct UsageView: View {
         }
     }
 
-    private func classValue(_ label: String, in bar: DailyBar) -> UInt64 {
-        switch label {
-        case "Input": return bar.input
-        case "Output": return bar.output
-        case "Cache read": return bar.cacheRead
-        case "Cache write": return bar.cacheWrite
-        case "Thinking": return bar.thinking
-        default: return 0
+    /// Mapped by typed key, not display string — a typo in a string literal
+    /// would silently yield 0 for a whole class. (Moving the labels
+    /// themselves into Rust, so Swift never reinvents them, is backlogged.)
+    private func classValue(_ key: PerchTokenClass, in bar: DailyBar) -> UInt64 {
+        switch key {
+        case .input: return bar.input
+        case .output: return bar.output
+        case .cacheRead: return bar.cacheRead
+        case .cacheWrite: return bar.cacheWrite
         }
     }
 
