@@ -36,6 +36,13 @@ pub struct SessionRow {
     pub elapsed: String,
     pub tokens: String,
     pub cost: String,
+    /// The composed "project · kind · vVERSION · TOKENS · COST" line, omitting
+    /// whichever parts are absent — a shell renders this verbatim rather than
+    /// assembling it (and rather than comparing `tokens`/`version` against a
+    /// sentinel to decide what to omit; that comparison is Rust's to make).
+    /// `project`, `kind`, `version`, `tokens`, and `cost` stay on the row too,
+    /// for a shell that wants the parts separately.
+    pub detail_line: String,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -45,6 +52,9 @@ pub struct RecentRow {
     pub project: String,
     pub ended_ago: String,
     pub tokens: String,
+    /// The composed "TOKENS · ended AGO ago" (or, with no usage, just "ended
+    /// AGO ago") line — same rationale as `SessionRow::detail_line`.
+    pub ended_line: String,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -182,6 +192,19 @@ pub fn build_model(db: Option<&Db>, live: &[LiveSession], now_ms: i64) -> Popove
                 }
                 None => (DASH.into(), DASH.into()),
             };
+            let project = project_of(&s.cwd);
+            let kind = s.kind.clone();
+            let version = s.cc_version.clone().unwrap_or_default();
+            let detail_line = [
+                Some(project.clone()),
+                Some(kind.clone()),
+                (!version.is_empty()).then(|| format!("v{version}")),
+                (tokens != DASH).then(|| format!("{tokens} · {cost}")),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
             SessionRow {
                 id: s.session_id.clone(),
                 pid: s.pid,
@@ -190,14 +213,15 @@ pub fn build_model(db: Option<&Db>, live: &[LiveSession], now_ms: i64) -> Popove
                 } else {
                     s.name.clone()
                 },
-                project: project_of(&s.cwd),
-                kind: s.kind.clone(),
-                version: s.cc_version.clone().unwrap_or_default(),
+                project,
+                kind,
+                version,
                 status,
                 status_label,
                 elapsed: elapsed_or_dash(now_ms, since),
                 tokens,
                 cost,
+                detail_line,
             }
         })
         .collect();
@@ -213,16 +237,24 @@ pub fn build_model(db: Option<&Db>, live: &[LiveSession], now_ms: i64) -> Popove
                         .as_deref()
                         .map(project_of)
                         .unwrap_or_else(|| r.id.chars().take(8).collect());
+                    let ended_ago = human_elapsed(now_ms - r.last_activity_at);
+                    let tokens = if r.usage.total_tokens() > 0 {
+                        human_tokens(r.usage.total_tokens())
+                    } else {
+                        DASH.into()
+                    };
+                    let ended_line = if tokens == DASH {
+                        format!("ended {ended_ago} ago")
+                    } else {
+                        format!("{tokens} · ended {ended_ago} ago")
+                    };
                     RecentRow {
                         id: r.id,
                         name: project.clone(),
                         project,
-                        ended_ago: human_elapsed(now_ms - r.last_activity_at),
-                        tokens: if r.usage.total_tokens() > 0 {
-                            human_tokens(r.usage.total_tokens())
-                        } else {
-                            DASH.into()
-                        },
+                        ended_ago,
+                        tokens,
+                        ended_line,
                     }
                 })
                 .collect(),
@@ -500,6 +532,125 @@ mod tests {
         assert_eq!(m.recent[0].project, "proj");
         assert_eq!(m.recent[0].ended_ago, "2s");
         assert_eq!(m.error, None, "the healthy path must not report an error");
+    }
+
+    /// `detail_line` is the composed "project · kind · vVERSION · TOKENS ·
+    /// COST" a shell renders verbatim. Table-tests every combination of
+    /// present/absent version and usage, including an empty (not just
+    /// missing) version string.
+    #[test]
+    fn detail_line_omits_absent_parts_and_includes_present_ones() {
+        // (cc_version, has_usage_in_db, expected detail_line)
+        let cases: &[(Option<&str>, bool, &str)] = &[
+            (None, false, "proj · interactive"),
+            (Some(""), false, "proj · interactive"),
+            (Some("2.1.251"), false, "proj · interactive · v2.1.251"),
+            (None, true, "proj · interactive · 2.0M · $30.00"),
+            (
+                Some("2.1.251"),
+                true,
+                "proj · interactive · v2.1.251 · 2.0M · $30.00",
+            ),
+        ];
+
+        for &(version, has_usage, expected) in cases {
+            let db = has_usage.then(|| {
+                let db = open_in_memory().unwrap();
+                seed_default_prices(&db).unwrap();
+                let pid = db
+                    .upsert_project("-Users-a-proj", "/Users/a/proj", false)
+                    .unwrap();
+                db.upsert_session(&SessionRecord {
+                    id: "a".into(),
+                    project_id: pid,
+                    file_path: "/tmp/a.jsonl".into(),
+                    file_size: 0,
+                    indexed_offset: 0,
+                    started_at: Some(1_000),
+                    last_activity_at: Some(9_000),
+                    cwd: Some("/Users/a/proj".into()),
+                    git_branch: None,
+                    cc_version: None,
+                    message_count: 1,
+                })
+                .unwrap();
+                db.insert_turns(
+                    "a",
+                    &[Turn {
+                        ts: 9_000,
+                        model: "claude-fable-5".into(),
+                        usage: TurnUsage {
+                            input: 2_000_000,
+                            ..Default::default()
+                        },
+                    }],
+                )
+                .unwrap();
+                db
+            });
+
+            let mut s = live(
+                7,
+                "a",
+                "alpha",
+                "/Users/a/proj",
+                SessionStatus::Working,
+                "interactive",
+            );
+            s.cc_version = version.map(str::to_string);
+            let m = build_model(db.as_ref(), &[s], 10_000);
+            assert_eq!(
+                m.live[0].detail_line, expected,
+                "version={version:?} has_usage={has_usage}"
+            );
+        }
+    }
+
+    /// `ended_line` is the composed "TOKENS · ended AGO ago" (or, with no
+    /// usage, just "ended AGO ago") a shell renders verbatim for a recent row.
+    #[test]
+    fn ended_line_omits_tokens_when_absent_and_includes_them_when_present() {
+        for (session_id, add_turns, expected) in [
+            ("gone", false, "ended 2s ago"),
+            ("gone-with-usage", true, "2.0M · ended 2s ago"),
+        ] {
+            let db = open_in_memory().unwrap();
+            seed_default_prices(&db).unwrap();
+            let pid = db
+                .upsert_project("-Users-a-proj", "/Users/a/proj", false)
+                .unwrap();
+            db.upsert_session(&SessionRecord {
+                id: session_id.into(),
+                project_id: pid,
+                file_path: format!("/tmp/{session_id}.jsonl"),
+                file_size: 0,
+                indexed_offset: 0,
+                started_at: Some(1),
+                last_activity_at: Some(8_000),
+                cwd: Some("/Users/a/proj".into()),
+                git_branch: None,
+                cc_version: None,
+                message_count: 1,
+            })
+            .unwrap();
+            if add_turns {
+                db.insert_turns(
+                    session_id,
+                    &[Turn {
+                        ts: 8_000,
+                        model: "claude-fable-5".into(),
+                        usage: TurnUsage {
+                            input: 2_000_000,
+                            ..Default::default()
+                        },
+                    }],
+                )
+                .unwrap();
+            }
+            let m = build_model(Some(&db), &[], 10_000);
+            assert_eq!(m.recent.len(), 1);
+            assert_eq!(m.recent[0].ended_line, expected, "session_id={session_id}");
+        }
     }
 
     /// Break only `recent_sessions` (it selects `sessions.cwd`, renamed away

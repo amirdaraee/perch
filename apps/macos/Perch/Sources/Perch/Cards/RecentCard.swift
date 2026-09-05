@@ -13,7 +13,7 @@ struct RecentCard: View {
                     Circle().fill(Color.perchBackground).frame(width: 8, height: 8)
                     Text(r.project).lineLimit(1)
                     Spacer()
-                    Text(r.tokens == "—" ? "ended \(r.endedAgo) ago" : "\(r.tokens) · ended \(r.endedAgo) ago")
+                    Text(r.endedLine)
                         .font(.caption).foregroundStyle(.secondary).monospacedDigit()
                 }
             }
