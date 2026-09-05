@@ -55,8 +55,27 @@ and the generated Swift bindings are build output and git-ignored; always regene
 with the script above rather than trusting a checked-in copy, which is a classic source of
 FFI bugs.
 
-The Tauri app below stays in the repo, unchanged, until the native app reaches parity — it
-still lacks jump-to-session and resume.
+**Open Perch**, an item in the status-item menu, opens the app's main window: a sidebar
+listing every project — grouped Pinned, Active, Recent, and Archived, each with its token
+and spend totals — and, for the selected project, a detail pane with your own note,
+aggregate stats, a 14-day sparkline, and its full session history. A separate Usage tab adds
+hero stats, 14 days of token-class bars, a top-projects ranking, and a per-model breakdown.
+While the window is open the app gets a Dock icon; it goes back to menu-bar-only when the
+window closes.
+
+From the project detail pane you can pin, archive, rename, resume an ended session
+(`claude --resume <id>`), or start a fresh one (`claude`) — both in the project's own
+directory. Both actions hand the command to Terminal.app by writing a one-shot script into
+Perch's *own* `~/Library/Application Support/Perch/commands/` directory (swept of anything
+older than a minute) and asking `NSWorkspace` to open it there, which is what avoids the
+Automation permission prompt an AppleScript-driven approach would need. The command line
+itself is composed in Rust (`perch-core::actions`), which POSIX-single-quotes every value it
+embeds before it ever reaches a shell. None of this touches your Claude Code directory or
+makes a network request — both promises in the [Privacy](#privacy) section above hold for
+the main window exactly as they do for the menu.
+
+The Tauri app below stays in the repo, unchanged — removing it is next on the backlog now
+that the native app has reached parity with it.
 
 ## The app
 

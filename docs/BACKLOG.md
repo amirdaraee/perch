@@ -21,12 +21,26 @@ Status legend: **now** = next task · **next** = this milestone or the following
   real, tracked `NSMenu` on the status item — the structurally correct fix, not yet confirmed
   by a human on a real display. Engine is the same Rust view-model, exposed to Swift via
   UniFFI; the app is a SwiftPM executable built by `scripts/build-xcframework.sh` plus
-  `make bundle`. The Tauri app remains until this reaches parity.
+  `make bundle`. The Tauri app remains until it's removed (see **Now**).
 - **Richer session rows.** Second line: project · kind · Claude Code version, per-session
   tokens and ≈$ joined from the index, blocked sessions sorted first.
 - **Recent section.** Last three ended sessions with project and "ended 2h ago".
 - **Taller popover**, list scrolls, hosted as SwiftUI cards inside the native menu.
 - **Re-indexes on show**, not only on launch, so a long-running Perch never shows stale totals.
+- **Main window.** A real window, opened from the status-item menu's **Open Perch**, that
+  gives the app a Dock icon while it's up and returns to menu-bar-only on close. A sidebar
+  lists every project — Pinned, Active, Recent, Archived — each row carrying its token and
+  spend totals.
+- **Per-project stats.** Selecting a project shows its own note (editable, survives
+  re-index), aggregate totals (sessions · tokens · cost), a 14-day sparkline, and its full
+  session history. Pin, archive, and rename all live here too.
+- **Resume and open a project's terminal.** Resume runs `claude --resume <id>` for any past
+  session; "Open new session" starts a fresh `claude` in the project's directory. Both are
+  composed in Rust (`perch-core::actions`, every value POSIX-single-quoted) and handed to
+  Terminal.app via a one-shot script written into Perch's own application-support directory
+  — no Automation permission prompt, nothing touches the Claude Code directory.
+- **Usage view** (spec §9.3). Hero stats, 14 days of token-class stacked bars, a top-projects
+  ranking, and a per-model breakdown, as a second tab alongside the project list.
 
 ---
 
@@ -35,16 +49,18 @@ Status legend: **now** = next task · **next** = this milestone or the following
 - **Waiting-on-you notification.** macOS alert when a session has been `waiting` longer than
   N minutes (default 10), once per episode, background sessions excluded by default. This is
   the feature that solves the 32-hour-blocked-session problem the project started from.
+- **Remove the Tauri app and React frontend.** The native app now has the main window, resume,
+  open, and per-project stats — the parity this was waiting on. `src-tauri` and `src/` (the
+  React frontend) can come out once the native app is the one people actually run.
 
 ## Next — sessions & projects (Perch's own ground)
 
-- **Jump to session.** Focus the terminal or IDE window that owns the session (walk the process
-  tree from the pid). Fallback: reveal the cwd in Finder.
-- **Resume ended session.** `claude --resume <id>` in the user's preferred terminal.
-- **Project "where I left off" note** — one line per project, user-owned, survives re-index.
-- **Pin / archive / status** per project (active · paused · done).
-- **Main window, hybrid layout** (spec §9.2): "Now" pinned above the project list; project
-  detail with note, totals, 14-day sparkline, session history.
+- **Preferred-terminal detection.** The design spec calls for resolving the user's terminal by
+  walking the process tree from a live session's pid, rather than a fixed choice. Resume and
+  Open currently hardcode Terminal.app (`Launcher.swift`); this was deliberately deferred to
+  ship the two actions first.
+- **Project status beyond pin/archive** (active · paused · done). `db::set_status` already
+  exists in the data layer; no UI surfaces the third state yet — only pinned and archived do.
 - **Prompt search.** `history.jsonl` already keys every typed prompt by session — search it to
   find "that session where I asked about X" without opening transcripts.
 - **Session naming.** Rename a live session from Perch (Claude Code already supports
@@ -64,7 +80,6 @@ Status legend: **now** = next task · **next** = this milestone or the following
 - **Stale-data dimming** — dim the icon when the last successful refresh is older than X.
 - **Approaching-limit alert** at a configurable threshold (default 80 %) once per window.
 - **Burn-rate projection** — "at this pace the window fills in ~1h 50m" (approved mockup).
-- **Usage view** (spec §9.3): daily stacked bars by token class, top projects, by model.
 - **Verified price table** with an editable UI — today's numbers are placeholders.
 - **Reset-time style** options: countdown vs absolute time (CodexBar has this; cheap).
 
@@ -80,8 +95,6 @@ Status legend: **now** = next task · **next** = this milestone or the following
   empty popover.
 - **Demo mode** (`--demo`) with synthetic sessions/projects — needed for README screenshots
   without leaking real project names, and for deterministic UI tests.
-- **Remove the Tauri app and React frontend** once the native app has jump-to-session and
-  resume, its last two gaps versus the popover it replaces.
 
 ## Later
 
