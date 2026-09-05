@@ -105,19 +105,3 @@ struct NowPane: View {
         }
     }
 }
-
-/// Stub — Task 9 replaces this with the real project detail pane (note
-/// editing, sparkline, session history, terminal actions). Deliberately
-/// minimal here so it's obvious this isn't the finished view.
-struct ProjectDetailPane: View {
-    let engine: PerchEngine
-    let projectId: Int64
-    let onChanged: () async -> Void
-
-    var body: some View {
-        Text(verbatim: "Project \(projectId)")
-            .font(.title2)
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
