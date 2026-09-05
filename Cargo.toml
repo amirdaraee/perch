@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/perch-core", "crates/perch-cli", "src-tauri"]
+members = ["crates/perch-core", "crates/perch-cli", "crates/perch-ffi", "src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
@@ -18,3 +18,5 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 libc = "0.2"
+notify = "8"
+uniffi = { version = "0.32", features = ["cli"] }

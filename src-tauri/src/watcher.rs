@@ -1,3 +1,9 @@
+//! Forked by (not the source of a move to) `perch-core`'s
+//! `ui::watcher`, which holds a near-identical loop for the native macOS
+//! app. This copy is kept deliberately until this app is removed (backlog:
+//! "Remove the Tauri app and React frontend"). A debounce or promotion fix
+//! here does not reach that copy on its own.
+
 use notify::{RecursiveMode, Watcher};
 use perch_core::{config, live, platform::RealProcessProbe};
 use std::sync::mpsc;

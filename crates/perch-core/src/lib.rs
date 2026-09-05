@@ -11,6 +11,7 @@ pub mod pricing;
 pub mod query;
 pub mod scan;
 pub mod transcript;
+pub mod ui;
 
 #[cfg(test)]
 mod tests {
