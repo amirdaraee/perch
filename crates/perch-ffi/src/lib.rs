@@ -40,6 +40,7 @@ pub struct SessionRow {
     pub elapsed: String,
     pub tokens: String,
     pub cost: String,
+    pub detail_line: String,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -49,6 +50,7 @@ pub struct RecentRow {
     pub project: String,
     pub ended_ago: String,
     pub tokens: String,
+    pub ended_line: String,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -82,58 +84,103 @@ impl From<core_model::Status> for Status {
     }
 }
 
+// Every `From` impl below destructures the core value (rather than reading
+// named fields off it) so that adding a field to a `perch_core::ui::model`
+// record is a compile error here, not a silent gap: without the destructure,
+// a new core field would compile fine while never reaching any shell.
+
 impl From<core_model::Stats> for Stats {
     fn from(s: core_model::Stats) -> Self {
+        let core_model::Stats {
+            window_tokens,
+            week_tokens,
+            day_tokens,
+            day_cost,
+            estimated,
+            has_data,
+        } = s;
         Stats {
-            window_tokens: s.window_tokens,
-            week_tokens: s.week_tokens,
-            day_tokens: s.day_tokens,
-            day_cost: s.day_cost,
-            estimated: s.estimated,
-            has_data: s.has_data,
+            window_tokens,
+            week_tokens,
+            day_tokens,
+            day_cost,
+            estimated,
+            has_data,
         }
     }
 }
 
 impl From<core_model::SessionRow> for SessionRow {
     fn from(r: core_model::SessionRow) -> Self {
+        let core_model::SessionRow {
+            id,
+            pid,
+            name,
+            project,
+            kind,
+            version,
+            status,
+            status_label,
+            elapsed,
+            tokens,
+            cost,
+            detail_line,
+        } = r;
         SessionRow {
-            id: r.id,
-            pid: r.pid,
-            name: r.name,
-            project: r.project,
-            kind: r.kind,
-            version: r.version,
-            status: r.status.into(),
-            status_label: r.status_label,
-            elapsed: r.elapsed,
-            tokens: r.tokens,
-            cost: r.cost,
+            id,
+            pid,
+            name,
+            project,
+            kind,
+            version,
+            status: status.into(),
+            status_label,
+            elapsed,
+            tokens,
+            cost,
+            detail_line,
         }
     }
 }
 
 impl From<core_model::RecentRow> for RecentRow {
     fn from(r: core_model::RecentRow) -> Self {
+        let core_model::RecentRow {
+            id,
+            name,
+            project,
+            ended_ago,
+            tokens,
+            ended_line,
+        } = r;
         RecentRow {
-            id: r.id,
-            name: r.name,
-            project: r.project,
-            ended_ago: r.ended_ago,
-            tokens: r.tokens,
+            id,
+            name,
+            project,
+            ended_ago,
+            tokens,
+            ended_line,
         }
     }
 }
 
 impl From<core_model::PopoverModel> for PopoverModel {
     fn from(m: core_model::PopoverModel) -> Self {
+        let core_model::PopoverModel {
+            stats,
+            live,
+            recent,
+            tray_title,
+            error,
+            waiting_banner,
+        } = m;
         PopoverModel {
-            stats: m.stats.into(),
-            live: m.live.into_iter().map(Into::into).collect(),
-            recent: m.recent.into_iter().map(Into::into).collect(),
-            tray_title: m.tray_title,
-            error: m.error,
-            waiting_banner: m.waiting_banner,
+            stats: stats.into(),
+            live: live.into_iter().map(Into::into).collect(),
+            recent: recent.into_iter().map(Into::into).collect(),
+            tray_title,
+            error,
+            waiting_banner,
         }
     }
 }
@@ -187,22 +234,53 @@ fn app_data_db() -> Result<PathBuf, PerchError> {
 /// outcome* only — not a back-reference to `Perch` itself.
 #[derive(Clone)]
 struct ThisPerch {
+    config_dir: PathBuf,
     db_path: PathBuf,
     reindex_error: Arc<Mutex<Option<String>>>,
 }
 
 impl ThisPerch {
     fn model_for(&self, sessions: Vec<live::LiveSession>) -> PopoverModel {
-        let db = db::open(&self.db_path).ok();
+        // Captured (not `.ok()`-discarded): this same file is also opened by
+        // the retained Tauri app, so a concurrent writer can make this fail
+        // with `SQLITE_BUSY` on an otherwise-healthy index — and this path
+        // runs on every watcher tick, not just around a re-index, so it is
+        // the only place that ever sees that failure.
+        let db_result = db::open(&self.db_path);
         let mut model: PopoverModel =
-            core_model::build_model(db.as_ref(), &sessions, now_ms()).into();
-        // A re-index failure must stay visible until a later re-index
-        // succeeds, but it must not clobber a more specific error already
-        // produced by `build_model` itself (e.g. a broken index schema).
+            core_model::build_model(db_result.as_ref().ok(), &sessions, now_ms()).into();
+        // Neither fold may clobber a more specific error `build_model` itself
+        // already produced (e.g. a broken index schema): this tick's open
+        // failure is more specific than a possibly-stale re-index failure
+        // from an earlier tick, so it is folded first.
+        if let Err(e) = &db_result {
+            model
+                .error
+                .get_or_insert_with(|| format!("could not open index: {e}"));
+        }
         if let Some(err) = self.reindex_error.lock().unwrap().clone() {
             model.error.get_or_insert(err);
         }
         model
+    }
+
+    /// Re-index the database, recording (rather than discarding) any
+    /// failure. The design's rule is that database trouble must be visible;
+    /// `PopoverModel::error` exists for exactly this, so a failure here is
+    /// folded into every model emitted afterwards (via `model_for` above)
+    /// until a later re-index succeeds and clears it — there is no separate
+    /// notification path, so nothing downstream can silently miss it.
+    fn reindex(&self) {
+        let outcome = (|| -> Result<(), String> {
+            let database =
+                db::open(&self.db_path).map_err(|e| format!("could not open index: {e}"))?;
+            pricing::seed_default_prices(&database)
+                .map_err(|e| format!("could not seed prices: {e}"))?;
+            index::index_all(&database, &config::projects_dir(&self.config_dir))
+                .map_err(|e| format!("could not index sessions: {e}"))?;
+            Ok(())
+        })();
+        *self.reindex_error.lock().unwrap() = outcome.err();
     }
 }
 
@@ -237,31 +315,49 @@ impl Perch {
         self.model_for(sessions)
     }
 
-    /// Re-index, emit, then keep emitting on every change and at least every 5 s.
+    /// Emit the current sessions immediately (from whatever the index
+    /// already holds), then re-index in the background and emit again, then
+    /// keep emitting on every change and at least every 5 s.
     ///
-    /// Idempotent: a second call while already running is a no-op.
+    /// Idempotent: a second call while already running is a no-op. Re-index
+    /// work never runs on the caller's thread (AppKit's main thread calls
+    /// this from `applicationDidFinishLaunching`) — see `refresh()`.
     pub fn start(&self, listener: Arc<dyn PerchListener>) {
         let mut guard = self.handle.lock().unwrap();
         if guard.is_some() {
             return;
         }
-        self.reindex();
         let me = ThisPerch {
+            config_dir: self.config_dir.clone(),
             db_path: self.db_path.clone(),
             reindex_error: self.reindex_error.clone(),
         };
+        let me_for_refresh = me.clone();
         let cfg = watcher::WatcherConfig::for_dir(config::sessions_dir(&self.config_dir));
-        let h = watcher::spawn(cfg, Arc::new(RealProcessProbe), move |sessions| {
-            listener.on_model(me.model_for(sessions));
-        });
+        let h = watcher::spawn(
+            cfg,
+            Arc::new(RealProcessProbe),
+            move |sessions| listener.on_model(me.model_for(sessions)),
+            move || me_for_refresh.reindex(),
+        );
+        // The watcher's own initial emit (above) is prompt but may be built
+        // from a stale or empty index; ask it to re-index and emit again
+        // right away, on its own thread, rather than blocking here for it.
+        h.refresh();
         *guard = Some(h);
     }
 
-    /// Re-index and emit now. Called when the menu opens.
+    /// Emit now. Called when the menu opens.
+    ///
+    /// While the watcher is running, this is a pure signal — the re-index it
+    /// triggers runs on the watcher thread, not here, so a slow index never
+    /// blocks the caller (AppKit calls this from `menuWillOpen`, while it is
+    /// preparing to display the menu). With no watcher running yet, there is
+    /// no thread to hand the work to, so it runs here instead.
     pub fn refresh(&self) {
-        self.reindex();
-        if let Some(h) = self.handle.lock().unwrap().as_ref() {
-            h.refresh();
+        match self.handle.lock().unwrap().as_ref() {
+            Some(h) => h.refresh(),
+            None => self.reindex(),
         }
     }
 
@@ -275,31 +371,22 @@ impl Perch {
 }
 
 impl Perch {
-    fn model_for(&self, sessions: Vec<live::LiveSession>) -> PopoverModel {
+    fn this(&self) -> ThisPerch {
         ThisPerch {
+            config_dir: self.config_dir.clone(),
             db_path: self.db_path.clone(),
             reindex_error: self.reindex_error.clone(),
         }
-        .model_for(sessions)
     }
 
-    /// Re-index the database, recording (rather than discarding) any
-    /// failure. The design's rule is that database trouble must be visible;
-    /// `PopoverModel::error` exists for exactly this, so a failure here is
-    /// folded into every model emitted afterwards (via `model_for` above)
-    /// until a later re-index succeeds and clears it — there is no separate
-    /// notification path, so nothing downstream can silently miss it.
+    fn model_for(&self, sessions: Vec<live::LiveSession>) -> PopoverModel {
+        self.this().model_for(sessions)
+    }
+
+    /// Synchronous fallback for `refresh()` when no watcher is running (see
+    /// `ThisPerch::reindex` for the real work and its error-visibility rule).
     fn reindex(&self) {
-        let outcome = (|| -> Result<(), String> {
-            let database =
-                db::open(&self.db_path).map_err(|e| format!("could not open index: {e}"))?;
-            pricing::seed_default_prices(&database)
-                .map_err(|e| format!("could not seed prices: {e}"))?;
-            index::index_all(&database, &config::projects_dir(&self.config_dir))
-                .map_err(|e| format!("could not index sessions: {e}"))?;
-            Ok(())
-        })();
-        *self.reindex_error.lock().unwrap() = outcome.err();
+        self.this().reindex();
     }
 }
 
@@ -413,6 +500,29 @@ mod tests {
         assert!(
             snap.error.is_none(),
             "a later successful re-index must clear the earlier error"
+        );
+    }
+
+    #[test]
+    fn ffi_level_open_failure_surfaces_in_model_error_even_without_a_reindex() {
+        // Same blocker technique as above, but this test never calls
+        // `start()` or `refresh()`, so `reindex_error` stays `None` — the
+        // only thing that can put an error on the model is `ThisPerch::model_for`'s
+        // own `db::open` call, exactly the path the watcher's 5-second ticks
+        // (and a concurrent-writer `SQLITE_BUSY`) go through. Before this fix
+        // that call was `.ok()`-discarded and `snap.error` stayed `None`.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        let blocker = data_root.path().join("blocked");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let _env = DataDirGuard::set(&blocker);
+
+        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
+        let snap = perch.current();
+        assert!(
+            snap.error.is_some(),
+            "an unopenable index must surface in model.error on every tick, \
+             not just around an explicit re-index"
         );
     }
 }

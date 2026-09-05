@@ -1,5 +1,10 @@
 //! Watches the sessions directory and reports the live session list.
-//! Moved from the Tauri shell; no UI framework in sight.
+//! No UI framework in sight.
+//!
+//! Forked from (not moved from) the Tauri shell's near-identical loop at
+//! `src-tauri/src/watcher.rs`, kept deliberately until that app is removed
+//! (backlog: "Remove the Tauri app and React frontend"). A debounce or
+//! promotion fix here does not reach that copy on its own.
 
 use crate::live::{live_sessions, LiveSession};
 use crate::platform::ProcessProbe;
@@ -46,7 +51,10 @@ pub struct WatcherHandle {
 }
 
 impl WatcherHandle {
-    /// Emit now, regardless of debounce. Used when the menu opens.
+    /// Run `on_refresh` (see `spawn`), then emit, regardless of debounce.
+    /// Used when the menu opens. A pure signal: the work happens on the
+    /// watcher thread, not the caller's, so a slow `on_refresh` never blocks
+    /// whoever calls this (menu-open handlers are commonly on a UI thread).
     pub fn refresh(&self) {
         let _ = self.events.send(Event::Cmd(Cmd::Refresh));
     }
@@ -87,13 +95,27 @@ impl Drop for WatcherHandle {
 /// Start watching. Emits the current list immediately, then on every change
 /// (debounced, trailing-edge) and at least every `poll` as a backstop — a session
 /// whose process dies produces no filesystem event, so polling is what removes it.
-pub fn spawn<F>(cfg: WatcherConfig, probe: Arc<dyn ProcessProbe>, on_sessions: F) -> WatcherHandle
+///
+/// `on_refresh` runs on the watcher thread, only when an explicit
+/// `WatcherHandle::refresh()` call is processed — never on the initial emit,
+/// a filesystem event, or a poll tick — so a caller (e.g. the FFI layer's
+/// index re-index, which is real work: a full directory walk plus SQLite
+/// round-trips) never blocks whoever asked for the refresh, and two
+/// `refresh()` calls can never run that work concurrently with each other:
+/// this thread processes one event at a time.
+pub fn spawn<F, R>(
+    cfg: WatcherConfig,
+    probe: Arc<dyn ProcessProbe>,
+    on_sessions: F,
+    on_refresh: R,
+) -> WatcherHandle
 where
     F: Fn(Vec<LiveSession>) + Send + 'static,
+    R: Fn() + Send + 'static,
 {
     let (ev_tx, ev_rx) = mpsc::channel::<Event>();
     let fs_tx = ev_tx.clone();
-    let thread = std::thread::spawn(move || run(cfg, probe, on_sessions, fs_tx, ev_rx));
+    let thread = std::thread::spawn(move || run(cfg, probe, on_sessions, on_refresh, fs_tx, ev_rx));
     let thread_id = thread.thread().id();
     WatcherHandle {
         events: ev_tx,
@@ -102,14 +124,16 @@ where
     }
 }
 
-fn run<F>(
+fn run<F, R>(
     cfg: WatcherConfig,
     probe: Arc<dyn ProcessProbe>,
     on_sessions: F,
+    on_refresh: R,
     fs_tx: mpsc::Sender<Event>,
     ev_rx: mpsc::Receiver<Event>,
 ) where
     F: Fn(Vec<LiveSession>),
+    R: Fn(),
 {
     let dir = cfg.sessions_dir.clone();
     let emit = |probe: &dyn ProcessProbe| on_sessions(live_sessions(&dir, probe));
@@ -147,6 +171,7 @@ fn run<F>(
         match ev_rx.recv_timeout(wait) {
             Ok(Event::Cmd(Cmd::Stop)) => return,
             Ok(Event::Cmd(Cmd::Refresh)) => {
+                on_refresh();
                 emit(&*probe);
                 last = Instant::now();
                 pending = false;
@@ -255,6 +280,7 @@ mod tests {
             move |s| {
                 let _ = tx.send(s);
             },
+            || {},
         );
 
         let first = rx
@@ -299,6 +325,7 @@ mod tests {
             move |s| {
                 let _ = tx.send(s);
             },
+            || {},
         );
 
         let first = rx
@@ -375,6 +402,7 @@ mod tests {
             move |s| {
                 let _ = tx.send(s);
             },
+            || {},
         );
         rx.recv_timeout(Duration::from_secs(2)).expect("initial");
         h.refresh();
@@ -421,6 +449,7 @@ mod tests {
                     let _ = outcome_tx.send(outcome);
                 }
             },
+            || {},
         );
         *handle_slot.lock().unwrap() = Some(h);
 
