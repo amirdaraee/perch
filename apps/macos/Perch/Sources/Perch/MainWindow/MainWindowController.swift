@@ -10,16 +10,26 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
     private let engine: PerchEngine
 
+    /// Bumped every time `show()` (re)presents the window. `MainWindowRoot`
+    /// keys its `.task` on this, so reopening the same `NSHostingView`
+    /// reloads the project list instead of showing whatever was current the
+    /// first time the view appeared — see `Sidebar.swift`.
+    private var refreshToken = 0
+
     init(engine: PerchEngine) {
         self.engine = engine
         super.init()
     }
 
     func show() {
+        refreshToken += 1
+
         if let window {
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
             window.makeKeyAndOrderFront(nil)
+            (window.contentView as? NSHostingView<MainWindowRoot>)?.rootView =
+                MainWindowRoot(engine: engine, refreshToken: refreshToken)
             return
         }
 
@@ -35,7 +45,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         w.center()
         w.isReleasedWhenClosed = false
         w.delegate = self
-        w.contentView = NSHostingView(rootView: MainWindowRoot(engine: engine))
+        w.contentView = NSHostingView(rootView: MainWindowRoot(engine: engine, refreshToken: refreshToken))
         window = w
 
         NSApp.setActivationPolicy(.regular)
@@ -44,33 +54,12 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        // Guarded even though there is exactly one window/delegate today:
+        // without it, a second window sharing this delegate would flip the
+        // activation policy back to .accessory when *it* closed, even while
+        // this controller's own window was still open.
+        guard notification.object as? NSWindow === window else { return }
         // Back to a pure menu-bar app: no Dock icon, no Cmd-Tab entry.
         NSApp.setActivationPolicy(.accessory)
-    }
-}
-
-/// Placeholder content for the main window. Task 8 replaces this with the
-/// sidebar and project list; this only proves the engine read reaches the UI.
-struct MainWindowRoot: View {
-    let engine: PerchEngine
-    @State private var model: MainWindowModel?
-
-    var body: some View {
-        VStack(spacing: 12) {
-            if let model {
-                Text("\(model.projects.count) projects")
-                    .font(.title2)
-                if let error = model.error {
-                    Text(error)
-                        .foregroundStyle(.secondary)
-                }
-            } else {
-                ProgressView("Loading…")
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .task {
-            model = await engine.mainWindow()
-        }
     }
 }
