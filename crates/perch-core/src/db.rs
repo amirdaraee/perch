@@ -11,6 +11,16 @@ pub struct Db {
     conn: Connection,
 }
 
+/// The user-owned half of a project row. Indexing never overwrites these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectMeta {
+    pub display_name: Option<String>,
+    pub status: String,
+    pub pinned: bool,
+    pub note: Option<String>,
+    pub archived: bool,
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS projects (
     id                INTEGER PRIMARY KEY,
@@ -180,6 +190,38 @@ impl Db {
             params![project_id],
             |r| r.get(0),
         )?)
+    }
+
+    pub fn project_meta(&self, project_id: i64) -> Result<ProjectMeta> {
+        Ok(self.conn.query_row(
+            "SELECT display_name, status, pinned, note, archived FROM projects WHERE id = ?1",
+            params![project_id],
+            |r| {
+                Ok(ProjectMeta {
+                    display_name: r.get(0)?,
+                    status: r.get(1)?,
+                    pinned: r.get::<_, i64>(2)? != 0,
+                    note: r.get(3)?,
+                    archived: r.get::<_, i64>(4)? != 0,
+                })
+            },
+        )?)
+    }
+
+    pub fn set_archived(&self, project_id: i64, archived: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE projects SET archived = ?2 WHERE id = ?1",
+            params![project_id, archived as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_status(&self, project_id: i64, status: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE projects SET status = ?2 WHERE id = ?1",
+            params![project_id, status],
+        )?;
+        Ok(())
     }
 
     pub fn upsert_session(&self, s: &SessionRecord) -> Result<()> {
@@ -501,5 +543,53 @@ mod tests {
             .unwrap();
         db.set_parent(child, Some(parent)).unwrap();
         assert_eq!(db.parent_of(child).unwrap(), Some(parent));
+    }
+
+    #[test]
+    fn project_meta_defaults_are_sane_for_a_fresh_project() {
+        let db = open_in_memory().unwrap();
+        let id = db.upsert_project("-a-b", "/a/b", false).unwrap();
+        let m = db.project_meta(id).unwrap();
+        assert_eq!(m.display_name, None);
+        assert_eq!(m.status, "active");
+        assert!(!m.pinned);
+        assert_eq!(m.note, None);
+        assert!(!m.archived, "a new project is not archived");
+    }
+
+    #[test]
+    fn archived_and_status_round_trip_and_survive_reindexing() {
+        let db = open_in_memory().unwrap();
+        let id = db.upsert_project("-a-b", "/a/b", false).unwrap();
+        db.set_archived(id, true).unwrap();
+        db.set_status(id, "done").unwrap();
+        db.set_note(id, "left off at the parser").unwrap();
+
+        // Re-indexing upserts the same project; user-owned columns must survive.
+        let same = db.upsert_project("-a-b", "/a/b", false).unwrap();
+        assert_eq!(same, id);
+
+        let m = db.project_meta(id).unwrap();
+        assert!(m.archived);
+        assert_eq!(m.status, "done");
+        assert_eq!(m.note.as_deref(), Some("left off at the parser"));
+    }
+
+    #[test]
+    fn archived_can_be_turned_back_off() {
+        let db = open_in_memory().unwrap();
+        let id = db.upsert_project("-a-b", "/a/b", false).unwrap();
+        db.set_archived(id, true).unwrap();
+        db.set_archived(id, false).unwrap();
+        assert!(!db.project_meta(id).unwrap().archived);
+    }
+
+    #[test]
+    fn project_meta_for_an_unknown_id_is_an_error_not_a_default() {
+        let db = open_in_memory().unwrap();
+        assert!(
+            db.project_meta(9999).is_err(),
+            "a missing project must not read as defaults"
+        );
     }
 }
