@@ -92,8 +92,11 @@ later Linux or Windows shell reuses them and only supplies its own delivery mech
 for `CLAUDE_CONFIG_DIR` and `PERCH_DATA_DIR`.
 
 **TOML, not JSON.** The file is watched and meant to be hand-edited; a config a user is invited
-to edit but cannot annotate is worse. The cost is six small pure-parser crates with no network
-surface, so the CI audit is untouched.
+to edit but cannot annotate is worse. The parser is **`toml_edit`** — the crate Cargo itself
+uses — because it is the one that preserves comments and key order across a write, which plain
+serialization cannot. It brings eight small pure-parsing crates (`winnow`, `toml_parser`,
+`toml_datetime`, `serde_spanned`, `serde_core`, `indexmap`, `hashbrown`, `equivalent`), none of
+them capable of I/O beyond parsing, so the no-network CI audit is untouched.
 
 It is written with a header comment and every key present at its default, so the file itself
 documents the options. Unknown keys are preserved on rewrite rather than dropped — a user's
