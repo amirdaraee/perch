@@ -12,6 +12,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let engine: PerchEngine
     private var cancellables = Set<AnyCancellable>()
 
+    /// Set by `AppDelegate`. The status item owns the menu, not the window's
+    /// lifetime, so it just asks for the window to be shown.
+    var onOpenWindow: (() -> Void)?
+
     init(engine: PerchEngine) {
         self.engine = engine
         super.init()
@@ -38,6 +42,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
         guard let model else {
             add(EmptyCard(title: engine.startupError ?? "Starting…", detail: nil))
+            menu.addItem(.separator())
+            addOpenWindow()
+            menu.addItem(.separator())
             addQuit()
             return
         }
@@ -59,6 +66,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             add(RecentCard(rows: model.recent))
         }
         menu.addItem(.separator())
+        addOpenWindow()
+        menu.addItem(.separator())
         addQuit()
     }
 
@@ -70,9 +79,16 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(item)
     }
 
+    private func addOpenWindow() {
+        let item = NSMenuItem(title: "Open Perch", action: #selector(openWindow), keyEquivalent: "o")
+        item.target = self
+        menu.addItem(item)
+    }
+
     private func addQuit() {
         menu.addItem(withTitle: "Quit Perch", action: #selector(quit), keyEquivalent: "q").target = self
     }
 
+    @objc private func openWindow() { onOpenWindow?() }
     @objc private func quit() { NSApp.terminate(nil) }
 }
