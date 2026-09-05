@@ -304,7 +304,7 @@ impl Perch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, MutexGuard};
     use std::time::Duration;
 
     struct Capture(Mutex<Vec<PopoverModel>>);
@@ -314,11 +314,41 @@ mod tests {
         }
     }
 
+    /// `cargo test` runs a crate's tests in parallel threads within one
+    /// process, and `PERCH_DATA_DIR` is process-global — so any two tests
+    /// that both call `std::env::set_var` on it race, genuinely, not just
+    /// in theory. This lock serializes every test that touches the var;
+    /// `DataDirGuard` (below) holds it for the guard's lifetime and clears
+    /// the var on drop, so a panicking test still leaves it unset for
+    /// whichever test runs next.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct DataDirGuard<'a> {
+        _lock: MutexGuard<'a, ()>,
+    }
+
+    impl<'a> DataDirGuard<'a> {
+        fn set(dir: &std::path::Path) -> Self {
+            // A prior test panicking while holding the lock poisons it;
+            // recover the guard rather than let that cascade into every
+            // later test in this file.
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var("PERCH_DATA_DIR", dir);
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for DataDirGuard<'_> {
+        fn drop(&mut self) {
+            std::env::remove_var("PERCH_DATA_DIR");
+        }
+    }
+
     #[test]
     fn constructs_against_an_empty_config_dir_and_emits_a_model() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("PERCH_DATA_DIR", data_dir.path());
+        let _env = DataDirGuard::set(data_dir.path());
         // Perch's own DB must not land inside the (fake) config dir either.
         let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
         let snap = perch.current();
@@ -349,5 +379,38 @@ mod tests {
             .err()
             .expect("must fail");
         assert!(matches!(err, PerchError::NoConfigDir { .. }));
+    }
+
+    #[test]
+    fn reindex_failure_surfaces_in_the_model_until_a_later_reindex_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_root = tempfile::tempdir().unwrap();
+        // A plain file where `app_data_db()`'s directory is expected: inside
+        // `reindex()`, `db::open`'s `create_dir_all(parent)` then fails
+        // because a regular file already occupies that path, so `reindex()`
+        // cannot even open the database — the cleanest lever to force the
+        // "could not open index" branch without touching perch-core.
+        let blocker = data_root.path().join("blocked");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let _env = DataDirGuard::set(&blocker);
+
+        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
+        perch.refresh(); // reindex() runs synchronously; no watcher needed.
+        let snap = perch.current();
+        assert!(
+            snap.error.is_some(),
+            "a re-index failure must surface in the model, not vanish silently"
+        );
+
+        // Clear the obstruction and let the next re-index succeed: the
+        // model must reflect that the trouble is gone, not keep repeating
+        // a stale error forever.
+        std::fs::remove_file(&blocker).unwrap();
+        perch.refresh();
+        let snap = perch.current();
+        assert!(
+            snap.error.is_none(),
+            "a later successful re-index must clear the earlier error"
+        );
     }
 }
