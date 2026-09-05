@@ -15,8 +15,15 @@ struct MainWindowRoot: View {
 
     @State private var model: MainWindowModel?
     @State private var selection: Selection? = .now
+    @State private var tab: DetailTab = .overview
 
     enum Selection: Hashable { case now, project(Int64) }
+
+    /// The detail pane's top-level control (spec §9.2). Independent of
+    /// `selection`: switching to Usage and back to Overview keeps whichever
+    /// sidebar row was selected, since Usage shows account-wide totals
+    /// rather than anything scoped to one project.
+    enum DetailTab: Hashable { case overview, usage }
 
     var body: some View {
         NavigationSplitView {
@@ -51,6 +58,29 @@ struct MainWindowRoot: View {
 
     @ViewBuilder
     private var detailPane: some View {
+        VStack(spacing: 0) {
+            Picker("View", selection: $tab) {
+                Text("Overview").tag(DetailTab.overview)
+                Text("Usage").tag(DetailTab.usage)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 220)
+            .padding(.horizontal, 20)
+            .padding(.top, 16)
+            .padding(.bottom, 8)
+
+            switch tab {
+            case .overview:
+                overviewPane
+            case .usage:
+                UsageView(engine: engine)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var overviewPane: some View {
         switch selection {
         case .now, .none:
             NowPane(model: model)
