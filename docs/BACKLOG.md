@@ -6,7 +6,7 @@ only — and deliberately wider in one direction CodexBar does not go: **session
 That is the edge, and the backlog leans into it.
 
 Status legend: **now** = next task · **next** = this milestone or the following ·
-**later** = after the main window and the rate-limit API land · **no** = decided against.
+**later** = further out · **no** = decided against.
 
 ---
 
@@ -59,6 +59,12 @@ Status legend: **now** = next task · **next** = this milestone or the following
   walking the process tree from a live session's pid, rather than a fixed choice. Resume and
   Open currently hardcode Terminal.app (`Launcher.swift`); this was deliberately deferred to
   ship the two actions first.
+- **Jump to session.** The original spec §9.4 and this branch's own spec §6 both call for a
+  third action alongside Resume and Open: Jump activates the *application* that owns a live
+  session (`NSRunningApplication.activate()`, no special permission needed) rather than
+  focusing the specific window (which would need Accessibility). The fallback — reveal the
+  project's `cwd` in Finder — is always offered alongside it, live or not. Implemented nowhere
+  yet; this item was previously dropped from the backlog without being built.
 - **Project status beyond pin/archive** (active · paused · done). `db::set_status` already
   exists in the data layer; no UI surfaces the third state yet — only pinned and archived do.
 - **Prompt search.** `history.jsonl` already keys every typed prompt by session — search it to
@@ -68,12 +74,30 @@ Status legend: **now** = next task · **next** = this milestone or the following
   the alias in Perch's own DB).
 - **Subagent transcripts.** Index `<session>/subagents/*.jsonl` and attribute to the parent.
   Today's totals are a floor; 164 such files on the reference machine.
+- **Worktree folding and an "N others" tail for top projects** (spec §9.3.3). `projects.
+  parent_project_id` exists and is already populated, but the top-projects ranking doesn't use
+  it yet — three worktrees of one repo currently compete as three separate rows instead of
+  folding into their parent, and the ranking has no collapsed tail for everything past the
+  top N.
+- **Robust live-dot matching.** `main_window.rs` lights a project's live dot by comparing
+  `live.cwd == project.real_path` exactly, so `/tmp` vs `/private/tmp` (a real macOS symlink)
+  can silently fail to match even though a session is genuinely live there. Session rows in
+  the same window match by `session_id` instead and are robust to this. The two liveness
+  signals can disagree within one window; unify on the robust comparison.
 
 ## Next — usage (the CodexBar-shaped half)
 
 - **Real rate-limit percentages** from the OAuth usage endpoint, with reset countdowns; local
   estimates remain the labelled fallback (spec §8). This is what finally puts a % in the menu
   bar (spec §9.1).
+- **Hover detail on the daily chart** (spec §9.3.2). Consciously scoped out of the first cut
+  of the daily stacked bars — the four token classes and their totals render, but nothing
+  shows on hover yet.
+- **Move the token-class labels into Rust.** `PerchChartPalette.order` in `PerchStyle.swift`
+  still hand-writes "Input" / "Output" / "Cache read" / "Cache write" as Swift string
+  literals (now mapped by a typed key, but still Swift-authored English); the purist fix is
+  putting these in `ui::usage` alongside the rest of the finished strings, so a future
+  Linux/Windows shell doesn't reinvent them.
 - **Menu-bar display modes** (from CodexBar): icon only · % · % + countdown · "N ⏳" when
   blocked. User-selectable; today it is count + ⏳.
 - **Tiny usage meter in the icon** — a filled-bar glyph that reads at a glance without text.
