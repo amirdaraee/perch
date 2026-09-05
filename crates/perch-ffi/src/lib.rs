@@ -1,8 +1,9 @@
 //! UniFFI surface over perch-core. Records mirror `perch_core::ui::model` exactly;
 //! the shell renders them and nothing else.
 
+use perch_core::db::Db;
 use perch_core::platform::RealProcessProbe;
-use perch_core::ui::{model as core_model, watcher};
+use perch_core::ui::{main_window, model as core_model, usage as core_usage, watcher};
 use perch_core::{config, db, index, live, pricing};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -185,6 +186,362 @@ impl From<core_model::PopoverModel> for PopoverModel {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ProjectGroup {
+    Pinned,
+    Active,
+    Recent,
+    Archived,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct ProjectRow {
+    pub id: i64,
+    pub name: String,
+    pub path: String,
+    pub group: ProjectGroup,
+    pub session_count: String,
+    pub tokens: String,
+    pub cost: String,
+    pub last_active: String,
+    pub live_session_count: u32,
+    pub subtitle: String,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct SparkPoint {
+    pub day_index: i32,
+    pub tokens: u64,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct SessionHistoryRow {
+    pub id: String,
+    pub name: String,
+    pub started: String,
+    pub duration: String,
+    pub tokens: String,
+    pub cost: String,
+    pub branch: Option<String>,
+    pub is_live: bool,
+    pub detail_line: String,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct ProjectDetail {
+    pub id: i64,
+    pub name: String,
+    pub path: String,
+    pub note: String,
+    pub tokens: String,
+    pub cost: String,
+    pub session_count: String,
+    pub sparkline: Vec<SparkPoint>,
+    pub sessions: Vec<SessionHistoryRow>,
+    pub pinned: bool,
+    pub archived: bool,
+    pub path_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct MainWindowModel {
+    pub now: PopoverModel,
+    pub projects: Vec<ProjectRow>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct HeroStat {
+    pub label: String,
+    pub value: String,
+    pub caption: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct DailyBar {
+    pub day_index: i32,
+    pub label: String,
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub thinking: u64,
+    pub total_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct RankedProject {
+    pub name: String,
+    pub tokens: u64,
+    pub tokens_label: String,
+    pub cost: String,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct ModelUsage {
+    pub model: String,
+    pub tokens: u64,
+    pub tokens_label: String,
+    pub cost: String,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct UsageModel {
+    pub hero: Vec<HeroStat>,
+    pub daily: Vec<DailyBar>,
+    pub top_projects: Vec<RankedProject>,
+    pub by_model: Vec<ModelUsage>,
+    pub burn_rate: Option<String>,
+    pub has_data: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct TerminalCommand {
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: String,
+    pub shell_line: String,
+}
+
+impl From<main_window::ProjectGroup> for ProjectGroup {
+    fn from(g: main_window::ProjectGroup) -> Self {
+        match g {
+            main_window::ProjectGroup::Pinned => ProjectGroup::Pinned,
+            main_window::ProjectGroup::Active => ProjectGroup::Active,
+            main_window::ProjectGroup::Recent => ProjectGroup::Recent,
+            main_window::ProjectGroup::Archived => ProjectGroup::Archived,
+        }
+    }
+}
+
+impl From<main_window::ProjectRow> for ProjectRow {
+    fn from(r: main_window::ProjectRow) -> Self {
+        let main_window::ProjectRow {
+            id,
+            name,
+            path,
+            group,
+            session_count,
+            tokens,
+            cost,
+            last_active,
+            live_session_count,
+            subtitle,
+        } = r;
+        ProjectRow {
+            id,
+            name,
+            path,
+            group: group.into(),
+            session_count,
+            tokens,
+            cost,
+            last_active,
+            live_session_count,
+            subtitle,
+        }
+    }
+}
+
+impl From<main_window::SparkPoint> for SparkPoint {
+    fn from(p: main_window::SparkPoint) -> Self {
+        let main_window::SparkPoint {
+            day_index,
+            tokens,
+            label,
+        } = p;
+        SparkPoint {
+            day_index,
+            tokens,
+            label,
+        }
+    }
+}
+
+impl From<main_window::SessionHistoryRow> for SessionHistoryRow {
+    fn from(r: main_window::SessionHistoryRow) -> Self {
+        let main_window::SessionHistoryRow {
+            id,
+            name,
+            started,
+            duration,
+            tokens,
+            cost,
+            branch,
+            is_live,
+            detail_line,
+        } = r;
+        SessionHistoryRow {
+            id,
+            name,
+            started,
+            duration,
+            tokens,
+            cost,
+            branch,
+            is_live,
+            detail_line,
+        }
+    }
+}
+
+impl From<main_window::ProjectDetail> for ProjectDetail {
+    fn from(d: main_window::ProjectDetail) -> Self {
+        let main_window::ProjectDetail {
+            id,
+            name,
+            path,
+            note,
+            tokens,
+            cost,
+            session_count,
+            sparkline,
+            sessions,
+            pinned,
+            archived,
+            path_exists,
+        } = d;
+        ProjectDetail {
+            id,
+            name,
+            path,
+            note,
+            tokens,
+            cost,
+            session_count,
+            sparkline: sparkline.into_iter().map(Into::into).collect(),
+            sessions: sessions.into_iter().map(Into::into).collect(),
+            pinned,
+            archived,
+            path_exists,
+        }
+    }
+}
+
+impl From<main_window::MainWindowModel> for MainWindowModel {
+    fn from(m: main_window::MainWindowModel) -> Self {
+        let main_window::MainWindowModel {
+            now,
+            projects,
+            error,
+        } = m;
+        MainWindowModel {
+            now: now.into(),
+            projects: projects.into_iter().map(Into::into).collect(),
+            error,
+        }
+    }
+}
+
+impl From<core_usage::HeroStat> for HeroStat {
+    fn from(h: core_usage::HeroStat) -> Self {
+        let core_usage::HeroStat {
+            label,
+            value,
+            caption,
+        } = h;
+        HeroStat {
+            label,
+            value,
+            caption,
+        }
+    }
+}
+
+impl From<core_usage::DailyBar> for DailyBar {
+    fn from(b: core_usage::DailyBar) -> Self {
+        let core_usage::DailyBar {
+            day_index,
+            label,
+            input,
+            output,
+            cache_read,
+            cache_write,
+            thinking,
+            total_label,
+        } = b;
+        DailyBar {
+            day_index,
+            label,
+            input,
+            output,
+            cache_read,
+            cache_write,
+            thinking,
+            total_label,
+        }
+    }
+}
+
+impl From<core_usage::RankedProject> for RankedProject {
+    fn from(p: core_usage::RankedProject) -> Self {
+        let core_usage::RankedProject {
+            name,
+            tokens,
+            tokens_label,
+            cost,
+        } = p;
+        RankedProject {
+            name,
+            tokens,
+            tokens_label,
+            cost,
+        }
+    }
+}
+
+impl From<core_usage::ModelUsage> for ModelUsage {
+    fn from(m: core_usage::ModelUsage) -> Self {
+        let core_usage::ModelUsage {
+            model,
+            tokens,
+            tokens_label,
+            cost,
+        } = m;
+        ModelUsage {
+            model,
+            tokens,
+            tokens_label,
+            cost,
+        }
+    }
+}
+
+impl From<core_usage::UsageModel> for UsageModel {
+    fn from(m: core_usage::UsageModel) -> Self {
+        let core_usage::UsageModel {
+            hero,
+            daily,
+            top_projects,
+            by_model,
+            burn_rate,
+            has_data,
+        } = m;
+        UsageModel {
+            hero: hero.into_iter().map(Into::into).collect(),
+            daily: daily.into_iter().map(Into::into).collect(),
+            top_projects: top_projects.into_iter().map(Into::into).collect(),
+            by_model: by_model.into_iter().map(Into::into).collect(),
+            burn_rate,
+            has_data,
+        }
+    }
+}
+
+impl From<perch_core::actions::TerminalCommand> for TerminalCommand {
+    fn from(c: perch_core::actions::TerminalCommand) -> Self {
+        let shell_line = c.shell_line();
+        let perch_core::actions::TerminalCommand { program, args, cwd } = c;
+        TerminalCommand {
+            program,
+            args,
+            cwd,
+            shell_line,
+        }
+    }
+}
+
 /// Implemented by the shell. Called on the watcher thread; the shell hops to its UI thread.
 #[uniffi::export(with_foreign)]
 pub trait PerchListener: Send + Sync {
@@ -201,6 +558,15 @@ pub struct Perch {
 
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+/// Fold any core error into the one typed database variant the shell sees.
+/// Used by every read/edit method below so a failure is always surfaced,
+/// never `.ok()`-discarded.
+fn db_err(e: impl std::fmt::Display) -> PerchError {
+    PerchError::Database {
+        message: e.to_string(),
+    }
 }
 
 /// Perch's own database. Never inside the Claude Code config dir.
@@ -241,14 +607,22 @@ struct ThisPerch {
 
 impl ThisPerch {
     fn model_for(&self, sessions: Vec<live::LiveSession>) -> PopoverModel {
+        self.core_model_for(sessions).into()
+    }
+
+    /// Same as `model_for`, but stops short of converting to the FFI mirror.
+    /// `main_window()` needs exactly this core-typed value (`build_main_window`
+    /// takes `perch_core::ui::model::PopoverModel`, not the FFI one) — building
+    /// it directly here, rather than adding a one-call-site FFI-to-core
+    /// conversion, is the choice Task 6's brief asked to be recorded.
+    fn core_model_for(&self, sessions: Vec<live::LiveSession>) -> core_model::PopoverModel {
         // Captured (not `.ok()`-discarded): this same file is also opened by
         // the retained Tauri app, so a concurrent writer can make this fail
         // with `SQLITE_BUSY` on an otherwise-healthy index — and this path
         // runs on every watcher tick, not just around a re-index, so it is
         // the only place that ever sees that failure.
         let db_result = db::open(&self.db_path);
-        let mut model: PopoverModel =
-            core_model::build_model(db_result.as_ref().ok(), &sessions, now_ms()).into();
+        let mut model = core_model::build_model(db_result.as_ref().ok(), &sessions, now_ms());
         // Neither fold may clobber a more specific error `build_model` itself
         // already produced (e.g. a broken index schema): this tick's open
         // failure is more specific than a possibly-stale re-index failure
@@ -368,6 +742,83 @@ impl Perch {
             h.stop();
         }
     }
+
+    /// The whole window: `Now` plus every project the index knows. `now` is
+    /// the *core* `PopoverModel` (see `core_model_for`'s doc comment for why),
+    /// and a database that fails to open still yields a window — with the
+    /// reason attached to `error` — rather than nothing.
+    pub fn main_window(&self) -> MainWindowModel {
+        let sessions =
+            live::live_sessions(&config::sessions_dir(&self.config_dir), &RealProcessProbe);
+        let now = self.core_model_for(sessions.clone());
+        let db = db::open(&self.db_path).ok();
+        main_window::build_main_window(db.as_ref(), now, &sessions, now_ms()).into()
+    }
+
+    /// One project in full: note, totals, sparkline, and every session.
+    pub fn project_detail(&self, project_id: i64) -> Result<ProjectDetail, PerchError> {
+        let database = self.open_db()?;
+        self.detail(&database, project_id)
+    }
+
+    /// The Usage tab's view-model.
+    pub fn usage(&self) -> Result<UsageModel, PerchError> {
+        let database = self.open_db()?;
+        core_usage::build_usage(&database, now_ms())
+            .map(Into::into)
+            .map_err(db_err)
+    }
+
+    /// Overwrite a project's note, returning the refreshed detail so the
+    /// shell never has to re-fetch or guess what changed.
+    pub fn set_note(&self, project_id: i64, note: String) -> Result<ProjectDetail, PerchError> {
+        let database = self.open_db()?;
+        database.set_note(project_id, &note).map_err(db_err)?;
+        self.detail(&database, project_id)
+    }
+
+    /// Pin or unpin a project.
+    pub fn set_pinned(&self, project_id: i64, pinned: bool) -> Result<ProjectDetail, PerchError> {
+        let database = self.open_db()?;
+        database.set_pinned(project_id, pinned).map_err(db_err)?;
+        self.detail(&database, project_id)
+    }
+
+    /// Archive or unarchive a project.
+    pub fn set_archived(
+        &self,
+        project_id: i64,
+        archived: bool,
+    ) -> Result<ProjectDetail, PerchError> {
+        let database = self.open_db()?;
+        database
+            .set_archived(project_id, archived)
+            .map_err(db_err)?;
+        self.detail(&database, project_id)
+    }
+
+    /// Set a project's display name.
+    pub fn rename_project(
+        &self,
+        project_id: i64,
+        name: String,
+    ) -> Result<ProjectDetail, PerchError> {
+        let database = self.open_db()?;
+        database
+            .set_display_name(project_id, &name)
+            .map_err(db_err)?;
+        self.detail(&database, project_id)
+    }
+
+    /// `claude --resume <session_id>` in `cwd`, as a ready-to-run shell line.
+    pub fn resume_command(&self, session_id: String, cwd: String) -> TerminalCommand {
+        perch_core::actions::TerminalCommand::resume(&session_id, &cwd).into()
+    }
+
+    /// A fresh `claude` session in `cwd`, as a ready-to-run shell line.
+    pub fn open_command(&self, cwd: String) -> TerminalCommand {
+        perch_core::actions::TerminalCommand::open(&cwd).into()
+    }
 }
 
 impl Perch {
@@ -383,10 +834,32 @@ impl Perch {
         self.this().model_for(sessions)
     }
 
+    /// See `ThisPerch::core_model_for`.
+    fn core_model_for(&self, sessions: Vec<live::LiveSession>) -> core_model::PopoverModel {
+        self.this().core_model_for(sessions)
+    }
+
     /// Synchronous fallback for `refresh()` when no watcher is running (see
     /// `ThisPerch::reindex` for the real work and its error-visibility rule).
     fn reindex(&self) {
         self.this().reindex();
+    }
+
+    /// Open Perch's own index database, mapping any failure to the one typed
+    /// variant every read/edit method surfaces — never `.ok()`-discarded.
+    fn open_db(&self) -> Result<Db, PerchError> {
+        db::open(&self.db_path).map_err(db_err)
+    }
+
+    /// The refreshed detail for `project_id`, built against an already-open
+    /// `database` — shared by every edit method so each returns the updated
+    /// state rather than making the shell re-fetch or guess what changed.
+    fn detail(&self, database: &Db, project_id: i64) -> Result<ProjectDetail, PerchError> {
+        let sessions =
+            live::live_sessions(&config::sessions_dir(&self.config_dir), &RealProcessProbe);
+        main_window::build_project_detail(database, project_id, &sessions, now_ms())
+            .map(Into::into)
+            .map_err(db_err)
     }
 }
 
@@ -524,5 +997,46 @@ mod tests {
             "an unopenable index must surface in model.error on every tick, \
              not just around an explicit re-index"
         );
+    }
+
+    #[test]
+    fn main_window_and_usage_are_reachable_against_an_empty_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
+
+        let w = perch.main_window();
+        assert!(w.projects.is_empty(), "an empty config dir has no projects");
+        let u = perch.usage().unwrap();
+        assert!(!u.has_data);
+        assert_eq!(
+            u.daily.len(),
+            14,
+            "the chart window is drawn even when empty"
+        );
+    }
+
+    #[test]
+    fn editing_an_unknown_project_is_a_typed_error_not_a_panic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
+        assert!(perch.set_pinned(4242, true).is_err());
+        assert!(perch.project_detail(4242).is_err());
+    }
+
+    #[test]
+    fn commands_cross_the_boundary_with_their_shell_line_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
+
+        let c = perch.resume_command("abc".into(), "/a/b".into());
+        assert_eq!(c.shell_line, "cd '/a/b' && claude --resume 'abc'");
+        let o = perch.open_command("/a/b".into());
+        assert_eq!(o.shell_line, "cd '/a/b' && claude");
     }
 }
