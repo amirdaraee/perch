@@ -55,6 +55,16 @@ impl TerminalCommand {
     /// from the value that follows it. Kept as a derivation over the plain
     /// `Vec<String>` (rather than a stored field) so the public shape stays
     /// exactly what the brief and Task 6's UniFFI mirror expect.
+    ///
+    /// Matching by exact string equality (rather than a `--` prefix guess)
+    /// means a value that merely *looks* like a flag still gets quoted. The
+    /// one case this can't distinguish is a session id that is *exactly*
+    /// `--resume`, which then renders unquoted like the real flag — but that
+    /// collision is safe specifically because the literal `--resume` holds no
+    /// shell-meaningful characters (no quote, no `$`, no backtick, no `;`),
+    /// so whether it is emitted quoted or bare, the shell parses it to the
+    /// same argv. See `a_session_id_that_collides_with_the_flag_literal_...`
+    /// below for the regression this relies on.
     fn typed_args(&self) -> Vec<Arg> {
         self.args
             .iter()
@@ -127,11 +137,22 @@ mod tests {
     #[test]
     fn a_session_id_is_quoted_too() {
         let c = TerminalCommand::resume("a'; rm -rf /", "/tmp");
-        let line = c.shell_line();
-        assert!(
-            line.contains(r#"'a'\''; rm -rf /'"#),
-            "the injection is inert: {line}"
+        assert_eq!(
+            c.shell_line(),
+            r#"cd '/tmp' && claude --resume 'a'\''; rm -rf /'"#
         );
+    }
+
+    // A session id that happens to be exactly the literal `--resume` collides
+    // with the flag in `typed_args`'s exact-match rule and is rendered
+    // unquoted like the flag. See the comment on `typed_args` for why this
+    // still can't change what the shell runs: the literal holds no
+    // shell-meaningful characters, so quoted or not it parses to the same
+    // argv, `["--resume", "--resume"]`.
+    #[test]
+    fn a_session_id_that_collides_with_the_flag_literal_still_renders_safely() {
+        let c = TerminalCommand::resume("--resume", "/tmp");
+        assert_eq!(c.shell_line(), "cd '/tmp' && claude --resume --resume");
     }
 
     // Beyond the brief's five: a command-substitution shape. Single quotes in
