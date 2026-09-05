@@ -9,6 +9,7 @@ pub struct ParsedLine {
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
     pub cc_version: Option<String>,
+    pub ai_title: Option<String>,
     pub ts: Option<i64>,
     pub model: Option<String>,
     pub usage: Option<TurnUsage>,
@@ -84,6 +85,7 @@ pub fn parse_line(line: &str) -> Option<ParsedLine> {
         cwd: string_at(&v, "cwd"),
         git_branch: string_at(&v, "gitBranch"),
         cc_version: string_at(&v, "version"),
+        ai_title: string_at(&v, "aiTitle"),
         ts: parse_ts(&v),
         model: message.and_then(|m| string_at(m, "model")),
         usage: message.and_then(parse_usage),
@@ -169,5 +171,24 @@ mod tests {
         let p = parse_line(line).unwrap();
         assert_eq!(p.kind, "");
         assert!(p.usage.is_none());
+    }
+
+    #[test]
+    fn parses_ai_title_line() {
+        let line = r#"{"type":"ai-title","aiTitle":"Claude projects dashboard","sessionId":"6dda468e-ae88-443b-8bf0-4f97f745b455"}"#;
+        let p = parse_line(line).unwrap();
+        assert_eq!(p.kind, "ai-title");
+        assert_eq!(p.ai_title.as_deref(), Some("Claude projects dashboard"));
+    }
+
+    #[test]
+    fn a_line_without_an_ai_title_field_yields_none() {
+        let p = parse_line(ASSISTANT).unwrap();
+        assert_eq!(p.ai_title, None);
+    }
+
+    #[test]
+    fn a_malformed_ai_title_line_is_skipped_rather_than_erroring() {
+        assert!(parse_line(r#"{"type":"ai-title","aiTitle":"#).is_none());
     }
 }

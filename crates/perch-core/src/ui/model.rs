@@ -478,6 +478,7 @@ mod tests {
             cwd: Some("/Users/a/proj".into()),
             git_branch: None,
             cc_version: None,
+            title: None,
             message_count: 1,
         })
         .unwrap();
@@ -531,6 +532,7 @@ mod tests {
                 cwd: Some("/Users/a/proj".into()),
                 git_branch: None,
                 cc_version: None,
+                title: None,
                 message_count: 1,
             })
             .unwrap();
@@ -588,6 +590,7 @@ mod tests {
                     cwd: Some("/Users/a/proj".into()),
                     git_branch: None,
                     cc_version: None,
+                    title: None,
                     message_count: 1,
                 })
                 .unwrap();
@@ -647,6 +650,7 @@ mod tests {
                 cwd: Some("/Users/a/proj".into()),
                 git_branch: None,
                 cc_version: None,
+                title: None,
                 message_count: 1,
             })
             .unwrap();
@@ -695,6 +699,7 @@ mod tests {
             cwd: Some("/Users/a/proj".into()),
             git_branch: None,
             cc_version: None,
+            title: None,
             message_count: 1,
         })
         .unwrap();
@@ -765,6 +770,7 @@ mod tests {
             cwd: Some("/Users/a/proj".into()),
             git_branch: None,
             cc_version: None,
+            title: None,
             message_count: 1,
         })
         .unwrap();

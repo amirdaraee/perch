@@ -49,6 +49,7 @@ pub struct SessionMeta {
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
     pub cc_version: Option<String>,
+    pub ai_title: Option<String>,
     pub first_ts: Option<i64>,
     pub last_ts: Option<i64>,
     pub message_count: u64,
@@ -66,6 +67,7 @@ pub struct SessionRecord {
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
     pub cc_version: Option<String>,
+    pub title: Option<String>,
     pub message_count: u64,
 }
 

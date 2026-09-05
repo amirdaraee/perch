@@ -5,7 +5,7 @@ use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::path::Path;
 
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 pub struct Db {
     conn: Connection,
@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     cwd              TEXT,
     git_branch       TEXT,
     cc_version       TEXT,
+    title            TEXT,
     message_count    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id);
@@ -97,9 +98,38 @@ fn init(conn: Connection) -> Result<Db> {
     // until the Tauri app is removed, so give a lock a few seconds to clear
     // before surfacing as an error.
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    // Read the on-disk version BEFORE creating tables: `CREATE TABLE IF NOT
+    // EXISTS` is a no-op on an existing database, so a v1 database's `sessions`
+    // table is left exactly as it was — this is the only place that still
+    // knows what shape it used to be in.
+    let existing_version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     conn.execute_batch(SCHEMA)?;
+    migrate(&conn, existing_version)?;
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(Db { conn })
+}
+
+/// Migrate a database whose stored `user_version` predates the current
+/// `SCHEMA_VERSION`. Must be safe to run on a fresh database (where `SCHEMA`
+/// already created every column) as well as on an older one.
+///
+/// v1 -> v2: `sessions.title` is new. A database created before this column
+/// existed needs `ALTER TABLE` to gain it; a fresh database already has it via
+/// `SCHEMA` above. Either way, every transcript must be rescanned so existing
+/// sessions can be backfilled with a title — turns are wholly derived from
+/// transcripts, so dropping them loses nothing, and `projects` (with its
+/// user-owned columns) is never touched.
+fn migrate(conn: &Connection, existing_version: i32) -> Result<()> {
+    if existing_version < 2 {
+        let has_title: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'title'")?
+            .exists([])?;
+        if !has_title {
+            conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT", [])?;
+        }
+        conn.execute_batch("UPDATE sessions SET indexed_offset = 0; DELETE FROM turns;")?;
+    }
+    Ok(())
 }
 
 impl Db {
@@ -331,13 +361,13 @@ impl Db {
 fn upsert_session_on(conn: &Connection, s: &SessionRecord) -> Result<()> {
     conn.execute(
         "INSERT INTO sessions (id, project_id, file_path, file_size, indexed_offset,
-             started_at, last_activity_at, cwd, git_branch, cc_version, message_count)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+             started_at, last_activity_at, cwd, git_branch, cc_version, title, message_count)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
          ON CONFLICT(id) DO UPDATE SET
              project_id = ?2, file_path = ?3, file_size = ?4, indexed_offset = ?5,
              -- `started_at` keeps the OLDEST value it has ever seen.
              started_at = COALESCE(sessions.started_at, ?6),
-             -- The four below keep the LAST value they have ever seen: a pass
+             -- The five below keep the LAST value they have ever seen: a pass
              -- that read no new bytes yields an all-`None` SessionMeta, and a
              -- bare assignment would null out perfectly good stored values on
              -- every re-index.
@@ -345,7 +375,8 @@ fn upsert_session_on(conn: &Connection, s: &SessionRecord) -> Result<()> {
              cwd              = COALESCE(?8, sessions.cwd),
              git_branch       = COALESCE(?9, sessions.git_branch),
              cc_version       = COALESCE(?10, sessions.cc_version),
-             message_count = ?11",
+             title            = COALESCE(?11, sessions.title),
+             message_count = ?12",
         params![
             s.id,
             s.project_id,
@@ -357,6 +388,7 @@ fn upsert_session_on(conn: &Connection, s: &SessionRecord) -> Result<()> {
             s.cwd,
             s.git_branch,
             s.cc_version,
+            s.title,
             s.message_count as i64
         ],
     )?;
@@ -413,6 +445,7 @@ mod tests {
             cwd: Some("/Users/a/proj".into()),
             git_branch: Some("main".into()),
             cc_version: Some("2.1.1".into()),
+            title: None,
             message_count: 3,
         }
     }
@@ -433,6 +466,188 @@ mod tests {
         }
         let db = open(&p).unwrap();
         assert_eq!(db.project_count().unwrap(), 1);
+    }
+
+    /// The property that protects user data through the v1 -> v2 migration.
+    /// A v1 database (no `title` column, `user_version = 1`) with real
+    /// sessions, turns, and a project note must, after opening with the
+    /// current code: gain the `title` column, have every session's
+    /// `indexed_offset` reset to 0 (forcing a full rescan so titles can be
+    /// backfilled), have `turns` emptied (they are wholly derived from
+    /// transcripts) — and still have the project's note.
+    #[test]
+    fn v1_database_migrates_and_preserves_the_project_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("v1.db");
+
+        {
+            // Build a v1-shaped database directly, bypassing today's `SCHEMA`
+            // (which already has `title`), so this test still means something
+            // once `SCHEMA` moves on.
+            let conn = Connection::open(&p).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE projects (
+                    id                INTEGER PRIMARY KEY,
+                    slug              TEXT NOT NULL UNIQUE,
+                    real_path         TEXT NOT NULL,
+                    path_is_guess     INTEGER NOT NULL DEFAULT 0,
+                    parent_project_id INTEGER REFERENCES projects(id),
+                    display_name      TEXT,
+                    status            TEXT NOT NULL DEFAULT 'active',
+                    pinned            INTEGER NOT NULL DEFAULT 0,
+                    note              TEXT,
+                    note_updated_at   INTEGER,
+                    archived          INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE sessions (
+                    id               TEXT PRIMARY KEY,
+                    project_id       INTEGER NOT NULL REFERENCES projects(id),
+                    file_path        TEXT NOT NULL,
+                    file_size        INTEGER NOT NULL DEFAULT 0,
+                    indexed_offset   INTEGER NOT NULL DEFAULT 0,
+                    started_at       INTEGER,
+                    last_activity_at INTEGER,
+                    cwd              TEXT,
+                    git_branch       TEXT,
+                    cc_version       TEXT,
+                    message_count    INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE turns (
+                    session_id     TEXT NOT NULL REFERENCES sessions(id),
+                    ts             INTEGER NOT NULL,
+                    model          TEXT NOT NULL,
+                    input          INTEGER NOT NULL DEFAULT 0,
+                    output         INTEGER NOT NULL DEFAULT 0,
+                    cache_read     INTEGER NOT NULL DEFAULT 0,
+                    cache_write_5m INTEGER NOT NULL DEFAULT 0,
+                    cache_write_1h INTEGER NOT NULL DEFAULT 0,
+                    thinking       INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO projects (id, slug, real_path, note) VALUES (1, 'slug', '/a/proj', 'left off on the CSV parser')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, project_id, file_path, file_size, indexed_offset, message_count)
+                 VALUES ('s1', 1, '/tmp/s1.jsonl', 500, 500, 3)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO turns (session_id, ts, model, input, output) VALUES ('s1', 1, 'm', 1, 2)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 1i32).unwrap();
+        }
+
+        // Opening with today's code must run the v1 -> v2 migration.
+        let db = open(&p).unwrap();
+
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+
+        // `title` column exists and is settable.
+        db.upsert_session(&session("s1", 1, 500)).unwrap();
+
+        // Offsets reset, turns cleared: the next index pass rescans from zero.
+        assert_eq!(
+            db.session_offset("s1").unwrap(),
+            500,
+            "upsert_session above just set it back to 500; check it moved through 0 first"
+        );
+        assert_eq!(db.turn_count().unwrap(), 0, "turns must be cleared");
+
+        // The user's note survives untouched.
+        assert_eq!(
+            db.note(1).unwrap().as_deref(),
+            Some("left off on the CSV parser"),
+            "the migration must never touch user-owned project columns"
+        );
+    }
+
+    /// Same migration, checked before any write re-touches the session: the
+    /// offset the migration itself produced must be 0.
+    #[test]
+    fn v1_migration_resets_offsets_before_any_new_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("v1.db");
+        {
+            let conn = Connection::open(&p).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT NOT NULL UNIQUE,
+                     real_path TEXT NOT NULL, path_is_guess INTEGER NOT NULL DEFAULT 0,
+                     parent_project_id INTEGER, display_name TEXT,
+                     status TEXT NOT NULL DEFAULT 'active', pinned INTEGER NOT NULL DEFAULT 0,
+                     note TEXT, note_updated_at INTEGER, archived INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE sessions (id TEXT PRIMARY KEY, project_id INTEGER NOT NULL,
+                     file_path TEXT NOT NULL, file_size INTEGER NOT NULL DEFAULT 0,
+                     indexed_offset INTEGER NOT NULL DEFAULT 0, started_at INTEGER,
+                     last_activity_at INTEGER, cwd TEXT, git_branch TEXT, cc_version TEXT,
+                     message_count INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE turns (session_id TEXT NOT NULL, ts INTEGER NOT NULL,
+                     model TEXT NOT NULL, input INTEGER NOT NULL DEFAULT 0,
+                     output INTEGER NOT NULL DEFAULT 0, cache_read INTEGER NOT NULL DEFAULT 0,
+                     cache_write_5m INTEGER NOT NULL DEFAULT 0, cache_write_1h INTEGER NOT NULL DEFAULT 0,
+                     thinking INTEGER NOT NULL DEFAULT 0);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO projects (id, slug, real_path) VALUES (1, 'slug', '/a/proj')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, project_id, indexed_offset, file_path) VALUES ('s1', 1, 999, '/tmp/s1.jsonl')",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 1i32).unwrap();
+        }
+
+        let db = open(&p).unwrap();
+        assert_eq!(
+            db.session_offset("s1").unwrap(),
+            0,
+            "the migration itself must reset the offset to 0"
+        );
+    }
+
+    /// Reopening an already-migrated (v2) database must be a true no-op: it
+    /// must not reset offsets or clear turns on every ordinary launch.
+    #[test]
+    fn reopening_a_v2_database_does_not_rescan_or_touch_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("v2.db");
+        {
+            let db = open(&p).unwrap();
+            let id = db.upsert_project("slug", "/a/proj", false).unwrap();
+            db.set_note(id, "keep me").unwrap();
+            db.upsert_session(&session("s1", id, 4096)).unwrap();
+            db.insert_turns(
+                "s1",
+                &[Turn {
+                    ts: 1,
+                    model: "m".into(),
+                    usage: TurnUsage {
+                        input: 1,
+                        ..Default::default()
+                    },
+                }],
+            )
+            .unwrap();
+        }
+
+        let db = open(&p).unwrap();
+        assert_eq!(
+            db.session_offset("s1").unwrap(),
+            4096,
+            "reopening a current-schema database must not force a rescan"
+        );
+        assert_eq!(db.turn_count().unwrap(), 1, "turns must survive a reopen");
+        assert_eq!(db.note(1).unwrap().as_deref(), Some("keep me"));
     }
 
     #[test]
@@ -506,6 +721,49 @@ mod tests {
         db.upsert_session(&session("s1", id, 8192)).unwrap();
         assert_eq!(db.session_offset("s1").unwrap(), 8192);
         assert_eq!(db.session_count().unwrap(), 1);
+    }
+
+    fn stored_title(db: &Db, session_id: &str) -> Option<String> {
+        db.conn()
+            .query_row(
+                "SELECT title FROM sessions WHERE id = ?1",
+                params![session_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// `title` is LATEST-wins, same as `git_branch` and `cc_version`: a later
+    /// pass over a range with no `ai-title` line must not null out a title a
+    /// previous pass stored.
+    #[test]
+    fn title_round_trips_and_a_later_pass_with_no_title_does_not_erase_it() {
+        let db = open_in_memory().unwrap();
+        let id = db.upsert_project("slug", "/a/proj", false).unwrap();
+
+        let mut s = session("s1", id, 100);
+        s.title = Some("Claude projects dashboard".into());
+        db.upsert_session(&s).unwrap();
+        assert_eq!(
+            stored_title(&db, "s1").as_deref(),
+            Some("Claude projects dashboard")
+        );
+
+        // A later incremental pass over new bytes with no `ai-title` line.
+        let mut s2 = session("s1", id, 200);
+        s2.title = None;
+        db.upsert_session(&s2).unwrap();
+        assert_eq!(
+            stored_title(&db, "s1").as_deref(),
+            Some("Claude projects dashboard"),
+            "a pass with no title must not erase the one already stored"
+        );
+
+        // The title can still be refined: last-wins when one IS present.
+        let mut s3 = session("s1", id, 300);
+        s3.title = Some("refined title".into());
+        db.upsert_session(&s3).unwrap();
+        assert_eq!(stored_title(&db, "s1").as_deref(), Some("refined title"));
     }
 
     #[test]
