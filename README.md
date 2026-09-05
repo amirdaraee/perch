@@ -20,10 +20,43 @@ Your transcripts contain source code, pasted secrets, and client names. So:
 
 - **No telemetry, no analytics, no crash reporting.** Ever.
 - **Read-only.** Perch never writes to, moves, or deletes anything in your Claude Code directory.
-- **One outbound host,** and only in the app itself: `anthropic.com`, to read your own rate-limit
-  status. The data layer in this repository makes no network requests at all, and CI fails the
-  build if an HTTP client or telemetry dependency appears in the manifests or the resolved
-  dependency graph.
+- **No network requests, today.** Neither the data layer, the Tauri app, nor the native macOS
+  app makes any HTTP call, and CI fails the build if an HTTP client or telemetry dependency
+  appears in the manifests or the resolved dependency graph. A planned future release adds
+  exactly one outbound host, `anthropic.com`, to read your own rate-limit status from
+  Anthropic's OAuth usage endpoint (see the backlog) — this section will be updated when
+  that lands.
+
+## Native app (macOS 15+)
+
+A native rewrite of the menu-bar app: `NSStatusItem` → a real, tracked `NSMenu` → SwiftUI
+cards hosted in `NSMenuItem`s. It exists because only a real, tracked `NSMenu` keeps the
+menu bar visible while it's open over a fullscreen app — an `NSPopover` or a detached
+`NSPanel` does not, which two spikes confirmed before this rewrite started. That said: the
+design is structurally correct for this, but no one has yet confirmed it on a real display
+against a real fullscreen app — treat it as guaranteed by construction, not as verified.
+
+The engine is the same Rust view-model as everywhere else in this repo (`perch-core`'s `ui`
+module), exposed to Swift as a static library via [UniFFI](https://github.com/mozilla/uniffi-rs)
+0.32. Every string the menu shows — formatting, the em dash for absent data, the pluralised
+"N sessions are waiting on you" banner — is produced in Rust, so a later Linux or Windows
+shell can reuse it instead of reimplementing it.
+
+Requires macOS 15+ and Swift 6. Build and run from a clean checkout:
+
+```bash
+scripts/build-xcframework.sh        # builds perch-ffi, emits PerchCore.xcframework + Swift bindings
+cd apps/macos/Perch && make bundle  # swift build -c release, then bundles build/Perch.app
+open build/Perch.app
+```
+
+`apps/macos/Perch` is a SwiftPM executable — there's no Xcode project. The `.xcframework`
+and the generated Swift bindings are build output and git-ignored; always regenerate them
+with the script above rather than trusting a checked-in copy, which is a classic source of
+FFI bugs.
+
+The Tauri app below stays in the repo, unchanged, until the native app reaches parity — it
+still lacks jump-to-session and resume.
 
 ## The app
 
