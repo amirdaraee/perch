@@ -58,6 +58,7 @@ pub struct PopoverModel {
     pub recent: Vec<RecentRow>,
     pub tray_title: String,
     pub error: Option<String>,
+    pub waiting_banner: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -132,6 +133,7 @@ impl From<core_model::PopoverModel> for PopoverModel {
             recent: m.recent.into_iter().map(Into::into).collect(),
             tray_title: m.tray_title,
             error: m.error,
+            waiting_banner: m.waiting_banner,
         }
     }
 }
