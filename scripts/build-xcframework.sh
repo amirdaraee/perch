@@ -77,8 +77,15 @@ lipo -create "${LIB_PATHS[@]}" -output "$BUILD/$LIB"
 # --- Swift bindings, from the compiled library (see header comment above). --
 cargo run -p perch-ffi --bin uniffi-bindgen-swift -- "$BUILD/$LIB" "$GEN" --swift-sources
 cargo run -p perch-ffi --bin uniffi-bindgen-swift -- "$BUILD/$LIB" "$BUILD/headers" --headers
+# NOTE: deliberately NOT --xcframework. That flag emits a `framework module`,
+# which expects headers under a `<Name>.framework/Headers` bundle reached via
+# `-F`. SwiftPM's binaryTarget consumption instead exposes this xcframework
+# slice's Headers/ dir with a plain `-I`, which only resolves a plain (non
+# `framework`) module declaration - see task-7-report.md for how this was
+# diagnosed. --module-name must match the generated Swift's
+# `canImport(perch_ffiFFI)` / `import perch_ffiFFI` guard.
 cargo run -p perch-ffi --bin uniffi-bindgen-swift -- "$BUILD/$LIB" "$BUILD/headers" \
-  --xcframework --modulemap --modulemap-filename module.modulemap
+  --modulemap --modulemap-filename module.modulemap --module-name perch_ffiFFI
 
 xcodebuild -create-xcframework \
   -library "$BUILD/$LIB" -headers "$BUILD/headers" \
