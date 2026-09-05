@@ -18,22 +18,11 @@ struct SessionRowView: View {
                 Text(row.statusLabel)
                     .font(.caption)
                     .foregroundStyle(row.status == .waiting ? Color.perchWaiting : .secondary)
-                Text(detailLine)
+                Text(row.detailLine)
                     .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
             }
         }
         .perchCard(verticalPadding: 6)
-    }
-
-    private var detailLine: String {
-        [
-            row.project,
-            row.kind,
-            row.version.isEmpty ? nil : "v\(row.version)",
-            row.tokens == "—" ? nil : "\(row.tokens) · \(row.cost)",
-        ]
-        .compactMap { $0 }
-        .joined(separator: " · ")
     }
 
     private var dotColor: Color {
