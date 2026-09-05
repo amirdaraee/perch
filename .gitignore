@@ -7,3 +7,7 @@ dist/
 Cargo.lock.orig
 .DS_Store
 src-tauri/gen/schemas/
+build/
+apps/macos/Perch/Frameworks/
+apps/macos/Perch/Sources/PerchFFI/
+apps/macos/Perch/.build/
