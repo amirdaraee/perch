@@ -17,19 +17,18 @@ struct StatsCard: View {
                 if stats.hasData && stats.estimated {
                     Text("est")
                         .font(.caption2)
-                        .foregroundStyle(Color(red: 1, green: 0.84, blue: 0.04))
+                        .foregroundStyle(Color.perchWaiting)
                         .padding(.horizontal, 5).padding(.vertical, 1)
                         .overlay(
                             Capsule()
                                 .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [3, 2]))
-                                .foregroundStyle(Color(red: 1, green: 0.84, blue: 0.04))
+                                .foregroundStyle(Color.perchWaiting)
                         )
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(.horizontal, 14).padding(.vertical, 10)
-        .frame(width: 360, alignment: .leading)
+        .perchCard(verticalPadding: 10)
     }
 
     private func stat(_ label: String, _ value: String) -> some View {

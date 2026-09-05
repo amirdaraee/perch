@@ -11,7 +11,6 @@ struct EmptyCard: View {
             Text(title).foregroundStyle(.secondary)
             if let detail { Text(detail).font(.caption2).foregroundStyle(.tertiary).lineLimit(2) }
         }
-        .padding(.horizontal, 14).padding(.vertical, 8)
-        .frame(width: 360, alignment: .leading)
+        .perchCard()
     }
 }

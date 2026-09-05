@@ -46,9 +46,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         if let err = model.error { add(EmptyCard(title: "Index unavailable", detail: err)) }
         menu.addItem(.separator())
 
-        let waiting = model.live.filter { $0.status == .waiting }.count
-        if waiting > 0 {
-            add(EmptyCard(title: waiting == 1 ? "1 session is waiting on you" : "\(waiting) sessions are waiting on you", detail: nil))
+        if let banner = model.waitingBanner {
+            add(EmptyCard(title: banner, detail: nil))
         }
         if model.live.isEmpty {
             add(EmptyCard(title: "No sessions running", detail: nil))
