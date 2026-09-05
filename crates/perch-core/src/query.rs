@@ -143,6 +143,20 @@ pub fn usage_since(db: &Db, since_ms: i64) -> Result<(TurnUsage, f64)> {
     priced_usage(db, &per_model)
 }
 
+/// The timestamp of the earliest turn at or after `since_ms`, or `None` if
+/// there are none. Used to measure how much of a trailing window Perch has
+/// actually observed turns for — e.g. the usage view's burn-rate projection,
+/// which anchors elapsed time to this rather than to an assumed window
+/// boundary it cannot know.
+pub fn oldest_turn_since(db: &Db, since_ms: i64) -> Result<Option<i64>> {
+    let ts: Option<i64> = db.conn().query_row(
+        "SELECT MIN(ts) FROM turns WHERE ts >= ?1",
+        params![since_ms],
+        |r| r.get(0),
+    )?;
+    Ok(ts)
+}
+
 pub fn usage_by_model(db: &Db) -> Result<Vec<(String, TurnUsage, f64)>> {
     let per_model = usage_rows(
         db,
