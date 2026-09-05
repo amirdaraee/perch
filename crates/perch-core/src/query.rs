@@ -221,6 +221,168 @@ pub fn recent_sessions(
     Ok(out)
 }
 
+pub const DAY_MS: i64 = 86_400_000;
+
+#[derive(Debug, Clone)]
+pub struct HistorySession {
+    pub id: String,
+    pub started_at: Option<i64>,
+    pub last_activity_at: Option<i64>,
+    pub git_branch: Option<String>,
+    pub message_count: u64,
+    pub usage: TurnUsage,
+    pub cost_usd: f64,
+}
+
+/// Every session ever recorded for a project, newest first. Sessions with no
+/// recorded activity sort last rather than being dropped — they exist, and the
+/// window's job is to show what exists.
+pub fn session_history(db: &Db, project_id: i64) -> Result<Vec<HistorySession>> {
+    let mut stmt = db.conn().prepare(
+        "SELECT id, started_at, last_activity_at, git_branch, message_count
+         FROM sessions WHERE project_id = ?1
+         ORDER BY last_activity_at IS NULL, last_activity_at DESC",
+    )?;
+    let rows = stmt.query_map(params![project_id], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<i64>>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, i64>(4)? as u64,
+        ))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, started_at, last_activity_at, git_branch, message_count) = row?;
+        let (usage, cost_usd) = session_usage(db, &id)?;
+        out.push(HistorySession {
+            id,
+            started_at,
+            last_activity_at,
+            git_branch,
+            message_count,
+            usage,
+            cost_usd,
+        });
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone)]
+pub struct DayUsage {
+    pub day_start_ms: i64,
+    pub usage: TurnUsage,
+    pub cost_usd: f64,
+}
+
+fn day_start(ts_ms: i64) -> i64 {
+    ts_ms - ts_ms.rem_euclid(DAY_MS)
+}
+
+/// `days` consecutive days ending with the one containing `now_ms`, oldest first.
+/// Quiet days are present and zeroed: a bar chart with gaps silently lies about
+/// the shape of the week.
+pub fn daily_usage(db: &Db, days: usize, now_ms: i64) -> Result<Vec<DayUsage>> {
+    let last = day_start(now_ms);
+    let first = last - (days as i64 - 1).max(0) * DAY_MS;
+
+    let mut per_day: std::collections::HashMap<i64, (TurnUsage, f64)> =
+        std::collections::HashMap::new();
+    let mut stmt = db.conn().prepare(&format!(
+        "SELECT (ts - (ts % {DAY_MS} + {DAY_MS}) % {DAY_MS}) AS day, model, {SUMS}
+         FROM turns WHERE ts >= ?1 GROUP BY day, model"
+    ))?;
+    let rows = stmt.query_map(params![first], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            TurnUsage {
+                input: r.get::<_, i64>(2)? as u64,
+                output: r.get::<_, i64>(3)? as u64,
+                cache_read: r.get::<_, i64>(4)? as u64,
+                cache_write_5m: r.get::<_, i64>(5)? as u64,
+                cache_write_1h: r.get::<_, i64>(6)? as u64,
+                thinking: r.get::<_, i64>(7)? as u64,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (day, model, u) = row?;
+        let cost = cost_of(db, &model, &u)?;
+        let slot = per_day.entry(day).or_insert((TurnUsage::default(), 0.0));
+        slot.0 = slot.0.plus(&u);
+        slot.1 += cost;
+    }
+
+    Ok((0..days)
+        .map(|i| {
+            let day_start_ms = first + i as i64 * DAY_MS;
+            let (usage, cost_usd) = per_day.get(&day_start_ms).cloned().unwrap_or_default();
+            DayUsage {
+                day_start_ms,
+                usage,
+                cost_usd,
+            }
+        })
+        .collect())
+}
+
+/// Projects ranked by tokens since `since_ms`. The label is the directory name,
+/// which is what the user recognises — not the slug and not the whole path.
+pub fn top_projects(db: &Db, since_ms: i64, limit: usize) -> Result<Vec<(String, TurnUsage, f64)>> {
+    let mut stmt = db.conn().prepare(&format!(
+        "SELECT p.real_path, p.display_name, t.model, {SUMS}
+         FROM turns t
+         JOIN sessions s ON s.id = t.session_id
+         JOIN projects p ON p.id = s.project_id
+         WHERE t.ts >= ?1
+         GROUP BY p.id, t.model"
+    ))?;
+    let rows = stmt.query_map(params![since_ms], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, String>(2)?,
+            TurnUsage {
+                input: r.get::<_, i64>(3)? as u64,
+                output: r.get::<_, i64>(4)? as u64,
+                cache_read: r.get::<_, i64>(5)? as u64,
+                cache_write_5m: r.get::<_, i64>(6)? as u64,
+                cache_write_1h: r.get::<_, i64>(7)? as u64,
+                thinking: r.get::<_, i64>(8)? as u64,
+            },
+        ))
+    })?;
+
+    let mut totals: std::collections::HashMap<String, (TurnUsage, f64)> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let (real_path, display_name, model, u) = row?;
+        let label = display_name.unwrap_or_else(|| {
+            std::path::Path::new(&real_path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or(real_path.clone())
+        });
+        let cost = cost_of(db, &model, &u)?;
+        let slot = totals.entry(label).or_insert((TurnUsage::default(), 0.0));
+        slot.0 = slot.0.plus(&u);
+        slot.1 += cost;
+    }
+
+    let mut out: Vec<(String, TurnUsage, f64)> =
+        totals.into_iter().map(|(k, (u, c))| (k, u, c)).collect();
+    out.sort_by(|a, b| {
+        b.1.total_tokens()
+            .cmp(&a.1.total_tokens())
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    out.truncate(limit);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,5 +663,97 @@ mod tests {
             .unwrap();
         seed_session(&db, pid, "s-a", "/Users/a/one", 1_000, 1);
         assert!(recent_sessions(&db, &[], 0).unwrap().is_empty());
+    }
+
+    const DAY: i64 = 86_400_000;
+
+    #[test]
+    fn session_history_is_newest_first_with_usage_attached() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let pid = db.upsert_project("-a-p", "/a/p", false).unwrap();
+        seed_session(&db, pid, "old", "/a/p", 1_000, 1_000_000);
+        seed_session(&db, pid, "new", "/a/p", 5_000, 2_000_000);
+
+        let rows = session_history(&db, pid).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["new", "old"]);
+        assert_eq!(rows[0].usage.input, 2_000_000);
+        assert!(
+            (rows[0].cost_usd - 30.0).abs() < 1e-9,
+            "2 MTok fable input at 15.0"
+        );
+    }
+
+    #[test]
+    fn session_history_for_a_project_with_no_sessions_is_empty_not_an_error() {
+        let db = open_in_memory().unwrap();
+        let pid = db.upsert_project("-a-p", "/a/p", false).unwrap();
+        assert!(session_history(&db, pid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn daily_usage_includes_quiet_days_as_zeroes() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let pid = db.upsert_project("-a-p", "/a/p", false).unwrap();
+        let now = 10 * DAY + 3_600_000; // mid-day on day 10
+                                        // Activity on day 10 and day 8 only; day 9 must still appear, zeroed.
+        seed_session(&db, pid, "s10", "/a/p", 10 * DAY + 1, 1_000_000);
+        seed_session(&db, pid, "s8", "/a/p", 8 * DAY + 1, 3_000_000);
+
+        let days = daily_usage(&db, 3, now).unwrap();
+        assert_eq!(days.len(), 3, "exactly the window requested");
+        assert_eq!(days[0].day_start_ms, 8 * DAY, "oldest first");
+        assert_eq!(days[2].day_start_ms, 10 * DAY);
+        assert_eq!(days[0].usage.input, 3_000_000);
+        assert_eq!(
+            days[1].usage.total_tokens(),
+            0,
+            "a quiet day is present and zeroed"
+        );
+        assert_eq!(days[1].cost_usd, 0.0);
+        assert_eq!(days[2].usage.input, 1_000_000);
+    }
+
+    #[test]
+    fn daily_usage_with_an_empty_index_still_returns_the_full_window() {
+        let db = open_in_memory().unwrap();
+        let days = daily_usage(&db, 14, 100 * DAY).unwrap();
+        assert_eq!(days.len(), 14);
+        assert!(days.iter().all(|d| d.usage.total_tokens() == 0));
+    }
+
+    #[test]
+    fn top_projects_ranks_by_tokens_and_respects_the_limit() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let big = db.upsert_project("-a-big", "/a/big", false).unwrap();
+        let mid = db.upsert_project("-a-mid", "/a/mid", false).unwrap();
+        let small = db.upsert_project("-a-small", "/a/small", false).unwrap();
+        seed_session(&db, big, "b", "/a/big", 5_000, 9_000_000);
+        seed_session(&db, mid, "m", "/a/mid", 5_000, 5_000_000);
+        seed_session(&db, small, "s", "/a/small", 5_000, 1_000_000);
+
+        let rows = top_projects(&db, 0, 2).unwrap();
+        assert_eq!(rows.len(), 2, "limit honoured");
+        assert_eq!(
+            rows[0].0, "big",
+            "ranked by tokens, labelled by directory name"
+        );
+        assert_eq!(rows[1].0, "mid");
+        assert!(rows[0].1.input > rows[1].1.input);
+    }
+
+    #[test]
+    fn top_projects_excludes_activity_before_the_cutoff() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let pid = db.upsert_project("-a-p", "/a/p", false).unwrap();
+        seed_session(&db, pid, "old", "/a/p", 1_000, 5_000_000);
+        assert!(
+            top_projects(&db, 10_000, 5).unwrap().is_empty(),
+            "all activity predates the cutoff"
+        );
     }
 }
