@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import SwiftUI
 import PerchFFI
 
 /// The tray item and its menu. A real NSMenu: while it is open, macOS is tracking a
@@ -34,8 +35,43 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private func render(_ model: PopoverModel?) {
         statusItem.button?.title = model?.trayTitle ?? ""
         menu.removeAllItems()
-        // Cards arrive in Task 8; for now the menu is just Quit.
+
+        guard let model else {
+            add(EmptyCard(title: engine.startupError ?? "Starting…", detail: nil))
+            addQuit()
+            return
+        }
+
+        add(StatsCard(stats: model.stats))
+        if let err = model.error { add(EmptyCard(title: "Index unavailable", detail: err)) }
         menu.addItem(.separator())
+
+        let waiting = model.live.filter { $0.status == .waiting }.count
+        if waiting > 0 {
+            add(EmptyCard(title: waiting == 1 ? "1 session is waiting on you" : "\(waiting) sessions are waiting on you", detail: nil))
+        }
+        if model.live.isEmpty {
+            add(EmptyCard(title: "No sessions running", detail: nil))
+        } else {
+            for row in model.live { add(SessionRowView(row: row)) }
+        }
+        if !model.recent.isEmpty {
+            menu.addItem(.separator())
+            add(RecentCard(rows: model.recent))
+        }
+        menu.addItem(.separator())
+        addQuit()
+    }
+
+    private func add<V: View>(_ view: V) {
+        let item = NSMenuItem()
+        let host = NSHostingView(rootView: view)
+        host.frame.size = host.fittingSize
+        item.view = host
+        menu.addItem(item)
+    }
+
+    private func addQuit() {
         menu.addItem(withTitle: "Quit Perch", action: #selector(quit), keyEquivalent: "q").target = self
     }
 
