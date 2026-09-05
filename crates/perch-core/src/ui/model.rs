@@ -126,7 +126,9 @@ pub fn tray_title(live: &[LiveSession]) -> String {
     }
 }
 
-fn dashed_stats() -> Stats {
+/// Shared with `main_window`, which needs the same "nothing yet" `Stats` for
+/// its own no-data states — hence `pub(crate)` rather than private.
+pub(crate) fn dashed_stats() -> Stats {
     Stats {
         window_tokens: DASH.into(),
         week_tokens: DASH.into(),
@@ -134,6 +136,21 @@ fn dashed_stats() -> Stats {
         day_cost: DASH.into(),
         estimated: true,
         has_data: false,
+    }
+}
+
+impl PopoverModel {
+    /// A model with nothing in it — the "before the first tick" state, and what
+    /// the window shows for `Now` when there is no engine data yet.
+    pub fn empty() -> Self {
+        PopoverModel {
+            stats: dashed_stats(),
+            live: Vec::new(),
+            recent: Vec::new(),
+            tray_title: String::new(),
+            error: None,
+            waiting_banner: None,
+        }
     }
 }
 

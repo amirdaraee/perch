@@ -284,10 +284,14 @@ fn day_start(ts_ms: i64) -> i64 {
     ts_ms - ts_ms.rem_euclid(DAY_MS)
 }
 
-/// `days` consecutive days ending with the one containing `now_ms`, oldest first.
-/// Quiet days are present and zeroed: a bar chart with gaps silently lies about
-/// the shape of the week.
-pub fn daily_usage(db: &Db, days: usize, now_ms: i64) -> Result<Vec<DayUsage>> {
+/// Shared by `daily_usage` and `daily_usage_for_project`: everything except
+/// which turns are in scope (all of them, or one project's) is identical.
+fn daily_usage_grouped(
+    db: &Db,
+    days: usize,
+    now_ms: i64,
+    project_filter: Option<i64>,
+) -> Result<Vec<DayUsage>> {
     let last = day_start(now_ms);
     let first = last - (days as i64 - 1).max(0) * DAY_MS;
     // Exclusive upper bound: one day past `last`, so turns newer than the
@@ -297,30 +301,27 @@ pub fn daily_usage(db: &Db, days: usize, now_ms: i64) -> Result<Vec<DayUsage>> {
 
     let mut per_day: std::collections::HashMap<i64, (TurnUsage, f64)> =
         std::collections::HashMap::new();
-    let mut stmt = db.conn().prepare(&format!(
+    let scope = match project_filter {
+        Some(_) => "AND session_id IN (SELECT id FROM sessions WHERE project_id = ?3)",
+        None => "",
+    };
+    let sql = format!(
         // `ts % D` in SQLite is a C-style remainder, already in [0, D) for
         // non-negative `ts`; the outer `(+ D) % D` only matters for negative
         // `ts` (pre-1970), pulling a negative remainder back into [0, D) so
         // this agrees with Rust's `ts.rem_euclid(D)` in `day_start` above.
         "SELECT (ts - (ts % {DAY_MS} + {DAY_MS}) % {DAY_MS}) AS day, model, {SUMS}
-         FROM turns WHERE ts >= ?1 AND ts < ?2 GROUP BY day, model"
-    ))?;
-    let rows = stmt.query_map(params![first, upper], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            TurnUsage {
-                input: r.get::<_, i64>(2)? as u64,
-                output: r.get::<_, i64>(3)? as u64,
-                cache_read: r.get::<_, i64>(4)? as u64,
-                cache_write_5m: r.get::<_, i64>(5)? as u64,
-                cache_write_1h: r.get::<_, i64>(6)? as u64,
-                thinking: r.get::<_, i64>(7)? as u64,
-            },
-        ))
-    })?;
-    for row in rows {
-        let (day, model, u) = row?;
+         FROM turns WHERE ts >= ?1 AND ts < ?2 {scope} GROUP BY day, model"
+    );
+    let mut stmt = db.conn().prepare(&sql)?;
+    let rows = if let Some(project_id) = project_filter {
+        stmt.query_map(params![first, upper, project_id], day_model_usage_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    } else {
+        stmt.query_map(params![first, upper], day_model_usage_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (day, model, u) in rows {
         let cost = cost_of(db, &model, &u)?;
         let slot = per_day.entry(day).or_insert((TurnUsage::default(), 0.0));
         slot.0 = slot.0.plus(&u);
@@ -338,6 +339,40 @@ pub fn daily_usage(db: &Db, days: usize, now_ms: i64) -> Result<Vec<DayUsage>> {
             }
         })
         .collect())
+}
+
+fn day_model_usage_row(r: &rusqlite::Row) -> rusqlite::Result<(i64, String, TurnUsage)> {
+    Ok((
+        r.get::<_, i64>(0)?,
+        r.get::<_, String>(1)?,
+        TurnUsage {
+            input: r.get::<_, i64>(2)? as u64,
+            output: r.get::<_, i64>(3)? as u64,
+            cache_read: r.get::<_, i64>(4)? as u64,
+            cache_write_5m: r.get::<_, i64>(5)? as u64,
+            cache_write_1h: r.get::<_, i64>(6)? as u64,
+            thinking: r.get::<_, i64>(7)? as u64,
+        },
+    ))
+}
+
+/// `days` consecutive days ending with the one containing `now_ms`, oldest first.
+/// Quiet days are present and zeroed: a bar chart with gaps silently lies about
+/// the shape of the week.
+pub fn daily_usage(db: &Db, days: usize, now_ms: i64) -> Result<Vec<DayUsage>> {
+    daily_usage_grouped(db, days, now_ms, None)
+}
+
+/// Same shape as `daily_usage`, scoped to one project — the main window's
+/// per-project sparkline must not silently show every project's activity on
+/// a single project's page.
+pub fn daily_usage_for_project(
+    db: &Db,
+    project_id: i64,
+    days: usize,
+    now_ms: i64,
+) -> Result<Vec<DayUsage>> {
+    daily_usage_grouped(db, days, now_ms, Some(project_id))
 }
 
 /// Projects ranked by tokens since `since_ms`. The label is the directory name,
@@ -771,6 +806,29 @@ mod tests {
         );
         assert_eq!(days[1].cost_usd, 0.0);
         assert_eq!(days[2].usage.input, 1_000_000);
+    }
+
+    #[test]
+    fn daily_usage_for_project_excludes_other_projects_activity() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let a = db.upsert_project("-a-a", "/a/a", false).unwrap();
+        let b = db.upsert_project("-a-b", "/a/b", false).unwrap();
+        let now = 10 * DAY + 3_600_000; // mid-day on day 10
+        seed_session(&db, a, "sa", "/a/a", 10 * DAY + 1, 1_000_000);
+        seed_session(&db, b, "sb", "/a/b", 10 * DAY + 1, 9_000_000);
+
+        let days = daily_usage_for_project(&db, a, 3, now).unwrap();
+        assert_eq!(days.len(), 3, "exactly the window requested");
+        assert_eq!(
+            days[2].usage.input, 1_000_000,
+            "only project a's tokens, not project b's"
+        );
+
+        // Workspace-wide `daily_usage` still sees both, so the two functions
+        // are not accidentally the same query.
+        let workspace = daily_usage(&db, 3, now).unwrap();
+        assert_eq!(workspace[2].usage.input, 10_000_000);
     }
 
     #[test]
