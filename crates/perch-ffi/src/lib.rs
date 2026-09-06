@@ -251,8 +251,13 @@ pub struct ProjectDetail {
     pub notify: NotifyOverride,
     /// What `NotifyOverride::Default` currently means, spelled out (see
     /// `main_window::default_notify_label`) — always present, regardless of
-    /// `notify`'s own value.
+    /// `notify`'s own value. For display only: never parse it.
     pub notify_default_label: String,
+    /// The number behind that label — the global "waiting on you" threshold
+    /// in minutes. What a shell seeds its "Custom" minute control from, so
+    /// the starting value is Rust's product decision rather than a literal
+    /// in the shell that drifts when the default moves.
+    pub notify_default_minutes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -414,6 +419,7 @@ impl From<main_window::ProjectDetail> for ProjectDetail {
             path_exists,
             notify,
             notify_default_label,
+            notify_default_minutes,
         } = d;
         ProjectDetail {
             id,
@@ -427,6 +433,7 @@ impl From<main_window::ProjectDetail> for ProjectDetail {
             sessions: sessions.into_iter().map(Into::into).collect(),
             notify: notify.into(),
             notify_default_label,
+            notify_default_minutes,
             pinned,
             archived,
             path_exists,
@@ -1842,6 +1849,12 @@ mod tests {
             detail.notify_default_label.contains("25 minutes"),
             "the label must reflect the saved global setting, not a stale default: {}",
             detail.notify_default_label
+        );
+        assert_eq!(
+            detail.notify_default_minutes, 25,
+            "the number behind that label has to cross the boundary too — it \
+             is what the shell's Custom minute control seeds from, and the \
+             shell must never parse the label to get it"
         );
     }
 
