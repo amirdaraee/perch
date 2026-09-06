@@ -18,10 +18,10 @@ struct MainWindowRoot: View {
     @ObservedObject var engine: PerchEngine
     let refreshToken: Int
     /// Set only when this presentation was triggered by clicking a "waiting
-    /// on you" notification — see `MainWindowController.show(selectingProjectNamed:)`.
-    /// Resolved against `model.projects` once `reload()` loads it; `nil` for
-    /// an ordinary open.
-    var selectProjectNamed: String? = nil
+    /// on you" notification — see `MainWindowController.show(selectingProjectId:)`.
+    /// Applied once `reload()` has the project list; `nil` for an ordinary
+    /// open.
+    var selectProjectId: Int64? = nil
 
     @State private var model: MainWindowModel?
     /// Distinguishes "still loading" from "loaded and empty" — both render
@@ -114,19 +114,16 @@ struct MainWindowRoot: View {
         model = await engine.mainWindow()
         hasLoaded = true
 
-        // A notification only carries the directory name (`project_name` in
-        // Rust — the session's `cwd`'s last path component), never a project
-        // id, so a click resolves it here against the just-loaded list
-        // rather than against `ProjectRow.name` (which a rename can change,
-        // while the underlying directory — and so `project` — cannot).
-        // Two distinct projects that happen to share a last path component
-        // (e.g. `~/work/api` and `~/side/api`) are indistinguishable from
-        // this field alone; the first match in the sidebar's own group/
-        // recency/name order wins. That is the one gap left by
-        // `WaitingNotification` not carrying a full path or project id.
-        if let name = selectProjectNamed,
-           let match = model?.projects.first(where: { URL(fileURLWithPath: $0.path).lastPathComponent == name }) {
-            selection = .project(match.id)
+        // A notification carries the project's id (`WaitingNotification.projectId`),
+        // which is unique; the displayed directory name is not, and two
+        // projects sharing one used to route to whichever the just-loaded
+        // list happened to hold first. Nothing is matched or compared here
+        // beyond checking the id is still in that list — a project deleted or
+        // re-indexed away since the alert fired selects nothing, rather than
+        // selecting something else.
+        if let id = selectProjectId,
+           model?.projects.contains(where: { $0.id == id }) == true {
+            selection = .project(id)
         }
     }
 }
