@@ -91,7 +91,13 @@ pub fn decide(
     now_ms: i64,
 ) -> (Vec<Notification>, HashSet<Episode>) {
     let mut notifications = Vec::new();
-    let mut remembered = HashSet::new();
+    // Seeded from what we already knew, not empty: absence from one tick is
+    // not evidence a block ended. A `sessions/<pid>.json` that is briefly
+    // unreadable or half-written is rejected by `live`, so the session simply
+    // vanishes from this slice -- and rebuilding from scratch would forget an
+    // alert already delivered and fire it again on the next tick. Only
+    // *seeing* a session move on licenses forgetting it (below).
+    let mut remembered = already_notified.clone();
 
     // General rule, and the reason for the ordering below: any exclusion that
     // depends on a MUTABLE SETTING (`waiting_enabled`, a project's `Off`
@@ -113,6 +119,12 @@ pub fn decide(
     // treating "excluded" as equivalent to "already handled."
 
     for session in live {
+        // This session is observable right now, so whatever we remembered
+        // about it is superseded by what we can see. Dropping its episodes
+        // here keeps at most one per session and lets the arms below restate
+        // the current truth.
+        remembered.retain(|e| e.session_id != session.session_id);
+
         let SessionStatus::Waiting { reason, since_ms } = &session.status else {
             // Not waiting (working, idle, ended...): an immutable fact about
             // this observation, not a setting. Any episode we had for this
@@ -315,7 +327,39 @@ mod tests {
     }
 
     #[test]
-    fn a_vanished_session_is_forgotten_so_the_memory_cannot_grow_forever() {
+    fn an_episode_survives_a_tick_that_cannot_see_its_session() {
+        let (n, seen) = decide(
+            &[waiting("a", "/p", 0, "interactive")],
+            &on(),
+            &no_override(),
+            &no_id(),
+            &HashSet::new(),
+            10 * MIN,
+        );
+        assert_eq!(n.len(), 1, "the first crossing fires");
+
+        // A tick that sees nothing -- an unreadable or half-written record.
+        let (n, seen) = decide(&[], &on(), &no_override(), &no_id(), &seen, 20 * MIN);
+        assert!(n.is_empty(), "an empty tick fires nothing by itself");
+        assert_eq!(seen.len(), 1, "the delivered alert is still remembered");
+
+        // The record comes back, same block, still waiting since 0.
+        let (n, _) = decide(
+            &[waiting("a", "/p", 0, "interactive")],
+            &on(),
+            &no_override(),
+            &no_id(),
+            &seen,
+            30 * MIN,
+        );
+        assert!(
+            n.is_empty(),
+            "the block never ended, so it must not alert twice"
+        );
+    }
+
+    #[test]
+    fn an_episode_is_forgotten_once_the_session_is_seen_to_move_on() {
         let (_, seen) = decide(
             &[waiting("a", "/p", 0, "interactive")],
             &on(),
@@ -324,11 +368,19 @@ mod tests {
             &HashSet::new(),
             10 * MIN,
         );
-        let (_, seen) = decide(&[], &on(), &no_override(), &no_id(), &seen, 20 * MIN);
-        assert!(
-            seen.is_empty(),
-            "the session is gone; its episode goes with it"
+        assert_eq!(seen.len(), 1, "the alert is remembered while it holds");
+
+        // Seeing the session working is what licenses forgetting -- not
+        // merely failing to see it at all.
+        let (_, seen) = decide(
+            &[working("a", "/p")],
+            &on(),
+            &no_override(),
+            &no_id(),
+            &seen,
+            20 * MIN,
         );
+        assert!(seen.is_empty(), "it moved on; the episode is over");
     }
 
     #[test]

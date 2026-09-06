@@ -213,10 +213,24 @@ waiting_after_minutes = 10
 /// turn a wholly-missing section into `name = { ... }` inline syntax the
 /// first time a key inside it is assigned.
 fn ensure_table<'a>(doc: &'a mut DocumentMut, name: &str) -> &'a mut Table {
-    doc.entry(name)
-        .or_insert_with(|| Item::Table(Table::new()))
+    let entry = doc.entry(name).or_insert_with(|| Item::Table(Table::new()));
+
+    // The file invites hand-editing, and TOML lets a section be spelled
+    // inline (`general = { launch_at_login = true }`). `load` accepts that,
+    // so `save` must too: promote it to a real `[general]` table, keeping
+    // every key it holds. Anything that is neither -- a scalar left by a
+    // broken edit, which `load` will already have reported as an error --
+    // becomes an empty table, since there is no key in it to preserve.
+    if !entry.is_table() {
+        let promoted = std::mem::replace(entry, Item::None)
+            .into_table()
+            .unwrap_or_default();
+        *entry = Item::Table(promoted);
+    }
+
+    entry
         .as_table_mut()
-        .expect("a settings section is always a table")
+        .expect("the branch above just made this a table")
 }
 
 /// Format-preserving save. Parses the existing file at `path` (or, if there
@@ -740,5 +754,41 @@ mod tests {
             "watch must never create the directory it watches"
         );
         h.stop();
+    }
+}
+
+#[cfg(test)]
+mod inline_table_tests {
+    use super::{load, save};
+    use tempfile::tempdir;
+
+    /// A user is invited by the file's own header to "edit freely", and TOML
+    /// lets them write a section as an inline table. `load` accepts that
+    /// spelling, so `save` must too -- it is the same document, not a
+    /// malformed one.
+    #[test]
+    fn a_section_written_inline_can_still_be_saved() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "version = 1\ngeneral = { launch_at_login = true }\n").unwrap();
+
+        let loaded = load(&path);
+        assert!(
+            loaded.error.is_none(),
+            "inline table should load: {:?}",
+            loaded.error
+        );
+        assert!(
+            loaded.settings.launch_at_login,
+            "the inline value should survive load"
+        );
+
+        save(&path, &loaded.settings).expect("saving a file with an inline section must not fail");
+
+        let again = load(&path);
+        assert!(
+            again.settings.launch_at_login,
+            "the value must survive the round trip"
+        );
     }
 }
