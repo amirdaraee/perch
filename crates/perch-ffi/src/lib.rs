@@ -1124,6 +1124,15 @@ impl ThisPerch {
     }
 }
 
+/// Composes the "After N minutes" label for a notification override a shell's
+/// stepper is *currently* showing. Free-standing rather than a `Perch` method
+/// because it reads no state: it exists purely so the pluralization happens
+/// here, under the rule that a shell never composes a sentence from a number.
+#[uniffi::export]
+pub fn custom_notify_label(minutes: u32) -> String {
+    perch_core::ui::main_window::custom_notify_label(minutes)
+}
+
 #[uniffi::export]
 impl Perch {
     /// `config_dir: None` resolves per spec §3 (CLAUDE_CONFIG_DIR → XDG →
