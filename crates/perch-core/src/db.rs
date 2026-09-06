@@ -24,8 +24,10 @@ pub struct ProjectMeta {
 
 /// Per-project override of the global notification setting. Stored on the
 /// project itself (below the user-owned line) so re-indexing never touches
-/// it, same as `note` and `pinned`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// it, same as `note` and `pinned`. `Serialize` so it can ride along on
+/// `ui::main_window::ProjectDetail`, which derives it uniformly with every
+/// other view-model in this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum NotifyOverride {
     /// Follow whatever the global setting says.
     Default,
