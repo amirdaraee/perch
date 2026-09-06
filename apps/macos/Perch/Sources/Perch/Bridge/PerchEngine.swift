@@ -110,4 +110,9 @@ private final class Listener: PerchListener, @unchecked Sendable {
     private let deliver: @Sendable (PopoverModel) -> Void
     init(_ deliver: @escaping @Sendable (PopoverModel) -> Void) { self.deliver = deliver }
     func onModel(model: PopoverModel) { deliver(model) }
+
+    // No-op for now: Task 6 added this method to the `PerchListener` trait
+    // (a breaking change to a foreign trait), so this conformance must exist
+    // for the tree to build. Task 9 (notification delivery) fills this in.
+    func onNotifications(items: [WaitingNotification]) {}
 }
