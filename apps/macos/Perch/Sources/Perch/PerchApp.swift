@@ -38,6 +38,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.settingsWindow = settingsWindow
         status.onOpenWindow = { [weak self] in self?.mainWindow?.show() }
         status.onOpenSettings = { [weak self] in self?.settingsWindow?.show() }
+        // Clicking a "waiting on you" notification opens the main window
+        // with that session's project selected. `sessionId` isn't needed
+        // here — see `Sidebar.swift`'s `reload()` for why `project` (the
+        // session's directory name) is what identifies a project for this
+        // purpose, and its own known limitation.
+        engine.notifier.onClicked = { [weak self] _, project in
+            self?.mainWindow?.show(selectingProjectNamed: project)
+        }
         engine.start()
     }
 
