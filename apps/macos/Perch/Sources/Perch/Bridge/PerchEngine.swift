@@ -84,6 +84,13 @@ final class PerchEngine: ObservableObject {
         }.value
     }
 
+    func setNotifyOverride(projectId: Int64, override: NotifyOverride) async -> Result<ProjectDetail, Error> {
+        guard let perch else { return .failure(EngineUnavailable()) }
+        return await Task.detached(priority: .userInitiated) {
+            Result { try perch.setNotifyOverride(projectId: projectId, o: override) }
+        }.value
+    }
+
     /// Builders are pure (non-throwing) on the Rust side; `nil` here only
     /// means the engine itself isn't running.
     func resumeCommand(sessionId: String, cwd: String) async -> TerminalCommand? {
