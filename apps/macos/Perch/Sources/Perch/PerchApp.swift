@@ -40,11 +40,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         status.onOpenSettings = { [weak self] in self?.settingsWindow?.show() }
         // Clicking a "waiting on you" notification opens the main window
         // with that session's project selected. `sessionId` isn't needed
-        // here — see `Sidebar.swift`'s `reload()` for why `project` (the
-        // session's directory name) is what identifies a project for this
-        // purpose, and its own known limitation.
-        engine.notifier.onClicked = { [weak self] _, project in
-            self?.mainWindow?.show(selectingProjectNamed: project)
+        // here: the project id Rust put in the payload is what identifies
+        // the project, and a `nil` one opens the window with whatever was
+        // already selected rather than selecting a guess.
+        engine.notifier.onClicked = { [weak self] _, projectId in
+            self?.mainWindow?.show(selectingProjectId: projectId)
         }
         engine.start()
     }

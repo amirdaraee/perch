@@ -18,13 +18,14 @@ import PerchFFI
 /// `PerchEngine`'s `Listener` uses for `onModel`/`onNotifications`.
 @MainActor
 final class Notifier: NSObject, UNUserNotificationCenterDelegate {
-    /// The clicked notification's `sessionId`/`project` — a plain mirror of
+    /// The clicked notification's `sessionId`/`projectId` — a plain mirror of
     /// the two `WaitingNotification` fields that went into its `userInfo`,
-    /// not anything decided here. The caller (`AppDelegate`) resolves
-    /// `project` into a project id and opens the main window; see its own
-    /// wiring for why `project`, not `sessionId`, is what identifies a
-    /// project for that purpose.
-    var onClicked: ((_ sessionId: String, _ project: String) -> Void)?
+    /// not anything decided here. `projectId` is what identifies the project
+    /// to open: it is unique, unlike the displayed directory name, which two
+    /// projects can share. `nil` when Rust could not resolve one (the
+    /// directory isn't indexed) — the caller then opens the window without
+    /// selecting anything rather than guessing.
+    var onClicked: ((_ sessionId: String, _ projectId: Int64?) -> Void)?
 
     override init() {
         super.init()
@@ -70,7 +71,14 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
             content.title = item.title
             content.body = item.body
             content.sound = .default
-            content.userInfo = ["sessionId": item.sessionId, "project": item.project]
+            // Only what a click needs to be routed. `projectId` is omitted
+            // entirely when Rust resolved none, so its absence at click time
+            // is the same "no project to open" it was at delivery time.
+            var userInfo: [String: Any] = ["sessionId": item.sessionId]
+            if let projectId = item.projectId {
+                userInfo["projectId"] = NSNumber(value: projectId)
+            }
+            content.userInfo = userInfo
             let request = UNNotificationRequest(
                 identifier: UUID().uuidString,
                 content: content,
@@ -103,9 +111,12 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     ) {
         let info = response.notification.request.content.userInfo
         let sessionId = info["sessionId"] as? String ?? ""
-        let project = info["project"] as? String ?? ""
+        // Absent (or, from some older delivered notification still sitting in
+        // Notification Centre, unreadable) means no project to select — never
+        // fall back to a name-shaped guess.
+        let projectId = (info["projectId"] as? NSNumber)?.int64Value
         Task { @MainActor [weak self] in
-            self?.onClicked?(sessionId, project)
+            self?.onClicked?(sessionId, projectId)
         }
         completionHandler()
     }
