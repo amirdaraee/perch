@@ -99,14 +99,67 @@ pub fn record_files(sessions_dir: &Path) -> Vec<PathBuf> {
 
 use crate::platform::ProcessProbe;
 
+/// The outcome of applying spec §7's three-part liveness rule to one record's
+/// raw JSON: the record must parse, its pid must be alive, and that pid's
+/// executable must actually be `claude` (pids are recycled, so liveness alone
+/// would resurrect a stale record as a phantom session). `live_sessions` and
+/// `ui::diagnostics::build_diagnostics` both go through [`decide_record`]
+/// rather than each re-deciding this, so the rule cannot drift between what
+/// the session list shows and what diagnostics explains about it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecordDecision {
+    /// All three confirmations passed; carries the parsed session.
+    Accepted(LiveSession),
+    /// The record parsed, but no process with this pid is currently running.
+    NoSuchProcess { pid: i32, session_id: String },
+    /// The pid is alive, but its executable is not `claude`. `actual` is
+    /// whatever the probe reports (or "unknown" when it can't determine one
+    /// at all — still alive, so not the same case as `NoSuchProcess`).
+    NotClaude {
+        pid: i32,
+        session_id: String,
+        actual: String,
+    },
+    /// The record's JSON did not parse into a [`LiveSession`] at all.
+    Unparsable,
+}
+
+/// Decide one record's fate under spec §7. See [`RecordDecision`].
+pub fn decide_record(json: &str, probe: &dyn ProcessProbe) -> RecordDecision {
+    let Some(session) = parse_session_record(json) else {
+        return RecordDecision::Unparsable;
+    };
+    if !probe.is_alive(session.pid) {
+        return RecordDecision::NoSuchProcess {
+            pid: session.pid,
+            session_id: session.session_id,
+        };
+    }
+    match probe.process_name(session.pid) {
+        Some(name) if name == "claude" => RecordDecision::Accepted(session),
+        Some(actual) => RecordDecision::NotClaude {
+            pid: session.pid,
+            session_id: session.session_id,
+            actual,
+        },
+        None => RecordDecision::NotClaude {
+            pid: session.pid,
+            session_id: session.session_id,
+            actual: "unknown".to_string(),
+        },
+    }
+}
+
 /// Read every session record and keep only those passing all three confirmations
 /// from spec §7. Blocked sessions sort first — they are the ones needing you.
 pub fn live_sessions(sessions_dir: &Path, probe: &dyn ProcessProbe) -> Vec<LiveSession> {
     let mut out: Vec<LiveSession> = record_files(sessions_dir)
         .into_iter()
         .filter_map(|p| std::fs::read_to_string(&p).ok())
-        .filter_map(|s| parse_session_record(&s))
-        .filter(|s| probe.is_alive(s.pid) && probe.process_name(s.pid).as_deref() == Some("claude"))
+        .filter_map(|s| match decide_record(&s, probe) {
+            RecordDecision::Accepted(session) => Some(session),
+            _ => None,
+        })
         .collect();
 
     out.sort_by(|a, b| {
@@ -325,6 +378,52 @@ mod tests {
             r#"{{"pid":{pid},"sessionId":"{session_id}","cwd":"/tmp/p","name":"{name}","kind":"interactive","status":"{status}","startedAt":1,"statusUpdatedAt":2}}"#
         );
         std::fs::write(dir.join(format!("{pid}.json")), json).unwrap();
+    }
+
+    #[test]
+    fn decide_record_reports_each_verdict_for_its_own_cause() {
+        let probe = FakeProbe::new(&[100, 101])
+            .with_name(100, "claude")
+            .with_name(101, "zsh");
+
+        match decide_record(BUSY.replace("11107", "100").as_str(), &probe) {
+            RecordDecision::Accepted(_) => {}
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+
+        let dead_probe = FakeProbe::new(&[]);
+        match decide_record(&BUSY.replace("11107", "999"), &dead_probe) {
+            RecordDecision::NoSuchProcess { pid, .. } => assert_eq!(pid, 999),
+            other => panic!("expected NoSuchProcess, got {other:?}"),
+        }
+
+        match decide_record(&BUSY.replace("11107", "101"), &probe) {
+            RecordDecision::NotClaude { pid, actual, .. } => {
+                assert_eq!(pid, 101);
+                assert_eq!(actual, "zsh");
+            }
+            other => panic!("expected NotClaude, got {other:?}"),
+        }
+
+        match decide_record("{nope", &probe) {
+            RecordDecision::Unparsable => {}
+            other => panic!("expected Unparsable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decide_record_names_the_process_unknown_rather_than_guessing() {
+        // Alive, but the probe cannot determine a name for it at all — this
+        // must not be confused with `NoSuchProcess` (it is alive) nor
+        // silently accepted (its name is not confirmed to be `claude`).
+        let probe = FakeProbe::new(&[102]); // alive, no `with_name` entry
+        match decide_record(&BUSY.replace("11107", "102"), &probe) {
+            RecordDecision::NotClaude { pid, actual, .. } => {
+                assert_eq!(pid, 102);
+                assert_eq!(actual, "unknown");
+            }
+            other => panic!("expected NotClaude, got {other:?}"),
+        }
     }
 
     #[test]
