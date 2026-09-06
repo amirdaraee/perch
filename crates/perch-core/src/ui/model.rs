@@ -2,6 +2,7 @@
 
 use crate::db::Db;
 use crate::live::{LiveSession, SessionStatus};
+use crate::settings::MenuBarDisplay;
 use crate::ui::format::{elapsed_or_dash, human_cost, human_elapsed, human_tokens};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -111,15 +112,26 @@ fn waiting_banner(waiting: usize) -> Option<String> {
     }
 }
 
-/// Menu-bar text: blocked count with an hourglass, else live count, else nothing.
-pub fn tray_title(live: &[LiveSession]) -> String {
-    let waiting = live
-        .iter()
-        .filter(|s| matches!(s.status, SessionStatus::Waiting { .. }))
-        .count();
-    if waiting > 0 {
-        format!("{waiting} ⏳")
-    } else if live.is_empty() {
+/// Menu-bar text, shaped by the user's `menu_bar_display` setting:
+/// - `Icon`: nothing — the tray icon carries the whole story.
+/// - `Count`: the live session count, full stop; never the hourglass, even
+///   while something is waiting.
+/// - `CountAndWaiting`: the live count, except a blocked count with an
+///   hourglass takes over whenever anything is waiting.
+pub fn tray_title(live: &[LiveSession], display: MenuBarDisplay) -> String {
+    if display == MenuBarDisplay::Icon {
+        return String::new();
+    }
+    if display == MenuBarDisplay::CountAndWaiting {
+        let waiting = live
+            .iter()
+            .filter(|s| matches!(s.status, SessionStatus::Waiting { .. }))
+            .count();
+        if waiting > 0 {
+            return format!("{waiting} ⏳");
+        }
+    }
+    if live.is_empty() {
         String::new()
     } else {
         live.len().to_string()
@@ -176,7 +188,14 @@ fn stats_from(db: &Db, now_ms: i64) -> anyhow::Result<Stats> {
 
 /// Build the whole view-model. `db: None` (or a failing db) degrades to sessions-only:
 /// the sessions list needs no index, and an honest dash beats a fabricated zero.
-pub fn build_model(db: Option<&Db>, live: &[LiveSession], now_ms: i64) -> PopoverModel {
+/// `display` shapes `tray_title` alone (see its own doc comment) — nothing else
+/// in this model depends on it.
+pub fn build_model(
+    db: Option<&Db>,
+    live: &[LiveSession],
+    now_ms: i64,
+    display: MenuBarDisplay,
+) -> PopoverModel {
     let mut error = None;
 
     let stats = match db.map(|d| stats_from(d, now_ms)) {
@@ -292,7 +311,7 @@ pub fn build_model(db: Option<&Db>, live: &[LiveSession], now_ms: i64) -> Popove
         stats,
         live: rows,
         recent,
-        tray_title: tray_title(live),
+        tray_title: tray_title(live, display),
         error,
         waiting_banner: waiting_banner(waiting),
     }
@@ -337,7 +356,7 @@ mod tests {
             SessionStatus::Working,
             "interactive",
         );
-        let m = build_model(None, &[s], 10_000);
+        let m = build_model(None, &[s], 10_000, MenuBarDisplay::CountAndWaiting);
         assert!(!m.stats.has_data);
         assert_eq!(m.stats.window_tokens, "—");
         assert_eq!(m.live.len(), 1);
@@ -358,7 +377,7 @@ mod tests {
             SessionStatus::Idle,
             "interactive",
         );
-        let m = build_model(None, &[s], 10_000);
+        let m = build_model(None, &[s], 10_000, MenuBarDisplay::CountAndWaiting);
         let r = &m.live[0];
         assert_eq!(r.project, "proj", "last path component of cwd");
         assert_eq!(r.kind, "interactive");
@@ -375,7 +394,7 @@ mod tests {
             reason: Some("dialog open".into()),
             since_ms: 2_000,
         };
-        let m = build_model(None, &[s], 10_000);
+        let m = build_model(None, &[s], 10_000, MenuBarDisplay::CountAndWaiting);
         assert_eq!(m.live[0].status_label, "waiting · dialog open");
         assert_eq!(m.live[0].elapsed, "8s");
         assert_eq!(m.live[0].status, Status::Waiting);
@@ -385,7 +404,7 @@ mod tests {
     fn absent_status_timestamp_is_a_dash() {
         let mut s = live(7, "a", "alpha", "/x", SessionStatus::Working, "interactive");
         s.status_updated_at = 0;
-        let m = build_model(None, &[s], 10_000);
+        let m = build_model(None, &[s], 10_000, MenuBarDisplay::CountAndWaiting);
         assert_eq!(m.live[0].elapsed, "—");
     }
 
@@ -397,7 +416,12 @@ mod tests {
             reason: None,
             since_ms: 1,
         };
-        let m = build_model(None, &[bg, bg_wait], 10_000);
+        let m = build_model(
+            None,
+            &[bg, bg_wait],
+            10_000,
+            MenuBarDisplay::CountAndWaiting,
+        );
         let by_id = |id: &str| m.live.iter().find(|r| r.id == id).unwrap();
         assert_eq!(by_id("a").status, Status::Background);
         assert_eq!(
@@ -418,9 +442,60 @@ mod tests {
             s
         };
         let b = live(2, "b", "b", "/x", SessionStatus::Working, "interactive");
-        assert_eq!(tray_title(&[]), "");
-        assert_eq!(tray_title(std::slice::from_ref(&b)), "1");
-        assert_eq!(tray_title(&[w, b]), "1 ⏳");
+        assert_eq!(tray_title(&[], MenuBarDisplay::CountAndWaiting), "");
+        assert_eq!(
+            tray_title(std::slice::from_ref(&b), MenuBarDisplay::CountAndWaiting),
+            "1"
+        );
+        assert_eq!(tray_title(&[w, b], MenuBarDisplay::CountAndWaiting), "1 ⏳");
+    }
+
+    #[test]
+    fn tray_title_icon_only_is_always_blank() {
+        let w = {
+            let mut s = live(1, "a", "a", "/x", SessionStatus::Working, "interactive");
+            s.status = SessionStatus::Waiting {
+                reason: None,
+                since_ms: 1,
+            };
+            s
+        };
+        let b = live(2, "b", "b", "/x", SessionStatus::Working, "interactive");
+        assert_eq!(tray_title(&[], MenuBarDisplay::Icon), "");
+        assert_eq!(
+            tray_title(std::slice::from_ref(&b), MenuBarDisplay::Icon),
+            "",
+            "Icon-only must never show a count"
+        );
+        assert_eq!(
+            tray_title(&[w, b], MenuBarDisplay::Icon),
+            "",
+            "Icon-only must never show the waiting hourglass either"
+        );
+    }
+
+    #[test]
+    fn tray_title_count_never_shows_the_hourglass() {
+        let w = {
+            let mut s = live(1, "a", "a", "/x", SessionStatus::Working, "interactive");
+            s.status = SessionStatus::Waiting {
+                reason: None,
+                since_ms: 1,
+            };
+            s
+        };
+        let b = live(2, "b", "b", "/x", SessionStatus::Working, "interactive");
+        assert_eq!(tray_title(&[], MenuBarDisplay::Count), "");
+        assert_eq!(
+            tray_title(std::slice::from_ref(&b), MenuBarDisplay::Count),
+            "1"
+        );
+        assert_eq!(
+            tray_title(&[w, b], MenuBarDisplay::Count),
+            "2",
+            "Count must report the plain live count, not the waiting count, \
+             and never the hourglass"
+        );
     }
 
     #[test]
@@ -449,13 +524,22 @@ mod tests {
         };
         let b = live(2, "b", "b", "/x", SessionStatus::Working, "interactive");
 
-        assert_eq!(build_model(None, &[], 10_000).waiting_banner, None);
         assert_eq!(
-            build_model(None, std::slice::from_ref(&b), 10_000).waiting_banner,
+            build_model(None, &[], 10_000, MenuBarDisplay::CountAndWaiting).waiting_banner,
             None
         );
         assert_eq!(
-            build_model(None, &[w], 10_000).waiting_banner,
+            build_model(
+                None,
+                std::slice::from_ref(&b),
+                10_000,
+                MenuBarDisplay::CountAndWaiting
+            )
+            .waiting_banner,
+            None
+        );
+        assert_eq!(
+            build_model(None, &[w], 10_000, MenuBarDisplay::CountAndWaiting).waiting_banner,
             Some("1 session is waiting on you".to_string())
         );
     }
@@ -503,7 +587,7 @@ mod tests {
             SessionStatus::Working,
             "interactive",
         );
-        let m = build_model(Some(&db), &[s], 10_000);
+        let m = build_model(Some(&db), &[s], 10_000, MenuBarDisplay::CountAndWaiting);
         assert!(m.stats.has_data);
         assert!(m.stats.estimated);
         assert_eq!(m.stats.window_tokens, "2.0M");
@@ -545,7 +629,7 @@ mod tests {
             SessionStatus::Working,
             "interactive",
         );
-        let m = build_model(Some(&db), &[s], 10_000);
+        let m = build_model(Some(&db), &[s], 10_000, MenuBarDisplay::CountAndWaiting);
         assert_eq!(m.recent.len(), 1);
         assert_eq!(m.recent[0].id, "gone");
         assert_eq!(m.recent[0].project, "proj");
@@ -618,7 +702,7 @@ mod tests {
                 "interactive",
             );
             s.cc_version = version.map(str::to_string);
-            let m = build_model(db.as_ref(), &[s], 10_000);
+            let m = build_model(db.as_ref(), &[s], 10_000, MenuBarDisplay::CountAndWaiting);
             assert_eq!(
                 m.live[0].detail_line, expected,
                 "version={version:?} has_usage={has_usage}"
@@ -668,7 +752,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            let m = build_model(Some(&db), &[], 10_000);
+            let m = build_model(Some(&db), &[], 10_000, MenuBarDisplay::CountAndWaiting);
             assert_eq!(m.recent.len(), 1);
             assert_eq!(m.recent[0].ended_line, expected, "session_id={session_id}");
         }
@@ -727,7 +811,7 @@ mod tests {
             SessionStatus::Working,
             "interactive",
         );
-        let m = build_model(Some(&db), &[s], 10_000);
+        let m = build_model(Some(&db), &[s], 10_000, MenuBarDisplay::CountAndWaiting);
         assert_eq!(
             m.error.as_deref(),
             Some("some session data unavailable"),
@@ -784,7 +868,7 @@ mod tests {
             SessionStatus::Working,
             "interactive",
         );
-        let m = build_model(Some(&db), &[s], 10_000);
+        let m = build_model(Some(&db), &[s], 10_000, MenuBarDisplay::CountAndWaiting);
         let msg = m.error.expect("a broken index must report an error");
         assert!(
             msg.starts_with("index unavailable"),

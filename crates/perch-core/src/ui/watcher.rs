@@ -22,12 +22,14 @@ pub struct WatcherConfig {
 }
 
 impl WatcherConfig {
-    /// Production defaults: 250 ms coalescing, 5 s backstop.
-    pub fn for_dir(sessions_dir: PathBuf) -> Self {
+    /// Production shape: 250 ms coalescing, with `poll` as the caller's own
+    /// backstop interval — in production, `Settings::poll_seconds` (see
+    /// `perch-ffi`'s `Perch::spawn_watcher`), not a hardcoded constant.
+    pub fn for_dir(sessions_dir: PathBuf, poll: Duration) -> Self {
         Self {
             sessions_dir,
             debounce: Duration::from_millis(250),
-            poll: Duration::from_secs(5),
+            poll,
         }
     }
 }
