@@ -8,15 +8,27 @@ final class PerchEngine: ObservableObject {
     @Published private(set) var model: PopoverModel?
     @Published private(set) var startupError: String?
 
+    /// Owns delivery of the "waiting on you" banner — see its own doc
+    /// comment. Created eagerly, not lazily, so its
+    /// `UNUserNotificationCenterDelegate` is registered before the engine
+    /// itself even starts, in case the app is being launched by clicking a
+    /// notification left over from a previous run.
+    let notifier = Notifier()
+
     private var perch: Perch?
     private var listener: Listener?
 
     func start() {
         do {
             let p = try Perch(configDir: nil)
-            let l = Listener { [weak self] m in
-                Task { @MainActor in self?.model = m }
-            }
+            let l = Listener(
+                deliverModel: { [weak self] m in
+                    Task { @MainActor in self?.model = m }
+                },
+                deliverNotifications: { [weak self] items in
+                    Task { @MainActor in self?.notifier.deliver(items) }
+                }
+            )
             perch = p
             listener = l
             model = p.current()
@@ -137,14 +149,19 @@ struct EngineUnavailable: LocalizedError {
     var errorDescription: String? { "Perch's engine is not running." }
 }
 
-/// Rust calls this on its watcher thread; hop to the main actor before touching UI.
+/// Rust calls both methods on its watcher thread; hop to the main actor before touching UI.
 private final class Listener: PerchListener, @unchecked Sendable {
-    private let deliver: @Sendable (PopoverModel) -> Void
-    init(_ deliver: @escaping @Sendable (PopoverModel) -> Void) { self.deliver = deliver }
-    func onModel(model: PopoverModel) { deliver(model) }
+    private let deliverModel: @Sendable (PopoverModel) -> Void
+    private let deliverNotifications: @Sendable ([WaitingNotification]) -> Void
 
-    // No-op for now: Task 6 added this method to the `PerchListener` trait
-    // (a breaking change to a foreign trait), so this conformance must exist
-    // for the tree to build. Task 9 (notification delivery) fills this in.
-    func onNotifications(items: [WaitingNotification]) {}
+    init(
+        deliverModel: @escaping @Sendable (PopoverModel) -> Void,
+        deliverNotifications: @escaping @Sendable ([WaitingNotification]) -> Void
+    ) {
+        self.deliverModel = deliverModel
+        self.deliverNotifications = deliverNotifications
+    }
+
+    func onModel(model: PopoverModel) { deliverModel(model) }
+    func onNotifications(items: [WaitingNotification]) { deliverNotifications(items) }
 }
