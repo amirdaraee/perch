@@ -130,6 +130,15 @@ struct SettingsRootView: View {
     enum Tab: Hashable { case general, sessions, notifications, diagnostics }
     @State private var tab: Tab = .general
 
+    /// Rust's own `Settings::default()`, read once. Every control below falls
+    /// back to these while `model` is still nil, rather than to a Swift
+    /// literal of the same value: a literal here is a second source of truth
+    /// for a default Rust already owns, and it drifts silently the day that
+    /// one changes. `preferredTerminal` is the one field still defaulted by a
+    /// literal below — the whole terminal-choice seam is being replaced next
+    /// milestone, when Rust supplies the detected-terminal list.
+    private static let defaults = PerchFFI.defaultSettings()
+
     var body: some View {
         VStack(spacing: 0) {
             if let loadError, model == nil {
@@ -141,8 +150,11 @@ struct SettingsRootView: View {
             if let model {
                 // Both must reach the user: `error` means a hand-edited file
                 // failed to parse at all (running on defaults); `notes` means
-                // it parsed but one or more values were out of range and got
-                // clamped. Neither is silent.
+                // it parsed but Rust refused a value as it stood — a number
+                // clamped to its range, or a `claude_config_dir` that is not
+                // a directory, dropped back to auto-detection. Neither is
+                // silent, and `notes` is how a rejected directory reaches the
+                // user at save time rather than at the next launch.
                 if let error = model.error {
                     banner(error, color: .red)
                 }
@@ -242,7 +254,7 @@ struct SettingsRootView: View {
     private var sessionsPane: some View {
         Form {
             Stepper(value: pollSecondsBinding, in: 1...60) {
-                Text("Check every \(model?.settings.pollSeconds ?? 5) seconds")
+                Text(pollSecondsLabel(seconds: pollSecondsBinding.wrappedValue))
             }
 
             Picker("Menu bar shows", selection: menuBarDisplayBinding) {
@@ -276,10 +288,11 @@ struct SettingsRootView: View {
             // Dependent controls stay visible and greyed rather than
             // disappearing — hiding them would conceal what is configurable
             // and make the window twitch when the toggle above flips.
-            let enabled = (model?.settings.waitingEnabled ?? false) && !notificationAuthDenied
+            let enabled = (model?.settings.waitingEnabled ?? Self.defaults.waitingEnabled)
+                && !notificationAuthDenied
 
             Stepper(value: waitingAfterMinutesBinding, in: 1...240) {
-                Text("After \(model?.settings.waitingAfterMinutes ?? 10) minutes")
+                Text(waitingAfterMinutesLabel(minutes: waitingAfterMinutesBinding.wrappedValue))
             }
             .disabled(!enabled)
 
@@ -336,14 +349,14 @@ struct SettingsRootView: View {
 
     private var pollSecondsBinding: Binding<UInt32> {
         Binding(
-            get: { model?.settings.pollSeconds ?? 5 },
+            get: { model?.settings.pollSeconds ?? Self.defaults.pollSeconds },
             set: { v in update { $0.pollSeconds = v } }
         )
     }
 
     private var menuBarDisplayBinding: Binding<MenuBarDisplay> {
         Binding(
-            get: { model?.settings.menuBarDisplay ?? .count },
+            get: { model?.settings.menuBarDisplay ?? Self.defaults.menuBarDisplay },
             set: { v in update { $0.menuBarDisplay = v } }
         )
     }
@@ -358,7 +371,10 @@ struct SettingsRootView: View {
     /// do nothing.
     private var waitingEnabledBinding: Binding<Bool> {
         Binding(
-            get: { !notificationAuthDenied && (model?.settings.waitingEnabled ?? false) },
+            get: {
+                !notificationAuthDenied
+                    && (model?.settings.waitingEnabled ?? Self.defaults.waitingEnabled)
+            },
             set: { v in
                 guard v else {
                     update { $0.waitingEnabled = false }
@@ -379,14 +395,14 @@ struct SettingsRootView: View {
 
     private var waitingAfterMinutesBinding: Binding<UInt32> {
         Binding(
-            get: { model?.settings.waitingAfterMinutes ?? 10 },
+            get: { model?.settings.waitingAfterMinutes ?? Self.defaults.waitingAfterMinutes },
             set: { v in update { $0.waitingAfterMinutes = v } }
         )
     }
 
     private var includeBackgroundBinding: Binding<Bool> {
         Binding(
-            get: { model?.settings.includeBackground ?? false },
+            get: { model?.settings.includeBackground ?? Self.defaults.includeBackground },
             set: { v in update { $0.includeBackground = v } }
         )
     }

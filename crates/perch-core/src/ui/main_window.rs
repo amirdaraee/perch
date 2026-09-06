@@ -103,7 +103,10 @@ fn dir_name(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-fn plural(n: i64, one: &str, many: &str) -> String {
+/// `pub(crate)` so the settings window's own view-model can pluralize its
+/// two stepper captions through the same helper, rather than growing a
+/// second one that could disagree with this about what "1 minute" reads like.
+pub(crate) fn plural(n: i64, one: &str, many: &str) -> String {
     if n == 1 {
         format!("1 {one}")
     } else {

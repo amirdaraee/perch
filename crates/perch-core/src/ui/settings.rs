@@ -5,6 +5,7 @@
 
 use crate::settings::store::load;
 use crate::settings::Settings;
+use crate::ui::main_window::plural;
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -13,6 +14,30 @@ pub struct SettingsModel {
     pub config_path: String,
     pub notes: Vec<String>,
     pub error: Option<String>,
+}
+
+/// The "Check every N seconds" caption under the Sessions pane's poll
+/// stepper, for the value that stepper is *currently* showing. It exists for
+/// the same reason `main_window::custom_notify_label` does: a shell renders
+/// this string, it does not compose it, so the number is formatted and
+/// pluralized here — where "1 second" is spelled correctly — and never in a
+/// UI's own interpolation.
+pub fn poll_seconds_label(seconds: u32) -> String {
+    format!(
+        "Check every {}",
+        plural(i64::from(seconds), "second", "seconds")
+    )
+}
+
+/// The "After N minutes" caption under the Notifications pane's threshold
+/// stepper, on the same terms as `poll_seconds_label` above.
+///
+/// It reads identically to `main_window::custom_notify_label` today, and is
+/// deliberately not routed through it: that one captions a single project's
+/// override, this one the global default those overrides depart from, and
+/// either window's wording can move without dragging the other with it.
+pub fn waiting_after_minutes_label(minutes: u32) -> String {
+    format!("After {}", plural(i64::from(minutes), "minute", "minutes"))
 }
 
 /// Load `path` (this never fails outright — see `settings::store::load`) and
@@ -32,6 +57,18 @@ pub fn build_settings(path: &Path) -> SettingsModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_poll_stepper_caption_is_pluralized_here_not_in_the_shell() {
+        assert_eq!(poll_seconds_label(1), "Check every 1 second");
+        assert_eq!(poll_seconds_label(5), "Check every 5 seconds");
+    }
+
+    #[test]
+    fn the_waiting_stepper_caption_is_pluralized_here_not_in_the_shell() {
+        assert_eq!(waiting_after_minutes_label(1), "After 1 minute");
+        assert_eq!(waiting_after_minutes_label(10), "After 10 minutes");
+    }
 
     #[test]
     fn a_missing_file_yields_defaults_with_no_notes_or_error() {
