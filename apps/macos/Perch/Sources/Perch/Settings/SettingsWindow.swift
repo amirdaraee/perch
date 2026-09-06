@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UserNotifications
 import PerchFFI
 
 /// Hosts the settings window, following `MainWindowController`'s established
@@ -110,6 +111,15 @@ struct SettingsRootView: View {
 
     @State private var claudeDirDraft: String = ""
     @FocusState private var claudeDirFocused: Bool
+
+    /// True when the OS has explicitly denied Perch permission to show
+    /// notifications — checked (without prompting) on every `load()`, so a
+    /// denial made from System Settings after this window last loaded is
+    /// caught the next time it's reopened, not just right after this pane's
+    /// own toggle triggers a request. `waitingEnabledBinding` reads this so
+    /// the toggle never shows "on" while nothing would actually be
+    /// delivered — see its own comment.
+    @State private var notificationAuthDenied = false
 
     /// Chains queued saves so a second control's edit always builds on the
     /// model left by the first save's `apply()`, not on the pre-edit
@@ -251,11 +261,22 @@ struct SettingsRootView: View {
     private var notificationsPane: some View {
         Form {
             Toggle("Notify when a session is waiting on you", isOn: waitingEnabledBinding)
+                .disabled(notificationAuthDenied)
+
+            if notificationAuthDenied {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Perch isn't allowed to show notifications.")
+                        .foregroundStyle(.red)
+                    Button("Open Notification Settings…") { openSystemNotificationSettings() }
+                }
+                .font(.callout)
+                .padding(.vertical, 4)
+            }
 
             // Dependent controls stay visible and greyed rather than
             // disappearing — hiding them would conceal what is configurable
             // and make the window twitch when the toggle above flips.
-            let enabled = model?.settings.waitingEnabled ?? false
+            let enabled = (model?.settings.waitingEnabled ?? false) && !notificationAuthDenied
 
             Stepper(value: waitingAfterMinutesBinding, in: 1...240) {
                 Text("After \(model?.settings.waitingAfterMinutes ?? 10) minutes")
@@ -267,6 +288,15 @@ struct SettingsRootView: View {
         }
         .padding(20)
         .disabled(model == nil)
+    }
+
+    /// Deep-links into System Settings' Notifications pane — the same
+    /// `x-apple.systempreferences:` scheme every third-party Mac app uses for
+    /// this, since there is no public API to open a single app's own
+    /// notification settings entry directly.
+    private func openSystemNotificationSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.notifications") else { return }
+        NSWorkspace.shared.open(url)
     }
 
     // MARK: - Bindings
@@ -303,10 +333,32 @@ struct SettingsRootView: View {
         )
     }
 
+    /// `get` reports `false` while `notificationAuthDenied` — even if the
+    /// stored setting is still `true` from before a revocation — so the
+    /// toggle never shows "on" while nothing would actually be delivered.
+    /// `set`'s ON branch requests authorization *at the moment the user asks
+    /// for it*, never before: granted, it saves `true` and clears any prior
+    /// denial; refused, it records the denial and leaves the persisted
+    /// setting `false` rather than saving a preference that would silently
+    /// do nothing.
     private var waitingEnabledBinding: Binding<Bool> {
         Binding(
-            get: { model?.settings.waitingEnabled ?? false },
-            set: { v in update { $0.waitingEnabled = v } }
+            get: { !notificationAuthDenied && (model?.settings.waitingEnabled ?? false) },
+            set: { v in
+                guard v else {
+                    update { $0.waitingEnabled = false }
+                    return
+                }
+                Task {
+                    if await engine.notifier.requestAuthorization() {
+                        notificationAuthDenied = false
+                        update { $0.waitingEnabled = true }
+                    } else {
+                        notificationAuthDenied = true
+                        update { $0.waitingEnabled = false }
+                    }
+                }
+            }
         )
     }
 
@@ -348,6 +400,11 @@ struct SettingsRootView: View {
             return
         }
         apply(m)
+        // Never prompts — just reads whatever the OS currently says, so a
+        // denial made from System Settings since this window last loaded
+        // (including one from a run that never touched this toggle at all)
+        // is reflected the next time the window opens.
+        notificationAuthDenied = await engine.notifier.authorizationStatus() == .denied
     }
 
     /// Queues `mutate` behind whatever save is already pending, rather than

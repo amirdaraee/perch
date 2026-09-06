@@ -33,7 +33,13 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     /// not to drop the activation policy while this window is still open.
     var isWindowOpen: Bool { window?.isVisible ?? false }
 
-    func show() {
+    /// `selectingProjectNamed` is a clicked "waiting on you" notification's
+    /// `WaitingNotification.project` — the directory name Perch shows
+    /// everywhere, not a project id (the notification never carries one).
+    /// `MainWindowRoot` resolves it against the freshly-loaded project list
+    /// once `reload()` completes; `nil` for an ordinary open leaves whatever
+    /// selection was already showing.
+    func show(selectingProjectNamed name: String? = nil) {
         refreshToken += 1
 
         if let window {
@@ -47,7 +53,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
             }
             window.makeKeyAndOrderFront(nil)
             (window.contentView as? NSHostingView<MainWindowRoot>)?.rootView =
-                MainWindowRoot(engine: engine, refreshToken: refreshToken)
+                MainWindowRoot(engine: engine, refreshToken: refreshToken, selectProjectNamed: name)
             return
         }
 
@@ -63,7 +69,9 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         w.center()
         w.isReleasedWhenClosed = false
         w.delegate = self
-        w.contentView = NSHostingView(rootView: MainWindowRoot(engine: engine, refreshToken: refreshToken))
+        w.contentView = NSHostingView(
+            rootView: MainWindowRoot(engine: engine, refreshToken: refreshToken, selectProjectNamed: name)
+        )
         window = w
 
         NSApp.setActivationPolicy(.regular)
