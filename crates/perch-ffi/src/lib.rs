@@ -1142,6 +1142,14 @@ impl Perch {
     /// which already reports exactly this precedence). An explicit `Some(p)`
     /// (tests, and any future caller with its own reason to bypass settings
     /// entirely) still beats both.
+    ///
+    /// A settings override that names something unusable never reaches the
+    /// failure below: `Settings::validated` has already dropped it back to
+    /// auto-detection and earned a note the settings window shows. That
+    /// matters here more than anywhere else — every control in that window
+    /// is disabled while the engine is down, so a constructor that failed on
+    /// a bad `claude_config_dir` would leave the user with no way to edit or
+    /// clear the very field that caused it.
     #[uniffi::constructor]
     pub fn new(config_dir: Option<String>) -> Result<Arc<Self>, PerchError> {
         let config_path = config_toml_path()?;
@@ -1151,9 +1159,20 @@ impl Perch {
                 let claude_config_dir = settings::store::load(&config_path)
                     .settings
                     .claude_config_dir;
-                resolve_config_dir_override(&claude_config_dir).ok_or(PerchError::NoConfigDir {
-                    path: "<unresolved>".into(),
-                })?
+                // `.filter(is_dir).or_else(...)` is defence in depth, not the
+                // mechanism: as the code stands `claude_config_dir` is either
+                // empty or a real directory by the time `load` returns it, so
+                // the filter never fires. It is here because this constructor
+                // is the one place where getting this wrong costs the user
+                // the only UI that could fix it — so it never trusts an
+                // override far enough to refuse to start over one, whatever
+                // some future loader might hand it.
+                resolve_config_dir_override(&claude_config_dir)
+                    .filter(|d| d.is_dir())
+                    .or_else(config::config_dir)
+                    .ok_or(PerchError::NoConfigDir {
+                        path: "<unresolved>".into(),
+                    })?
             }
         };
         if !dir.is_dir() {
@@ -1498,9 +1517,15 @@ impl Perch {
 
         // Only an actual, successful swap of `config_dir` earns a restart on
         // its own account — a `claude_config_dir` edit that fails to resolve
-        // (cleared with nothing to auto-detect, or naming something that
-        // isn't a directory) changes nothing about what the watcher should
-        // be doing, so it must not restart the watcher over a no-op.
+        // changes nothing about what the watcher should be doing, so it must
+        // not restart the watcher over a no-op.
+        //
+        // A hand-edit naming something that isn't a directory no longer
+        // arrives here as itself: `Settings::validated` drops it back to ""
+        // on the way out of `load`, with a note the settings window shows —
+        // so what can still fail below is only the *auto-detected* path
+        // having gone away, which no setting can repair and which stderr is
+        // the right (and only) place for.
         let mut dir_actually_moved = false;
         if dir_changed {
             match resolve_config_dir_override(&loaded.claude_config_dir) {
@@ -1607,6 +1632,31 @@ mod tests {
     impl Drop for DataDirGuard<'_> {
         fn drop(&mut self) {
             std::env::remove_var("PERCH_DATA_DIR");
+        }
+    }
+
+    /// `CLAUDE_CONFIG_DIR` for the life of the guard, restored to whatever
+    /// was there before on drop. Only ever taken while a `DataDirGuard` is
+    /// held — that guard owns `ENV_LOCK`, which is what serializes this
+    /// process-global write against every other env-touching test here.
+    struct ClaudeDirGuard {
+        prior: Option<String>,
+    }
+
+    impl ClaudeDirGuard {
+        fn set(dir: &std::path::Path) -> Self {
+            let prior = std::env::var("CLAUDE_CONFIG_DIR").ok();
+            std::env::set_var("CLAUDE_CONFIG_DIR", dir);
+            Self { prior }
+        }
+    }
+
+    impl Drop for ClaudeDirGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+                None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+            }
         }
     }
 
@@ -2174,6 +2224,42 @@ mod tests {
             perch.config_dir(),
             dir_a.path(),
             "the settings file's override must win over env-based auto-detection"
+        );
+    }
+
+    /// A `claude_config_dir` naming something that is not a directory used to
+    /// fail `Perch::new` outright, and every control in the settings window is
+    /// disabled while the engine is down — so the one field that caused the
+    /// failure could not be edited or cleared from the app at all. The value
+    /// must degrade to auto-detection and say so, never to a window that
+    /// cannot be used to fix it.
+    #[test]
+    fn a_claude_config_dir_that_is_not_a_directory_falls_back_instead_of_bricking_the_app() {
+        let fallback = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+        let _claude = ClaudeDirGuard::set(fallback.path());
+
+        let not_a_dir = data.path().join("regular-file");
+        std::fs::write(&not_a_dir, b"i am a file, not a directory").unwrap();
+        let seed = settings::Settings {
+            claude_config_dir: not_a_dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        settings::store::save(&data.path().join("config.toml"), &seed).unwrap();
+
+        let perch =
+            Perch::new(None).expect("a bad claude_config_dir must never stop Perch from opening");
+        assert_eq!(
+            perch.config_dir(),
+            fallback.path(),
+            "the ordinary resolution order must take over, not the unusable override"
+        );
+
+        let notes = perch.settings().notes;
+        assert!(
+            notes.iter().any(|n| n.contains("claude_config_dir")),
+            "and the settings window must be told why: {notes:?}"
         );
     }
 
