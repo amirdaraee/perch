@@ -435,6 +435,12 @@ struct ProjectDetailPane: View {
         switch result {
         case .success(let d):
             guard d.id == projectId else { return }
+            // Cleared here, not only set in the failure arm below: without
+            // this, a rejected pin toggle leaves its banner on screen through
+            // every later edit that succeeds, asserting a failure that is no
+            // longer true. `SettingsRootView.load()` carries the same fix for
+            // the same reason.
+            actionError = nil
             detail = d
             noteDraft = d.note
             // `set_notify_override` clamps the custom threshold in Rust
