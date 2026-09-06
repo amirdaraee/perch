@@ -26,7 +26,7 @@ final class PerchEngine: ObservableObject {
                     Task { @MainActor in self?.model = m }
                 },
                 deliverNotifications: { [weak self] items in
-                    Task { @MainActor in self?.notifier.deliver(items) }
+                    Task { @MainActor in await self?.notifier.deliver(items) }
                 }
             )
             perch = p
