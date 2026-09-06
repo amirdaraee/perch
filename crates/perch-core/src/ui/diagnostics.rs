@@ -231,6 +231,7 @@ pub fn build_diagnostics(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::store::ENV_LOCK;
     use std::collections::HashMap;
 
     struct FakeProbe {
@@ -267,7 +268,35 @@ mod tests {
         std::fs::write(dir.join(format!("{pid}.json")), json).unwrap();
     }
 
+    /// `build_diagnostics` reads `CLAUDE_CONFIG_DIR`, `XDG_CONFIG_HOME` and
+    /// `HOME` from the real process environment, and `cargo test` runs this
+    /// crate's tests in parallel threads within one process — so a `getenv`
+    /// in here racing a `setenv` in one of the three environment tests below
+    /// is a use-after-free inside libc, not merely an assertion that
+    /// sometimes reads the wrong source. Every test that reaches
+    /// `build_diagnostics` therefore takes the same crate-wide `ENV_LOCK`
+    /// those tests take, whether or not it cares about the environment
+    /// itself: it is the *read* that has to be serialized, not only the
+    /// write.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        // A prior test panicking while holding the lock poisons it; recover
+        // the guard rather than let that cascade into every later test here.
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn diagnostics_for(
+        sessions_dir: &Path,
+        probe: &dyn ProcessProbe,
+        settings_path: &Path,
+    ) -> DiagnosticsModel {
+        let _guard = env_lock();
+        diagnostics_while_env_locked(sessions_dir, probe, settings_path)
+    }
+
+    /// For the three tests that already hold `ENV_LOCK` themselves — they
+    /// must keep holding it across their own `set_var` *and* the read, and
+    /// `ENV_LOCK` is not reentrant.
+    fn diagnostics_while_env_locked(
         sessions_dir: &Path,
         probe: &dyn ProcessProbe,
         settings_path: &Path,
@@ -469,6 +498,7 @@ mod tests {
         let settings_path = tmp.path().join("config.toml");
         let db = crate::db::open_in_memory().unwrap();
 
+        let _guard = env_lock();
         let model = build_diagnostics(
             Some(&db),
             sessions_dir.parent().unwrap(),
@@ -551,9 +581,18 @@ mod tests {
         let sessions_dir = sessions_dir_under(&tmp);
         let probe = FakeProbe::new(&[]);
         let settings_path = tmp.path().join("config.toml");
+        // A real directory, not any old string: `Settings::validated` drops a
+        // `claude_config_dir` that is not one (so a bad value can never brick
+        // the app), which would leave nothing here for the override branch to
+        // report and quietly turn this into a test of the default branch.
+        let override_dir = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&override_dir).unwrap();
         std::fs::write(
             &settings_path,
-            "[general]\nclaude_config_dir = \"/wherever\"\n",
+            format!(
+                "[general]\nclaude_config_dir = {:?}\n",
+                override_dir.to_string_lossy()
+            ),
         )
         .unwrap();
 
@@ -562,17 +601,16 @@ mod tests {
         assert_eq!(model.config_dir_source, "setting");
     }
 
-    // The three tests below are the only ones in this module that touch the
-    // real process environment, so — like `settings::store`'s own
-    // `PERCH_CONFIG`/`PERCH_DATA_DIR` tests — they take `ENV_LOCK` first:
-    // `cargo test` runs a crate's tests in parallel threads within one
-    // process, and any two tests mutating `CLAUDE_CONFIG_DIR` or
-    // `XDG_CONFIG_HOME` concurrently would race for real, not just in
-    // theory. Reusing the crate-wide lock (rather than a second one here)
-    // means a test in `settings::store` and a test here can't race past
-    // each other either. Each restores whatever was there before it, so a
-    // developer's own shell environment isn't left altered.
-    use crate::settings::store::ENV_LOCK;
+    // The three tests below are the only ones in this module that *mutate*
+    // the real process environment, so — like `settings::store`'s own
+    // `PERCH_CONFIG`/`PERCH_DATA_DIR` tests — they take `ENV_LOCK` first and
+    // hold it across both the write and their read. Reusing the crate-wide
+    // lock (rather than a second one here) means a test in `settings::store`
+    // and a test here can't race past each other either, and it is the same
+    // lock `env_lock()` above hands to every test that merely *reads* the
+    // environment through `build_diagnostics`. Each restores whatever was
+    // there before it, so a developer's own shell environment isn't left
+    // altered.
 
     struct EnvVarGuard {
         key: &'static str,
@@ -613,7 +651,7 @@ mod tests {
         let probe = FakeProbe::new(&[]);
         let settings_path = tmp.path().join("config.toml"); // no override
 
-        let model = diagnostics_for(&sessions_dir, &probe, &settings_path);
+        let model = diagnostics_while_env_locked(&sessions_dir, &probe, &settings_path);
 
         assert_eq!(model.config_dir_source, "CLAUDE_CONFIG_DIR");
     }
@@ -629,7 +667,7 @@ mod tests {
         let probe = FakeProbe::new(&[]);
         let settings_path = tmp.path().join("config.toml"); // no override
 
-        let model = diagnostics_for(&sessions_dir, &probe, &settings_path);
+        let model = diagnostics_while_env_locked(&sessions_dir, &probe, &settings_path);
 
         assert_eq!(model.config_dir_source, "XDG");
     }
@@ -645,7 +683,7 @@ mod tests {
         let probe = FakeProbe::new(&[]);
         let settings_path = tmp.path().join("config.toml"); // no override
 
-        let model = diagnostics_for(&sessions_dir, &probe, &settings_path);
+        let model = diagnostics_while_env_locked(&sessions_dir, &probe, &settings_path);
 
         assert_eq!(model.config_dir_source, "default");
     }
