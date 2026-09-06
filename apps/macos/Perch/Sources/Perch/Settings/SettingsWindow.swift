@@ -90,22 +90,44 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 /// the Claude Code directory path — saves on commit (focus loss, Return, or
 /// the folder picker) instead, mirroring that same file's note editor: a
 /// path typed character by character would otherwise rewrite the config file
-/// on every keystroke.
+/// on every keystroke. Saves themselves are queued one at a time (see
+/// `update(_:)`/`pendingSave`) so two controls edited in quick succession
+/// never race each other over the same whole-struct `saveSettings` call.
 struct SettingsRootView: View {
     let engine: PerchEngine
     let refreshToken: Int
 
     @State private var model: SettingsModel?
+    /// Set only when the *initial* `settings()` read fails (the engine isn't
+    /// running) — rendered only while there is no model yet.
     @State private var loadError: String?
+    /// Set when a `saveSettings` call fails, independent of `loadError`.
+    /// Rendered unconditionally, whether or not a model has loaded — mirrors
+    /// `ProjectDetailPane.actionError`, which exists for exactly this reason:
+    /// a post-load action failure must never be gated behind the "still
+    /// loading" branch, or it silently disappears once a model exists.
+    @State private var actionError: String?
 
     @State private var claudeDirDraft: String = ""
     @FocusState private var claudeDirFocused: Bool
+
+    /// Chains queued saves so a second control's edit always builds on the
+    /// model left by the first save's `apply()`, not on the pre-edit
+    /// baseline both would otherwise read if their `saveSettings` calls
+    /// overlapped — see `update(_:)`.
+    @State private var pendingSave: Task<Void, Never>?
 
     enum Tab: Hashable { case general, sessions, notifications, diagnostics }
     @State private var tab: Tab = .general
 
     var body: some View {
         VStack(spacing: 0) {
+            if let loadError, model == nil {
+                banner(loadError, color: .red)
+            }
+            if let actionError {
+                banner(actionError, color: .red)
+            }
             if let model {
                 // Both must reach the user: `error` means a hand-edited file
                 // failed to parse at all (running on defaults); `notes` means
@@ -117,8 +139,6 @@ struct SettingsRootView: View {
                 if !model.notes.isEmpty {
                     banner(model.notes.joined(separator: "\n"), color: .orange)
                 }
-            } else if let loadError {
-                banner(loadError, color: .red)
             }
 
             TabView(selection: $tab) {
@@ -131,7 +151,7 @@ struct SettingsRootView: View {
                 notificationsPane
                     .tabItem { Label("Notifications", systemImage: "bell") }
                     .tag(Tab.notifications)
-                DiagnosticsView(engine: engine)
+                DiagnosticsView(engine: engine, refreshToken: refreshToken)
                     .tabItem { Label("Diagnostics", systemImage: "stethoscope") }
                     .tag(Tab.diagnostics)
             }
@@ -139,7 +159,7 @@ struct SettingsRootView: View {
         .frame(width: 520, height: 420)
         .task(id: refreshToken) { await load() }
         .onChange(of: claudeDirFocused) { _, focused in
-            if !focused { Task { await commitClaudeDir() } }
+            if !focused { commitClaudeDir() }
         }
     }
 
@@ -162,13 +182,13 @@ struct SettingsRootView: View {
             Section("Claude Code Directory") {
                 TextField("Auto-detected", text: $claudeDirDraft)
                     .focused($claudeDirFocused)
-                    .onSubmit { Task { await commitClaudeDir() } }
+                    .onSubmit { commitClaudeDir() }
                 HStack {
                     Button("Choose…") { chooseClaudeDir() }
                     if !claudeDirDraft.isEmpty {
                         Button("Use Default (Auto-Detect)") {
                             claudeDirDraft = ""
-                            Task { await commitClaudeDir() }
+                            commitClaudeDir()
                         }
                     }
                 }
@@ -198,12 +218,12 @@ struct SettingsRootView: View {
         }
         guard panel.runModal() == .OK, let url = panel.url else { return }
         claudeDirDraft = url.path
-        Task { await commitClaudeDir() }
+        commitClaudeDir()
     }
 
-    private func commitClaudeDir() async {
+    private func commitClaudeDir() {
         guard let model, claudeDirDraft != model.settings.claudeConfigDir else { return }
-        await update { $0.claudeConfigDir = claudeDirDraft }
+        update { $0.claudeConfigDir = claudeDirDraft }
     }
 
     // MARK: - Sessions & Menu Bar
@@ -258,49 +278,49 @@ struct SettingsRootView: View {
     private var launchAtLoginBinding: Binding<Bool> {
         Binding(
             get: { model?.settings.launchAtLogin ?? false },
-            set: { v in Task { await update { $0.launchAtLogin = v } } }
+            set: { v in update { $0.launchAtLogin = v } }
         )
     }
 
     private var preferredTerminalBinding: Binding<String> {
         Binding(
             get: { model?.settings.preferredTerminal ?? "Terminal" },
-            set: { v in Task { await update { $0.preferredTerminal = v } } }
+            set: { v in update { $0.preferredTerminal = v } }
         )
     }
 
     private var pollSecondsBinding: Binding<UInt32> {
         Binding(
             get: { model?.settings.pollSeconds ?? 5 },
-            set: { v in Task { await update { $0.pollSeconds = v } } }
+            set: { v in update { $0.pollSeconds = v } }
         )
     }
 
     private var menuBarDisplayBinding: Binding<MenuBarDisplay> {
         Binding(
             get: { model?.settings.menuBarDisplay ?? .count },
-            set: { v in Task { await update { $0.menuBarDisplay = v } } }
+            set: { v in update { $0.menuBarDisplay = v } }
         )
     }
 
     private var waitingEnabledBinding: Binding<Bool> {
         Binding(
             get: { model?.settings.waitingEnabled ?? false },
-            set: { v in Task { await update { $0.waitingEnabled = v } } }
+            set: { v in update { $0.waitingEnabled = v } }
         )
     }
 
     private var waitingAfterMinutesBinding: Binding<UInt32> {
         Binding(
             get: { model?.settings.waitingAfterMinutes ?? 10 },
-            set: { v in Task { await update { $0.waitingAfterMinutes = v } } }
+            set: { v in update { $0.waitingAfterMinutes = v } }
         )
     }
 
     private var includeBackgroundBinding: Binding<Bool> {
         Binding(
             get: { model?.settings.includeBackground ?? false },
-            set: { v in Task { await update { $0.includeBackground = v } } }
+            set: { v in update { $0.includeBackground = v } }
         )
     }
 
@@ -314,14 +334,35 @@ struct SettingsRootView: View {
         apply(m)
     }
 
-    private func update(_ mutate: (inout PerchFFI.Settings) -> Void) async {
+    /// Queues `mutate` behind whatever save is already pending, rather than
+    /// firing it immediately against `model` as it stands right now. Without
+    /// this, two controls edited in quick succession (ordinary use, not a
+    /// stress case) would both read the same pre-edit `model.settings` if
+    /// the first `saveSettings` round trip hadn't returned yet — a plain
+    /// read-modify-write race in which whichever response lands last
+    /// silently discards the other edit. Chaining through `pendingSave`
+    /// instead means the second `mutate` only runs after the first save's
+    /// `apply()` has already landed, so it always builds on the freshest
+    /// `model`, not a stale baseline both edits started from.
+    private func update(_ mutate: @escaping (inout PerchFFI.Settings) -> Void) {
+        let previous = pendingSave
+        pendingSave = Task {
+            _ = await previous?.value
+            await performUpdate(mutate)
+        }
+    }
+
+    private func performUpdate(_ mutate: (inout PerchFFI.Settings) -> Void) async {
         guard var settings = model?.settings else { return }
         mutate(&settings)
+        actionError = nil
         switch await engine.saveSettings(settings) {
         case .success(let m):
             apply(m)
         case .failure(let e):
-            loadError = e.localizedDescription
+            // Must reach the user independent of `model`/`loadError` — see
+            // `actionError`'s declaration above.
+            actionError = e.localizedDescription
         }
     }
 
