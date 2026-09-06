@@ -1,9 +1,10 @@
 //! The main window's view-model: every project the index knows, and one
 //! project's full history. Same rule as the popover — every string is final here.
 
-use crate::db::Db;
+use crate::db::{Db, NotifyOverride};
 use crate::live::LiveSession;
 use crate::query;
+use crate::settings::Settings;
 use crate::ui::format::{elapsed_or_dash, human_cost, human_elapsed, human_tokens};
 use crate::ui::model::PopoverModel;
 
@@ -67,6 +68,17 @@ pub struct ProjectDetail {
     pub pinned: bool,
     pub archived: bool,
     pub path_exists: bool,
+    /// This project's own notification override — not the global setting.
+    pub notify: NotifyOverride,
+    /// What `NotifyOverride::Default` currently means, spelled out: the
+    /// global "waiting on you" threshold as a finished, user-facing sentence
+    /// fragment, always present regardless of `notify`'s own value. The
+    /// Default/Custom/Off control (spec: per-project override, in the
+    /// project detail pane) shows this beside the control when Default is
+    /// selected, so the user is never choosing blind — composed here, not
+    /// assembled from a raw number in a shell, for the same reason every
+    /// other string on this struct is finished in Rust.
+    pub notify_default_label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -89,6 +101,17 @@ fn plural(n: i64, one: &str, many: &str) -> String {
     } else {
         format!("{n} {many}")
     }
+}
+
+/// What `NotifyOverride::Default` currently means: the global
+/// `waiting_after_minutes` setting, spelled out as a finished sentence
+/// fragment rather than a bare number a shell would have to pluralize and
+/// contextualize itself.
+fn default_notify_label(waiting_after_minutes: u32) -> String {
+    format!(
+        "Default — waits {}",
+        plural(i64::from(waiting_after_minutes), "minute", "minutes")
+    )
 }
 
 /// `elapsed_or_dash` already treats a non-positive timestamp as absent; this
@@ -215,6 +238,7 @@ pub fn build_project_detail(
     project_id: i64,
     live: &[LiveSession],
     now_ms: i64,
+    settings: &Settings,
 ) -> anyhow::Result<ProjectDetail> {
     let meta = db.project_meta(project_id)?;
     let summary = query::project_summaries(db)?
@@ -299,6 +323,8 @@ pub fn build_project_detail(
         sessions,
         pinned: meta.pinned,
         archived: meta.archived,
+        notify: meta.notify,
+        notify_default_label: default_notify_label(settings.waiting_after_minutes),
     })
 }
 
@@ -484,7 +510,7 @@ mod tests {
         let now = 100 * DAY + 3_600_000;
         let pid = project_with_session(&db, "-a-p", "/a/proj", "s1", now - 1000, 1_000_000);
 
-        let d = build_project_detail(&db, pid, &[], now).unwrap();
+        let d = build_project_detail(&db, pid, &[], now, &Settings::default()).unwrap();
         assert_eq!(d.sparkline.len(), 14);
         assert_eq!(
             d.sparkline[0].day_index, 0,
@@ -514,7 +540,7 @@ mod tests {
         let quiet = project_with_session(&db, "-a-quiet", "/a/quiet", "s1", now - 1000, 0);
         project_with_session(&db, "-a-noisy", "/a/noisy", "s2", now - 1000, 5_000_000);
 
-        let d = build_project_detail(&db, quiet, &[], now).unwrap();
+        let d = build_project_detail(&db, quiet, &[], now, &Settings::default()).unwrap();
         assert_eq!(
             d.sparkline[13].tokens, 0,
             "the other project's tokens must not appear on this one's sparkline"
@@ -555,7 +581,7 @@ mod tests {
             cc_version: None,
             socket_path: None,
         }];
-        let d = build_project_detail(&db, pid, &live, now).unwrap();
+        let d = build_project_detail(&db, pid, &live, now, &Settings::default()).unwrap();
         assert_eq!(d.sessions[0].id, "livesess");
         assert!(d.sessions[0].is_live);
         assert!(!d.sessions[1].is_live, "the older one has ended");
@@ -584,7 +610,7 @@ mod tests {
         })
         .unwrap();
 
-        let d = build_project_detail(&db, pid, &[], now).unwrap();
+        let d = build_project_detail(&db, pid, &[], now, &Settings::default()).unwrap();
         assert_eq!(d.sessions[0].name, "Claude projects dashboard");
     }
 
@@ -610,7 +636,7 @@ mod tests {
         })
         .unwrap();
 
-        let d = build_project_detail(&db, pid, &[], now).unwrap();
+        let d = build_project_detail(&db, pid, &[], now, &Settings::default()).unwrap();
         assert_eq!(
             d.sessions[0].name, "6dda468e",
             "no title: fall back to the first 8 chars of the session id"
@@ -639,7 +665,7 @@ mod tests {
         })
         .unwrap();
 
-        let d = build_project_detail(&db, pid, &[], now).unwrap();
+        let d = build_project_detail(&db, pid, &[], now, &Settings::default()).unwrap();
         let row = &d.sessions[0];
         assert_eq!(row.duration, "—");
         assert!(
@@ -655,10 +681,61 @@ mod tests {
         seed_default_prices(&db).unwrap();
         let pid = project_with_session(&db, "-nope", "/definitely/not/here", "s1", 100 * DAY, 1);
 
-        let d = build_project_detail(&db, pid, &[], 100 * DAY).unwrap();
+        let d = build_project_detail(&db, pid, &[], 100 * DAY, &Settings::default()).unwrap();
         assert!(
             !d.path_exists,
             "a vanished project directory is reported, not fatal"
+        );
+    }
+
+    #[test]
+    fn a_project_left_on_default_shows_the_current_global_threshold() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let pid = project_with_session(&db, "-a-p", "/a/proj", "s1", 100 * DAY, 1);
+        let settings = Settings {
+            waiting_after_minutes: 25,
+            ..Settings::default()
+        };
+
+        let d = build_project_detail(&db, pid, &[], 100 * DAY, &settings).unwrap();
+        assert_eq!(
+            d.notify,
+            NotifyOverride::Default,
+            "a project that was never given its own override reads as Default"
+        );
+        assert!(
+            d.notify_default_label.contains("25 minutes"),
+            "Default's own label must reflect *this* global setting, not a stale or hardcoded one: {}",
+            d.notify_default_label
+        );
+    }
+
+    #[test]
+    fn a_project_on_custom_shows_its_own_threshold_not_the_global_one() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let pid = project_with_session(&db, "-a-p", "/a/proj", "s1", 100 * DAY, 1);
+        db.set_notify_override(pid, &NotifyOverride::Custom { after_minutes: 45 })
+            .unwrap();
+        // Deliberately different from 45, so the two fields can't be
+        // confused for one another below.
+        let settings = Settings {
+            waiting_after_minutes: 10,
+            ..Settings::default()
+        };
+
+        let d = build_project_detail(&db, pid, &[], 100 * DAY, &settings).unwrap();
+        assert_eq!(
+            d.notify,
+            NotifyOverride::Custom { after_minutes: 45 },
+            "notify carries the project's own override"
+        );
+        assert!(
+            d.notify_default_label.contains("10 minutes"),
+            "notify_default_label always reflects the *global* setting, \
+             regardless of this project's own override: {}",
+            d.notify_default_label
         );
     }
 }
