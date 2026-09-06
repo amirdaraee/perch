@@ -816,6 +816,18 @@ impl From<core_diagnostics::DiagnosticsModel> for DiagnosticsModel {
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct WaitingNotification {
     pub session_id: String,
+    /// What a click on this alert routes to: the id of the indexed project
+    /// the waiting session is running in — unique, and the same key every
+    /// other model on this boundary is addressed by. `project` below is only
+    /// the directory name Perch displays, and two projects can share one
+    /// (`~/work/api` and `~/personal/api`), so it must never be used to
+    /// identify a project.
+    ///
+    /// `None` when the index has never seen that directory. A shell that
+    /// gets `None` has nothing to select and must select nothing — guessing
+    /// from `project` is exactly the wrong answer this field exists to
+    /// prevent.
+    pub project_id: Option<i64>,
     pub project: String,
     pub title: String,
     pub body: String,
@@ -825,12 +837,14 @@ impl From<notify::Notification> for WaitingNotification {
     fn from(n: notify::Notification) -> Self {
         let notify::Notification {
             session_id,
+            project_id,
             project,
             title,
             body,
         } = n;
         WaitingNotification {
             session_id,
+            project_id,
             project,
             title,
             body,
@@ -1016,20 +1030,27 @@ impl ThisPerch {
         *self.reindex_error.lock().unwrap() = outcome.err();
     }
 
-    /// This tick's `NotifyOverride` for every project the index knows, keyed
-    /// by the project's `real_path` — the same string `LiveSession::cwd`
+    /// This tick's id and `NotifyOverride` for every project the index knows,
+    /// keyed by the project's `real_path` — the same string `LiveSession::cwd`
     /// carries (see `main_window`'s identical `l.cwd == s.real_path` match).
-    /// One database round trip per tick, not one per session: `decide`'s
-    /// `override_for` closure below is a pure map lookup over this.
+    /// One database round trip per tick, not one per session: both of
+    /// `decide`'s lookups below are pure map lookups over this.
+    ///
+    /// The id rides along with the override rather than costing a second
+    /// query because `project_summaries` already carries it — it is what a
+    /// finished notification points at, so a click routes to the project the
+    /// alert was about rather than to whichever indexed project happens to
+    /// share its directory name.
     ///
     /// A database that won't open, or a summary query that fails, yields an
     /// empty map — every project then falls through to `NotifyOverride::Default`
-    /// for this tick. That is the same graceful-degradation the rest of this
-    /// file gives a watcher tick (see `core_model_for`'s own `db::open`): the
-    /// tick's `PopoverModel.error` already carries an open failure when there
-    /// is one, and `Vec<WaitingNotification>` has no error channel of its own to
-    /// carry a second, redundant report of the identical trouble.
-    fn overrides_by_cwd(&self) -> HashMap<String, db::NotifyOverride> {
+    /// (and to no id) for this tick. That is the same graceful-degradation the
+    /// rest of this file gives a watcher tick (see `core_model_for`'s own
+    /// `db::open`): the tick's `PopoverModel.error` already carries an open
+    /// failure when there is one, and `Vec<WaitingNotification>` has no error
+    /// channel of its own to carry a second, redundant report of the identical
+    /// trouble.
+    fn projects_by_cwd(&self) -> HashMap<String, (i64, db::NotifyOverride)> {
         let Ok(database) = db::open(&self.db_path) else {
             return HashMap::new();
         };
@@ -1048,7 +1069,7 @@ impl ThisPerch {
                 database
                     .project_meta(s.id)
                     .ok()
-                    .map(|m| (s.real_path, m.notify))
+                    .map(|m| (s.real_path, (s.id, m.notify)))
             })
             .collect()
     }
@@ -1058,19 +1079,23 @@ impl ThisPerch {
     /// exactly where this one left off.
     fn notifications_for(&self, sessions: &[live::LiveSession]) -> Vec<WaitingNotification> {
         let loaded_settings = settings::store::load(&self.config_path).settings;
-        let overrides = self.overrides_by_cwd();
+        let projects = self.projects_by_cwd();
         let override_for = |cwd: &str| {
-            overrides
+            projects
                 .get(cwd)
-                .copied()
+                .map(|(_, notify)| *notify)
                 .unwrap_or(db::NotifyOverride::Default)
         };
+        // A `cwd` the index has never seen resolves to no id at all — the
+        // notification then names no project rather than a wrong one.
+        let project_id_for = |cwd: &str| projects.get(cwd).map(|(id, _)| *id);
 
         let mut notified = self.notified.lock().unwrap();
         let (items, remembered) = notify::decide(
             sessions,
             &loaded_settings,
             &override_for,
+            &project_id_for,
             &notified,
             now_ms(),
         );
@@ -1871,6 +1896,120 @@ mod tests {
             1,
             "no repeat push for the same episode on a later tick"
         );
+    }
+
+    /// Two indexed projects whose directories share a last path component
+    /// (`~/work/api` and `~/personal/api`) must be tellable apart from the
+    /// notification payload alone. `project` — the directory name — is the
+    /// same string for both, so a shell routing a click on it can only
+    /// guess; `project_id` is what makes the click land on the project the
+    /// alert was actually about.
+    #[test]
+    fn notifications_carry_the_project_id_so_a_shared_directory_name_still_routes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+
+        let db_path = data.path().join("index.db");
+        let (work_api, personal_api) = {
+            let database = db::open(&db_path).unwrap();
+            (
+                database
+                    .upsert_project("-work-api", "/work/api", false)
+                    .unwrap(),
+                database
+                    .upsert_project("-personal-api", "/personal/api", false)
+                    .unwrap(),
+            )
+        };
+        assert_ne!(work_api, personal_api);
+
+        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
+        let mut s = perch.settings().settings;
+        s.waiting_enabled = true;
+        s.waiting_after_minutes = 1;
+        perch.save_settings(s).unwrap();
+
+        let since_ms = now_ms() - 2 * 60_000;
+        let waiting = |id: &str, cwd: &str| live::LiveSession {
+            pid: 1,
+            session_id: id.into(),
+            cwd: cwd.into(),
+            name: id.into(),
+            kind: "interactive".into(),
+            status: live::SessionStatus::Waiting {
+                reason: None,
+                since_ms,
+            },
+            started_at: since_ms,
+            status_updated_at: since_ms,
+            cc_version: None,
+            socket_path: None,
+        };
+
+        let cap = Arc::new(Capture::default());
+        perch.this().tick(
+            cap.as_ref(),
+            vec![
+                waiting("s-work", "/work/api"),
+                waiting("s-personal", "/personal/api"),
+            ],
+        );
+
+        let pushed = cap.notifications.lock().unwrap().clone();
+        assert_eq!(pushed.len(), 1);
+        let mut routed: Vec<(String, Option<i64>, String)> = pushed[0]
+            .iter()
+            .map(|n| (n.session_id.clone(), n.project_id, n.project.clone()))
+            .collect();
+        routed.sort();
+        assert_eq!(
+            routed,
+            vec![
+                ("s-personal".to_string(), Some(personal_api), "api".into()),
+                ("s-work".to_string(), Some(work_api), "api".into()),
+            ],
+            "both alerts say \"api\"; only the id tells the two projects apart"
+        );
+    }
+
+    /// A waiting session in a directory the index has never seen has no
+    /// project row to point at. The payload says so with `None` rather than
+    /// naming some other project — a click that selects nothing is right,
+    /// a click that silently selects the wrong project is not.
+    #[test]
+    fn an_unindexed_directory_notifies_with_no_project_id_rather_than_a_wrong_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
+
+        let mut s = perch.settings().settings;
+        s.waiting_enabled = true;
+        s.waiting_after_minutes = 1;
+        perch.save_settings(s).unwrap();
+
+        let since_ms = now_ms() - 2 * 60_000;
+        let session = live::LiveSession {
+            pid: 1,
+            session_id: "s1".into(),
+            cwd: "/tmp/never-indexed".into(),
+            name: "s1".into(),
+            kind: "interactive".into(),
+            status: live::SessionStatus::Waiting {
+                reason: None,
+                since_ms,
+            },
+            started_at: since_ms,
+            status_updated_at: since_ms,
+            cc_version: None,
+            socket_path: None,
+        };
+
+        let cap = Arc::new(Capture::default());
+        perch.this().tick(cap.as_ref(), vec![session]);
+        let pushed = cap.notifications.lock().unwrap().clone();
+        assert_eq!(pushed[0][0].project_id, None);
     }
 
     #[test]

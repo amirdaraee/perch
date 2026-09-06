@@ -33,13 +33,14 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     /// not to drop the activation policy while this window is still open.
     var isWindowOpen: Bool { window?.isVisible ?? false }
 
-    /// `selectingProjectNamed` is a clicked "waiting on you" notification's
-    /// `WaitingNotification.project` — the directory name Perch shows
-    /// everywhere, not a project id (the notification never carries one).
-    /// `MainWindowRoot` resolves it against the freshly-loaded project list
-    /// once `reload()` completes; `nil` for an ordinary open leaves whatever
-    /// selection was already showing.
-    func show(selectingProjectNamed name: String? = nil) {
+    /// `selectingProjectId` is a clicked "waiting on you" notification's
+    /// `WaitingNotification.projectId` — the unique id of the project the
+    /// alert was about, not its displayed directory name (two projects can
+    /// share one). `MainWindowRoot` selects it once `reload()` has loaded the
+    /// project list; `nil` — an ordinary open, or an alert whose directory
+    /// the index has never seen — leaves whatever selection was already
+    /// showing.
+    func show(selectingProjectId id: Int64? = nil) {
         refreshToken += 1
 
         if let window {
@@ -53,7 +54,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
             }
             window.makeKeyAndOrderFront(nil)
             (window.contentView as? NSHostingView<MainWindowRoot>)?.rootView =
-                MainWindowRoot(engine: engine, refreshToken: refreshToken, selectProjectNamed: name)
+                MainWindowRoot(engine: engine, refreshToken: refreshToken, selectProjectId: id)
             return
         }
 
@@ -70,7 +71,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         w.isReleasedWhenClosed = false
         w.delegate = self
         w.contentView = NSHostingView(
-            rootView: MainWindowRoot(engine: engine, refreshToken: refreshToken, selectProjectNamed: name)
+            rootView: MainWindowRoot(engine: engine, refreshToken: refreshToken, selectProjectId: id)
         )
         window = w
 

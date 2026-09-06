@@ -23,6 +23,16 @@ pub struct Episode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notification {
     pub session_id: String,
+    /// The indexed project this session's `cwd` belongs to — the id every
+    /// other model on this boundary is keyed by, and the only thing in this
+    /// payload that identifies a project unambiguously. `project` below is a
+    /// directory name, and two projects can share one (`~/work/api` and
+    /// `~/personal/api`), so a shell routing a click must use this.
+    ///
+    /// `None` when the index has never seen that directory: there is no
+    /// project to point at, and saying so is better than pointing at some
+    /// other project that merely shares a name.
+    pub project_id: Option<i64>,
     pub project: String,
     pub title: String,
     pub body: String,
@@ -59,6 +69,13 @@ fn compose(project: &str, reason: Option<&str>, elapsed_ms: i64) -> (String, Str
 /// Pure: same inputs, same answer. `already_notified` is the caller's memory of
 /// episodes it has fired for; the returned set replaces it.
 ///
+/// `override_for` and `project_id_for` are both lookups keyed on a session's
+/// `cwd` — the string the index stores as a project's `real_path`. They stay
+/// separate closures rather than one combined lookup because the override
+/// decides *whether* to fire and the id only travels with a notification that
+/// already has: a caller with no index to consult can pass `|_| None` for the
+/// second and still get correct decisions.
+///
 /// The returned set contains exactly the episodes that have actually fired (just
 /// now, or on a previous call) and are still live and still waiting. A session
 /// not yet over its threshold is not remembered — there is nothing to dedup
@@ -69,6 +86,7 @@ pub fn decide(
     live: &[LiveSession],
     settings: &Settings,
     override_for: &dyn Fn(&str) -> NotifyOverride,
+    project_id_for: &dyn Fn(&str) -> Option<i64>,
     already_notified: &HashSet<Episode>,
     now_ms: i64,
 ) -> (Vec<Notification>, HashSet<Episode>) {
@@ -149,6 +167,7 @@ pub fn decide(
         let (title, body) = compose(&project, reason.as_deref(), elapsed_ms);
         notifications.push(Notification {
             session_id: session.session_id.clone(),
+            project_id: project_id_for(&session.cwd),
             project,
             title,
             body,
@@ -197,6 +216,11 @@ mod tests {
     fn no_override() -> impl Fn(&str) -> NotifyOverride {
         |_| NotifyOverride::Default
     }
+    /// For the tests that are about *when* an alert fires rather than what
+    /// it points at: no index to consult, so no project id.
+    fn no_id() -> impl Fn(&str) -> Option<i64> {
+        |_| None
+    }
 
     #[test]
     fn nothing_fires_while_the_feature_is_off() {
@@ -208,6 +232,7 @@ mod tests {
             &[waiting("a", "/p", 0, "interactive")],
             &s,
             &no_override(),
+            &no_id(),
             &HashSet::new(),
             60 * MIN,
         );
@@ -220,6 +245,7 @@ mod tests {
             &[waiting("a", "/p", 0, "interactive")],
             &on(),
             &no_override(),
+            &no_id(),
             &HashSet::new(),
             9 * MIN,
         );
@@ -230,7 +256,14 @@ mod tests {
     #[test]
     fn it_fires_once_at_the_threshold_and_not_again_while_still_waiting() {
         let live = [waiting("a", "/p", 0, "interactive")];
-        let (n, seen) = decide(&live, &on(), &no_override(), &HashSet::new(), 10 * MIN);
+        let (n, seen) = decide(
+            &live,
+            &on(),
+            &no_override(),
+            &no_id(),
+            &HashSet::new(),
+            10 * MIN,
+        );
         assert_eq!(n.len(), 1, "fires when the threshold is crossed");
         assert!(
             n[0].body.contains("dialog open"),
@@ -238,7 +271,7 @@ mod tests {
             n[0].body
         );
 
-        let (again, seen2) = decide(&live, &on(), &no_override(), &seen, 30 * MIN);
+        let (again, seen2) = decide(&live, &on(), &no_override(), &no_id(), &seen, 30 * MIN);
         assert!(
             again.is_empty(),
             "level-triggering here would notify every tick"
@@ -252,6 +285,7 @@ mod tests {
             &[waiting("a", "/p", 0, "interactive")],
             &on(),
             &no_override(),
+            &no_id(),
             &HashSet::new(),
             10 * MIN,
         );
@@ -260,6 +294,7 @@ mod tests {
             &[working("a", "/p")],
             &on(),
             &no_override(),
+            &no_id(),
             &seen,
             20 * MIN,
         );
@@ -272,6 +307,7 @@ mod tests {
             &[waiting("a", "/p", 30 * MIN, "interactive")],
             &on(),
             &no_override(),
+            &no_id(),
             &seen,
             41 * MIN,
         );
@@ -284,10 +320,11 @@ mod tests {
             &[waiting("a", "/p", 0, "interactive")],
             &on(),
             &no_override(),
+            &no_id(),
             &HashSet::new(),
             10 * MIN,
         );
-        let (_, seen) = decide(&[], &on(), &no_override(), &seen, 20 * MIN);
+        let (_, seen) = decide(&[], &on(), &no_override(), &no_id(), &seen, 20 * MIN);
         assert!(
             seen.is_empty(),
             "the session is gone; its episode goes with it"
@@ -297,14 +334,21 @@ mod tests {
     #[test]
     fn background_sessions_are_excluded_unless_asked_for() {
         let bg = [waiting("a", "/p", 0, "bg")];
-        let (n, _) = decide(&bg, &on(), &no_override(), &HashSet::new(), 60 * MIN);
+        let (n, _) = decide(
+            &bg,
+            &on(),
+            &no_override(),
+            &no_id(),
+            &HashSet::new(),
+            60 * MIN,
+        );
         assert!(n.is_empty(), "a bg session is not waiting on *you*");
 
         let s = Settings {
             include_background: true,
             ..on()
         };
-        let (n, _) = decide(&bg, &s, &no_override(), &HashSet::new(), 60 * MIN);
+        let (n, _) = decide(&bg, &s, &no_override(), &no_id(), &HashSet::new(), 60 * MIN);
         assert_eq!(n.len(), 1, "unless you say otherwise");
     }
 
@@ -322,12 +366,19 @@ mod tests {
         };
 
         // Fires once with include_background on.
-        let (n, seen) = decide(&bg, &with_bg, &no_override(), &HashSet::new(), 10 * MIN);
+        let (n, seen) = decide(
+            &bg,
+            &with_bg,
+            &no_override(),
+            &no_id(),
+            &HashSet::new(),
+            10 * MIN,
+        );
         assert_eq!(n.len(), 1);
 
         // Turned off, session still blocked in the same episode: no firing, and
         // the memory of the already-fired episode must survive.
-        let (n2, seen2) = decide(&bg, &on(), &no_override(), &seen, 20 * MIN);
+        let (n2, seen2) = decide(&bg, &on(), &no_override(), &no_id(), &seen, 20 * MIN);
         assert!(n2.is_empty(), "include_background off: nothing fires");
         assert_eq!(
             seen2, seen,
@@ -335,7 +386,7 @@ mod tests {
         );
 
         // Turned back on, same episode still blocked: must not fire again.
-        let (n3, _) = decide(&bg, &with_bg, &no_override(), &seen2, 30 * MIN);
+        let (n3, _) = decide(&bg, &with_bg, &no_override(), &no_id(), &seen2, 30 * MIN);
         assert!(
             n3.is_empty(),
             "toggling include_background back on must not resurrect a repeat notification"
@@ -352,7 +403,14 @@ mod tests {
 
         // Excluded the whole time, well past what the threshold would be: never
         // fires, and never enters memory either.
-        let (n, seen) = decide(&bg, &on(), &no_override(), &HashSet::new(), 60 * MIN);
+        let (n, seen) = decide(
+            &bg,
+            &on(),
+            &no_override(),
+            &no_id(),
+            &HashSet::new(),
+            60 * MIN,
+        );
         assert!(
             n.is_empty(),
             "excluded: never fires, no matter how long it's waited"
@@ -368,7 +426,7 @@ mod tests {
             include_background: true,
             ..on()
         };
-        let (n2, _) = decide(&bg, &with_bg, &no_override(), &seen, 70 * MIN);
+        let (n2, _) = decide(&bg, &with_bg, &no_override(), &no_id(), &seen, 70 * MIN);
         assert_eq!(
             n2.len(),
             1,
@@ -389,7 +447,7 @@ mod tests {
             waiting("a", "/quiet", 0, "interactive"),
             waiting("b", "/loud", 0, "interactive"),
         ];
-        let (n, _) = decide(&live, &on(), &off, &HashSet::new(), 60 * MIN);
+        let (n, _) = decide(&live, &on(), &off, &no_id(), &HashSet::new(), 60 * MIN);
         assert_eq!(n.len(), 1);
         assert_eq!(
             n[0].session_id, "b",
@@ -407,13 +465,20 @@ mod tests {
         let live = [waiting("a", "/noisy", 0, "interactive")];
 
         // Fires once on Default.
-        let (n, seen) = decide(&live, &on(), &no_override(), &HashSet::new(), 10 * MIN);
+        let (n, seen) = decide(
+            &live,
+            &on(),
+            &no_override(),
+            &no_id(),
+            &HashSet::new(),
+            10 * MIN,
+        );
         assert_eq!(n.len(), 1);
 
         // Muted, session still blocked in the same episode: no firing, and the
         // memory of the already-fired episode must survive the muted call.
         let off = |_: &str| NotifyOverride::Off;
-        let (n2, seen2) = decide(&live, &on(), &off, &seen, 20 * MIN);
+        let (n2, seen2) = decide(&live, &on(), &off, &no_id(), &seen, 20 * MIN);
         assert!(n2.is_empty(), "muted: nothing fires");
         assert_eq!(
             seen2, seen,
@@ -421,7 +486,7 @@ mod tests {
         );
 
         // Unmuted, same episode still blocked: must not fire again.
-        let (n3, _) = decide(&live, &on(), &no_override(), &seen2, 30 * MIN);
+        let (n3, _) = decide(&live, &on(), &no_override(), &no_id(), &seen2, 30 * MIN);
         assert!(
             n3.is_empty(),
             "unmuting must not resurrect a repeat notification for the same episode"
@@ -440,7 +505,7 @@ mod tests {
 
         // Off the whole time, well past what the threshold would be: never fires,
         // and — critically — never enters memory either.
-        let (n, seen) = decide(&live, &on(), &off, &HashSet::new(), 60 * MIN);
+        let (n, seen) = decide(&live, &on(), &off, &no_id(), &HashSet::new(), 60 * MIN);
         assert!(
             n.is_empty(),
             "Off: never fires, no matter how long it's waited"
@@ -449,7 +514,7 @@ mod tests {
 
         // Switched back to Default, same session still blocked past the (global)
         // threshold: this is a genuinely un-notified episode and must fire.
-        let (n2, _) = decide(&live, &on(), &no_override(), &seen, 70 * MIN);
+        let (n2, _) = decide(&live, &on(), &no_override(), &no_id(), &seen, 70 * MIN);
         assert_eq!(
             n2.len(),
             1,
@@ -467,9 +532,9 @@ mod tests {
             }
         };
         let live = [waiting("a", "/slow", 0, "interactive")];
-        let (n, _) = decide(&live, &on(), &custom, &HashSet::new(), 20 * MIN);
+        let (n, _) = decide(&live, &on(), &custom, &no_id(), &HashSet::new(), 20 * MIN);
         assert!(n.is_empty(), "20 minutes is under this project's own 45");
-        let (n, _) = decide(&live, &on(), &custom, &HashSet::new(), 46 * MIN);
+        let (n, _) = decide(&live, &on(), &custom, &no_id(), &HashSet::new(), 46 * MIN);
         assert_eq!(n.len(), 1);
     }
 
@@ -479,6 +544,7 @@ mod tests {
             &[waiting("a", "/Users/x/my-proj", 0, "interactive")],
             &on(),
             &no_override(),
+            &no_id(),
             &HashSet::new(),
             12 * MIN,
         );
@@ -505,7 +571,14 @@ mod tests {
         let live = [waiting("a", "/p", 0, "interactive")];
 
         // Fires once while enabled.
-        let (n, seen) = decide(&live, &on(), &no_override(), &HashSet::new(), 10 * MIN);
+        let (n, seen) = decide(
+            &live,
+            &on(),
+            &no_override(),
+            &no_id(),
+            &HashSet::new(),
+            10 * MIN,
+        );
         assert_eq!(n.len(), 1);
 
         // Disabled, session still blocked in the same episode: no firing, and the
@@ -514,7 +587,7 @@ mod tests {
             waiting_enabled: false,
             ..Default::default()
         };
-        let (n2, seen2) = decide(&live, &off, &no_override(), &seen, 20 * MIN);
+        let (n2, seen2) = decide(&live, &off, &no_override(), &no_id(), &seen, 20 * MIN);
         assert!(n2.is_empty(), "disabled: nothing fires");
         assert_eq!(
             seen2, seen,
@@ -522,7 +595,7 @@ mod tests {
         );
 
         // Re-enabled, same episode still blocked: must not fire again.
-        let (n3, _) = decide(&live, &on(), &no_override(), &seen2, 30 * MIN);
+        let (n3, _) = decide(&live, &on(), &no_override(), &no_id(), &seen2, 30 * MIN);
         assert!(
             n3.is_empty(),
             "re-enabling must not resurrect a repeat notification for the same episode"
@@ -545,6 +618,7 @@ mod tests {
             &[waiting("a", "/p", 0, "interactive")],
             &on(),
             &no_override(),
+            &no_id(),
             &HashSet::new(),
             10 * MIN,
         );
@@ -556,6 +630,7 @@ mod tests {
             &[waiting("a", "/p", 15 * MIN, "interactive")],
             &on(),
             &no_override(),
+            &no_id(),
             &seen,
             26 * MIN,
         );
@@ -581,7 +656,14 @@ mod tests {
             waiting("a", "/p", 0, "interactive"),
             waiting("b", "/p", 5 * MIN, "interactive"),
         ];
-        let (n, seen) = decide(&live, &on(), &no_override(), &HashSet::new(), 10 * MIN);
+        let (n, seen) = decide(
+            &live,
+            &on(),
+            &no_override(),
+            &no_id(),
+            &HashSet::new(),
+            10 * MIN,
+        );
         // "a" has waited 10 minutes (over threshold), "b" has waited only 5 (under).
         assert_eq!(n.len(), 1, "only the session actually over threshold fires");
         assert_eq!(n[0].session_id, "a");
@@ -592,7 +674,7 @@ mod tests {
         );
 
         // Time passes; "b" now crosses its own threshold too, independently of "a".
-        let (n2, seen2) = decide(&live, &on(), &no_override(), &seen, 16 * MIN);
+        let (n2, seen2) = decide(&live, &on(), &no_override(), &no_id(), &seen, 16 * MIN);
         assert_eq!(
             n2.len(),
             1,
@@ -604,5 +686,52 @@ mod tests {
             2,
             "both episodes are now remembered, having each crossed their own threshold"
         );
+    }
+
+    // `project` is a directory name and two projects can share one. The id
+    // the caller resolves from the session's `cwd` is what a shell routes a
+    // click on, so it has to survive into the notification itself.
+    #[test]
+    fn a_notification_carries_the_project_id_its_cwd_resolves_to() {
+        let live = [
+            waiting("a", "/work/api", 0, "interactive"),
+            waiting("b", "/personal/api", 0, "interactive"),
+        ];
+        let ids = |cwd: &str| match cwd {
+            "/work/api" => Some(7),
+            "/personal/api" => Some(9),
+            _ => None,
+        };
+        let (n, _) = decide(
+            &live,
+            &on(),
+            &no_override(),
+            &ids,
+            &HashSet::new(),
+            60 * MIN,
+        );
+        let mut got: Vec<_> = n
+            .iter()
+            .map(|x| (x.session_id.as_str(), x.project_id, x.project.as_str()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![("a", Some(7), "api"), ("b", Some(9), "api")],
+            "both read \"api\"; only the id distinguishes them"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_cwd_carries_no_project_id_at_all() {
+        let (n, _) = decide(
+            &[waiting("a", "/p", 0, "interactive")],
+            &on(),
+            &no_override(),
+            &|_| None,
+            &HashSet::new(),
+            60 * MIN,
+        );
+        assert_eq!(n[0].project_id, None);
     }
 }
