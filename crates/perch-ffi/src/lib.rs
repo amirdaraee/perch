@@ -1189,16 +1189,28 @@ impl Perch {
     /// work never runs on the caller's thread (AppKit's main thread calls
     /// this from `applicationDidFinishLaunching`) — see `refresh()`.
     pub fn start(&self, listener: Arc<dyn PerchListener>) {
+        let loaded = settings::store::load(&self.config_path).settings;
+
+        // Checking "already running?" and claiming the slot are one critical
+        // section, the same way `refresh()` and `stop()` each decide inside a
+        // single `self.handle.lock()`. Released and retaken, two callers can
+        // both read `None` and both spawn a watcher — and only the second
+        // ends up in `handle`, so `stop()` can never reach the first.
+        //
+        // Nothing else is locked while this guard is held: `build_watcher`
+        // touches no other field of `self`, and the assignments below wait
+        // until it is dropped. `on_settings_file_changed` takes `listener`
+        // and *then* `handle`, so taking them the other way round here would
+        // be a lock-order inversion between this thread and that one.
         {
-            let guard = self.handle.lock().unwrap();
-            if guard.is_some() {
+            let mut handle = self.handle.lock().unwrap();
+            if handle.is_some() {
                 return;
             }
+            *handle = Some(self.build_watcher(listener.clone(), loaded.poll_seconds));
         }
-        let loaded = settings::store::load(&self.config_path).settings;
-        *self.last_settings.lock().unwrap() = loaded.clone();
-        *self.listener.lock().unwrap() = Some(listener.clone());
-        self.spawn_watcher(listener, loaded.poll_seconds);
+        *self.last_settings.lock().unwrap() = loaded;
+        *self.listener.lock().unwrap() = Some(listener);
 
         // `self_ref` upgraded only transiently, inside the callback, each
         // time it actually fires — never held onto — so this watch thread
@@ -1395,12 +1407,30 @@ impl Perch {
     }
 
     /// (Re)builds the session watcher against the current config dir and
-    /// poll interval, replacing whatever handle is already running (if any
-    /// — the caller is responsible for having stopped it first when this is
-    /// a restart rather than the initial `start()`). Emits once immediately
-    /// (`h.refresh()`) so a restart is never silently quiet until the next
-    /// tick.
+    /// poll interval, storing it as the running handle and replacing
+    /// whatever was there (if any — the caller is responsible for having
+    /// stopped it first when this is a restart rather than the initial
+    /// `start()`).
+    ///
+    /// Only for a restart, where the handle is taken and replaced in two
+    /// steps under a lock this does not hold. `start()` calls
+    /// `build_watcher` directly instead, because it must decide *and* claim
+    /// inside one critical section — see its own comment.
     fn spawn_watcher(&self, listener: Arc<dyn PerchListener>, poll_seconds: u32) {
+        *self.handle.lock().unwrap() = Some(self.build_watcher(listener, poll_seconds));
+    }
+
+    /// The watcher itself, built and started but not stored anywhere, so the
+    /// caller decides under which lock it becomes *the* running watcher.
+    /// Reads `config_dir` and nothing else of `self`'s locked state, which
+    /// is what makes it safe to call with `handle` held. Emits once
+    /// immediately (`h.refresh()`) so a start or restart is never silently
+    /// quiet until the next tick.
+    fn build_watcher(
+        &self,
+        listener: Arc<dyn PerchListener>,
+        poll_seconds: u32,
+    ) -> watcher::WatcherHandle {
         let me = self.this();
         let me_for_refresh = me.clone();
         let cfg = watcher::WatcherConfig::for_dir(
@@ -1414,7 +1444,7 @@ impl Perch {
             move || me_for_refresh.reindex(),
         );
         h.refresh();
-        *self.handle.lock().unwrap() = Some(h);
+        h
     }
 
     /// Called (debounced, trailing-edge, at least once per `config.toml`
@@ -1568,6 +1598,66 @@ mod tests {
     impl Drop for DataDirGuard<'_> {
         fn drop(&mut self) {
             std::env::remove_var("PERCH_DATA_DIR");
+        }
+    }
+
+    /// `start` is documented idempotent: "a second call while already
+    /// running is a no-op". Two threads arriving together must not both come
+    /// away believing they were the first — that leaves two watcher threads
+    /// polling the same directory, only one of which `handle` still names,
+    /// so `stop()` can never reach the other.
+    ///
+    /// Each thread brings its own listener, which is what makes the failure
+    /// visible rather than inferred: exactly one watcher exists iff at most
+    /// one of the two listeners is ever driven. Rounds, because the window
+    /// between the check and the claim is short and a single round can get
+    /// lucky — this is a race, so the test drives at it repeatedly rather
+    /// than pretending one attempt proves anything.
+    #[test]
+    fn two_threads_calling_start_at_once_only_ever_start_one_watcher() {
+        let data = tempfile::tempdir().unwrap();
+        let _env = DataDirGuard::set(data.path());
+        let tmp = tempfile::tempdir().unwrap();
+
+        for round in 0..12 {
+            let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
+            let a = Arc::new(Capture::default());
+            let b = Arc::new(Capture::default());
+            let gate = Arc::new(std::sync::Barrier::new(2));
+
+            let threads: Vec<_> = [a.clone(), b.clone()]
+                .into_iter()
+                .map(|cap| {
+                    let perch = perch.clone();
+                    let gate = gate.clone();
+                    std::thread::spawn(move || {
+                        gate.wait();
+                        perch.start(cap);
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().unwrap();
+            }
+
+            // Long enough for a spawned watcher's immediate emit to land.
+            std::thread::sleep(Duration::from_millis(200));
+            perch.stop();
+
+            let a_emits = a.models.lock().unwrap().len();
+            let b_emits = b.models.lock().unwrap().len();
+            assert!(
+                a_emits == 0 || b_emits == 0,
+                "round {round}: both listeners were driven, so both calls to \
+                 start() spawned a watcher (a={a_emits} emits, b={b_emits} emits) \
+                 — one of those watchers is now unreachable from `handle` and \
+                 stop() will never reach it"
+            );
+            assert!(
+                a_emits > 0 || b_emits > 0,
+                "round {round}: neither listener was driven — the test is not \
+                 observing a running watcher at all"
+            );
         }
     }
 
