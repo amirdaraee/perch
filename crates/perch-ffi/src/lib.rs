@@ -246,6 +246,12 @@ pub struct ProjectDetail {
     pub pinned: bool,
     pub archived: bool,
     pub path_exists: bool,
+    /// This project's own notification override — not the global setting.
+    pub notify: NotifyOverride,
+    /// What `NotifyOverride::Default` currently means, spelled out (see
+    /// `main_window::default_notify_label`) — always present, regardless of
+    /// `notify`'s own value.
+    pub notify_default_label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -405,6 +411,8 @@ impl From<main_window::ProjectDetail> for ProjectDetail {
             pinned,
             archived,
             path_exists,
+            notify,
+            notify_default_label,
         } = d;
         ProjectDetail {
             id,
@@ -416,6 +424,8 @@ impl From<main_window::ProjectDetail> for ProjectDetail {
             session_count,
             sparkline: sparkline.into_iter().map(Into::into).collect(),
             sessions: sessions.into_iter().map(Into::into).collect(),
+            notify: notify.into(),
+            notify_default_label,
             pinned,
             archived,
             path_exists,
@@ -670,9 +680,10 @@ impl From<core_ui_settings::SettingsModel> for SettingsModel {
 }
 
 /// Per-project override of the global notification setting (see
-/// `db::NotifyOverride`). Input-only today (`set_notify_override` is the
-/// only place it crosses the boundary), but still destructured on the way
-/// in for the same reason as every other conversion here.
+/// `db::NotifyOverride`). Crosses the boundary both ways: `set_notify_override`
+/// takes one as input, and `ProjectDetail.notify` reports a project's current
+/// one back — so, like `Settings`, it gets a `From` each way, both
+/// destructuring for the same reason as every other conversion here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum NotifyOverride {
     Default,
@@ -687,6 +698,18 @@ impl From<NotifyOverride> for db::NotifyOverride {
             NotifyOverride::Off => db::NotifyOverride::Off,
             NotifyOverride::Custom { after_minutes } => {
                 db::NotifyOverride::Custom { after_minutes }
+            }
+        }
+    }
+}
+
+impl From<db::NotifyOverride> for NotifyOverride {
+    fn from(o: db::NotifyOverride) -> Self {
+        match o {
+            db::NotifyOverride::Default => NotifyOverride::Default,
+            db::NotifyOverride::Off => NotifyOverride::Off,
+            db::NotifyOverride::Custom { after_minutes } => {
+                NotifyOverride::Custom { after_minutes }
             }
         }
     }
@@ -957,6 +980,14 @@ impl ThisPerch {
         let Ok(database) = db::open(&self.db_path) else {
             return HashMap::new();
         };
+        // One `project_meta` query per *project*, not per session (that's the
+        // shape the brief asked to avoid: an N+1 against live session count).
+        // This is still an N+1 against project count, run once per tick —
+        // a deliberate choice at today's scale, not an oversight: `Db` has no
+        // "every project's meta in one query" method yet, and adding one
+        // purely for this cache would be new surface for a cost that isn't
+        // showing up. Revisit if this is ever measured against hundreds of
+        // projects.
         query::project_summaries(&database)
             .unwrap_or_default()
             .into_iter()
@@ -1255,9 +1286,21 @@ impl Perch {
     fn detail(&self, database: &Db, project_id: i64) -> Result<ProjectDetail, PerchError> {
         let sessions =
             live::live_sessions(&config::sessions_dir(&self.config_dir), &RealProcessProbe);
-        main_window::build_project_detail(database, project_id, &sessions, now_ms())
-            .map(Into::into)
-            .map_err(db_err)
+        // `build_project_detail` needs the global `waiting_after_minutes` to
+        // compose `notify_default_label` (what "Default" currently means for
+        // this project) — `&Settings` rather than the bare minute count,
+        // matching `notify::decide`'s own calling convention elsewhere in
+        // this file, and self-documenting at this call site.
+        let loaded_settings = settings::store::load(&self.config_path).settings;
+        main_window::build_project_detail(
+            database,
+            project_id,
+            &sessions,
+            now_ms(),
+            &loaded_settings,
+        )
+        .map(Into::into)
+        .map_err(db_err)
     }
 }
 
@@ -1542,12 +1585,53 @@ mod tests {
             .set_notify_override(project_id, NotifyOverride::Custom { after_minutes: 45 })
             .unwrap();
         assert_eq!(detail.id, project_id);
+        assert_eq!(
+            detail.notify,
+            NotifyOverride::Custom { after_minutes: 45 },
+            "the refreshed detail must show the override it just wrote, not just accept it"
+        );
+        assert!(
+            detail.notify_default_label.contains("10 minutes"),
+            "a first run's global default (10 minutes) must still be reported \
+             even though this project itself is on Custom: {}",
+            detail.notify_default_label
+        );
 
         let database = db::open(&db_path).unwrap();
         assert_eq!(
             database.project_meta(project_id).unwrap().notify,
             db::NotifyOverride::Custom { after_minutes: 45 },
             "the override must actually persist, not just echo back in the reply"
+        );
+    }
+
+    #[test]
+    fn a_project_never_given_its_own_override_reports_default_and_the_current_global_label() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+
+        let db_path = data.path().join("index.db");
+        let project_id = {
+            let database = db::open(&db_path).unwrap();
+            database.upsert_project("slug", "/a/proj", false).unwrap()
+        };
+
+        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
+        let mut s = perch.settings().settings;
+        s.waiting_after_minutes = 25;
+        perch.save_settings(s).unwrap();
+
+        let detail = perch.project_detail(project_id).unwrap();
+        assert_eq!(
+            detail.notify,
+            NotifyOverride::Default,
+            "a project never given its own override reads as Default"
+        );
+        assert!(
+            detail.notify_default_label.contains("25 minutes"),
+            "the label must reflect the saved global setting, not a stale default: {}",
+            detail.notify_default_label
         );
     }
 
