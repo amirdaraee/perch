@@ -75,9 +75,12 @@ pub fn decide(
     let mut notifications = Vec::new();
     let mut remembered = HashSet::new();
 
-    if !settings.waiting_enabled {
-        return (notifications, remembered);
-    }
+    // Note: `settings.waiting_enabled` is checked per-episode below, *after* the
+    // already-fired check, rather than as an early return here. An early return
+    // would discard `already_notified` outright — so disabling the feature mid-block,
+    // then re-enabling it while the same episode is still continuously waiting,
+    // would forget it fired and notify again. Toggling the setting must only
+    // suppress new firings, never erase memory of episodes already notified.
 
     for session in live {
         let SessionStatus::Waiting { reason, since_ms } = &session.status else {
@@ -103,8 +106,15 @@ pub fn decide(
 
         if already_notified.contains(&episode) {
             // Already fired for this exact episode: keep remembering it, but
-            // don't fire again while it stays the same episode.
+            // don't fire again while it stays the same episode. This holds
+            // regardless of `waiting_enabled` — see the note above.
             remembered.insert(episode);
+            continue;
+        }
+
+        if !settings.waiting_enabled {
+            // Feature off and this episode has never fired: nothing to notify,
+            // nothing yet to remember either (only a fired episode is memory).
             continue;
         }
 
@@ -334,6 +344,81 @@ mod tests {
             m.body.contains("12m") || m.body.contains("12"),
             "how long, already formatted: {}",
             m.body
+        );
+    }
+
+    // Beyond the brief (review round 1, item 1): disabling the feature mid-block
+    // must only suppress new firings, not erase memory of episodes already fired
+    // for. Otherwise: fire while enabled -> disable -> re-enable while the *same*
+    // episode is still continuously waiting -> it fires again, which is exactly
+    // the repeat notification this module exists to prevent.
+    #[test]
+    fn disabling_and_re_enabling_mid_episode_does_not_refire() {
+        let live = [waiting("a", "/p", 0, "interactive")];
+
+        // Fires once while enabled.
+        let (n, seen) = decide(&live, &on(), &no_override(), &HashSet::new(), 10 * MIN);
+        assert_eq!(n.len(), 1);
+
+        // Disabled, session still blocked in the same episode: no firing, and the
+        // memory of the already-fired episode must survive the disabled call.
+        let off = Settings {
+            waiting_enabled: false,
+            ..Default::default()
+        };
+        let (n2, seen2) = decide(&live, &off, &no_override(), &seen, 20 * MIN);
+        assert!(n2.is_empty(), "disabled: nothing fires");
+        assert_eq!(
+            seen2, seen,
+            "disabling must not discard memory of an already-fired episode"
+        );
+
+        // Re-enabled, same episode still blocked: must not fire again.
+        let (n3, _) = decide(&live, &on(), &no_override(), &seen2, 30 * MIN);
+        assert!(
+            n3.is_empty(),
+            "re-enabling must not resurrect a repeat notification for the same episode"
+        );
+    }
+
+    // Beyond the brief (review round 1, item 2): the episode key must be
+    // (session_id, since_ms), not session_id alone. Every other "new episode"
+    // test here has an intervening non-Waiting observation (Working, or the
+    // session vanishing) between the two blocks. This one has none: the session
+    // is reported Waiting on every single call, but Claude Code's own since_ms
+    // jumps forward between calls (a missed poll tick, or Perch restarting and
+    // re-attaching mid-block with a slightly different reading — either way, no
+    // Working/Idle/absent observation ever separates the two stretches). A
+    // session_id-only key would treat this as the same episode forever and
+    // never fire again; keying on since_ms catches the jump and fires.
+    #[test]
+    fn a_since_ms_jump_with_no_intervening_non_waiting_observation_is_a_new_episode() {
+        let (_, seen) = decide(
+            &[waiting("a", "/p", 0, "interactive")],
+            &on(),
+            &no_override(),
+            &HashSet::new(),
+            10 * MIN,
+        );
+        assert_eq!(seen.len(), 1);
+
+        // Still Waiting on every observation Perch makes, but since_ms jumped
+        // from 0 to 15 minutes with no non-waiting sample in between.
+        let (n, seen2) = decide(
+            &[waiting("a", "/p", 15 * MIN, "interactive")],
+            &on(),
+            &no_override(),
+            &seen,
+            26 * MIN,
+        );
+        assert_eq!(
+            n.len(),
+            1,
+            "a session_id-only key would have missed this: since_ms moved, so it's a new episode"
+        );
+        assert_ne!(
+            seen2, seen,
+            "the memory now tracks the new episode's since_ms, not the old one"
         );
     }
 
