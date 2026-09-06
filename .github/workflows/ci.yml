@@ -519,15 +519,21 @@ jobs:
 
           WRITE_APIS='\.write\(to:|FileManager\.default\.createDirectory|FileManager\.default\.removeItem|FileManager\.default\.createFile|FileManager\.default\.setAttributes|FileManager\.default\.moveItem|FileManager\.default\.copyItem|FileManager\.default\.trashItem|FileHandle\('
 
-          # A reference to the Claude Code directory itself — as an actual
-          # string literal or identifier a write could plausibly be aimed
-          # at, not the word "Claude" alone (which appears constantly in
-          # doc comments, e.g. "Nothing in Swift reads Claude Code's
-          # files"). Requiring a quote before ".claude" is what excludes
+          # A reference to the Claude Code directory itself — either Swift
+          # constructing a path into it (a string literal containing
+          # ".claude"), or Swift reading CLAUDE_CONFIG_DIR directly (which
+          # would bypass Rust's documented resolution precedence). Not the
+          # word "Claude" alone (which appears constantly in doc comments,
+          # e.g. "Nothing in Swift reads Claude Code's files"), and
+          # deliberately NOT bare camelCase identifiers like
+          # claudeConfigDir/claudeDirDraft/chooseClaudeDir — that is
+          # vocabulary the settings UI (which lets the user point Perch at
+          # their Claude Code directory, entirely through Rust) is allowed
+          # to use. Requiring a quote before ".claude" is what excludes
           # Launcher.swift's own doc comments ("the read-only promise about
           # `~/.claude`", written in backticks, not a Swift string) while
           # still catching a real `"~/.claude"` or `"$HOME/.claude"` literal.
-          CLAUDE_DIR_REF='"[^"]*\.claude|claudeConfig|ClaudeConfig|claudeDir|ClaudeDir|CLAUDE_CONFIG_DIR'
+          CLAUDE_DIR_REF='"[^"]*\.claude|CLAUDE_CONFIG_DIR'
 
           # -H forces the filename prefix even when only one file matches
           # (grep omits it for a single-file argument list otherwise) — the
@@ -551,6 +557,16 @@ jobs:
           printf 'let dir = base.appendingPathComponent("~/.claude")\n' > /tmp/swift-claudedir-selftest.swift
           if ! grep -qE "$CLAUDE_DIR_REF" /tmp/swift-claudedir-selftest.swift; then
             echo "::error::Guard self-test failed: the Claude-directory pattern no longer detects a known offender."
+            exit 1
+          fi
+          # And a bare camelCase identifier — the settings UI's own
+          # vocabulary for the "which directory is Claude Code's" concept,
+          # with no string literal and no env var read — must NOT trip the
+          # pattern, or this guard would be blind exactly where a real
+          # violation is now most likely to appear.
+          printf 'private var claudeConfigDir: String { claudeDirDraft }\n' > /tmp/swift-claudedir-negative-selftest.swift
+          if grep -qE "$CLAUDE_DIR_REF" /tmp/swift-claudedir-negative-selftest.swift; then
+            echo "::error::Guard self-test failed: the Claude-directory pattern now matches a bare identifier, not just path/env-var access."
             exit 1
           fi
           # And the real doc comments in Launcher.swift (which mention
