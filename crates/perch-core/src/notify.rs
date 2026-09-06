@@ -75,29 +75,32 @@ pub fn decide(
     let mut notifications = Vec::new();
     let mut remembered = HashSet::new();
 
-    // Note: both `settings.waiting_enabled` and a project's `NotifyOverride::Off`
-    // are checked per-episode below, *after* the already-fired check, rather than
-    // as an early return / short-circuit. Either gate discarding `already_notified`
-    // outright would mean: an episode fires, the user mutes it (globally, or by
-    // setting that one project to Off), then unmutes it while the same episode is
-    // still continuously waiting — and it fires again. Muting must only suppress
-    // *new* firings, never erase memory of an episode already notified for.
+    // General rule, and the reason for the ordering below: any exclusion that
+    // depends on a MUTABLE SETTING (`waiting_enabled`, a project's `Off`
+    // override, `include_background`) must sit *after* the already-notified
+    // check, never before it as an early return or short-circuit. Toggling a
+    // setting must only ever suppress *new* firings — it must never erase the
+    // record of an alert already delivered, or the user can flip a switch off
+    // and back on and get a repeat notification for a block that never ended.
     //
-    // Symmetrically, an episode that has genuinely never fired must NOT enter
-    // memory while muted — so unmuting later still delivers an alert that was
-    // never actually sent. That's why both gates `continue` without touching
-    // `remembered` when reached (i.e. only for an episode not already notified).
+    // Only an exclusion that depends on an IMMUTABLE FACT about the session —
+    // its `status` not being `Waiting` — may short-circuit before that check,
+    // because a session that is not waiting genuinely has no episode to carry
+    // forward; there is nothing being suppressed, only something that ended.
+    //
+    // Symmetrically, every mutable-setting exclusion below must `continue`
+    // without inserting into `remembered` when it excludes an episode that
+    // has never fired — so re-enabling that setting later still finds a
+    // genuinely un-notified episode and delivers the alert, rather than
+    // treating "excluded" as equivalent to "already handled."
 
     for session in live {
         let SessionStatus::Waiting { reason, since_ms } = &session.status else {
-            // Not waiting (working, idle, ended...): any episode we had for this
+            // Not waiting (working, idle, ended...): an immutable fact about
+            // this observation, not a setting. Any episode we had for this
             // session is over. Nothing carried forward for it.
             continue;
         };
-
-        if session.kind == "bg" && !settings.include_background {
-            continue;
-        }
 
         let episode = Episode {
             session_id: session.session_id.clone(),
@@ -107,8 +110,8 @@ pub fn decide(
         if already_notified.contains(&episode) {
             // Already fired for this exact episode: keep remembering it, but
             // don't fire again while it stays the same episode. This holds
-            // regardless of `waiting_enabled` or a project's `Off` override —
-            // see the note above.
+            // regardless of any of the mutable-setting exclusions below — see
+            // the general rule above.
             remembered.insert(episode);
             continue;
         }
@@ -119,11 +122,19 @@ pub fn decide(
             continue;
         }
 
+        if session.kind == "bg" && !settings.include_background {
+            // Excluded by a mutable setting and this episode has never fired:
+            // same shape as the disabled case above — no notification, and
+            // nothing enters memory, so turning `include_background` on later
+            // can still deliver it.
+            continue;
+        }
+
         let Some(threshold_ms) = effective_threshold_ms(settings, override_for(&session.cwd))
         else {
-            // `Off` and this episode has never fired: same as the disabled case
-            // above — no notification, and nothing enters memory, so switching
-            // the project back to Default later can still deliver it.
+            // `Off` and this episode has never fired: same as above — no
+            // notification, and nothing enters memory, so switching the
+            // project back to Default later can still deliver it.
             continue;
         };
 
@@ -295,6 +306,74 @@ mod tests {
         };
         let (n, _) = decide(&bg, &s, &no_override(), &HashSet::new(), 60 * MIN);
         assert_eq!(n.len(), 1, "unless you say otherwise");
+    }
+
+    // Beyond the brief (review round 3, item 1): `include_background` is a live
+    // user setting, same as `waiting_enabled` and a project's `Off` override —
+    // the third instance of the same bug. Fire with it on, turn it off (memory
+    // must survive), turn it back on with the same session still blocked in the
+    // same episode: must not fire again.
+    #[test]
+    fn toggling_include_background_off_and_on_mid_episode_does_not_refire() {
+        let bg = [waiting("a", "/p", 0, "bg")];
+        let with_bg = Settings {
+            include_background: true,
+            ..on()
+        };
+
+        // Fires once with include_background on.
+        let (n, seen) = decide(&bg, &with_bg, &no_override(), &HashSet::new(), 10 * MIN);
+        assert_eq!(n.len(), 1);
+
+        // Turned off, session still blocked in the same episode: no firing, and
+        // the memory of the already-fired episode must survive.
+        let (n2, seen2) = decide(&bg, &on(), &no_override(), &seen, 20 * MIN);
+        assert!(n2.is_empty(), "include_background off: nothing fires");
+        assert_eq!(
+            seen2, seen,
+            "toggling include_background off must not discard memory of an already-fired episode"
+        );
+
+        // Turned back on, same episode still blocked: must not fire again.
+        let (n3, _) = decide(&bg, &with_bg, &no_override(), &seen2, 30 * MIN);
+        assert!(
+            n3.is_empty(),
+            "toggling include_background back on must not resurrect a repeat notification"
+        );
+    }
+
+    // Beyond the brief (review round 3, item 2): symmetrically, a bg session
+    // blocked past the threshold while include_background is off, having never
+    // fired, must not enter memory — so turning include_background on later
+    // still delivers that genuinely un-notified alert.
+    #[test]
+    fn enabling_include_background_still_delivers_an_alert_that_was_never_sent() {
+        let bg = [waiting("a", "/p", 0, "bg")];
+
+        // Excluded the whole time, well past what the threshold would be: never
+        // fires, and never enters memory either.
+        let (n, seen) = decide(&bg, &on(), &no_override(), &HashSet::new(), 60 * MIN);
+        assert!(
+            n.is_empty(),
+            "excluded: never fires, no matter how long it's waited"
+        );
+        assert!(
+            seen.is_empty(),
+            "excluded: nothing enters memory while excluded"
+        );
+
+        // include_background turned on, same session still blocked past the
+        // threshold: a genuinely un-notified episode, must fire.
+        let with_bg = Settings {
+            include_background: true,
+            ..on()
+        };
+        let (n2, _) = decide(&bg, &with_bg, &no_override(), &seen, 70 * MIN);
+        assert_eq!(
+            n2.len(),
+            1,
+            "enabling include_background must not silently swallow an alert that was never sent"
+        );
     }
 
     #[test]
