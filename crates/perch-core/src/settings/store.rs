@@ -464,17 +464,20 @@ fn try_watch(
     }
 }
 
+/// Shared by every `perch-core` test that touches a process-global env var
+/// (`PERCH_CONFIG`, `PERCH_DATA_DIR` here; `CLAUDE_CONFIG_DIR`,
+/// `XDG_CONFIG_HOME`, `HOME` in `ui::diagnostics`) -- `cargo test` runs a
+/// crate's tests in parallel threads within one process, so any two such
+/// tests race, genuinely, not just in theory, unless they take this lock
+/// first. One lock for the whole crate, not one per module, so a test here
+/// and a test in `ui::diagnostics` can't race past each other either.
+/// `perch-ffi` guards its own `PERCH_DATA_DIR` tests the same way.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// `PERCH_CONFIG` and `PERCH_DATA_DIR` are process-global, and `cargo
-    /// test` runs a crate's tests in parallel threads within one process --
-    /// so any two tests here that touch either var race, genuinely, not just
-    /// in theory. `perch-ffi` guards its own `PERCH_DATA_DIR` tests the same
-    /// way. Every test below that sets either var takes this lock first.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn a_missing_file_loads_defaults_without_an_error() {
