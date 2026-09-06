@@ -31,7 +31,15 @@ final class MainWindowController: NSObject, NSWindowDelegate {
 
     /// Read by `SettingsWindowController` (via `AppDelegate`) so *it* knows
     /// not to drop the activation policy while this window is still open.
-    var isWindowOpen: Bool { window?.isVisible ?? false }
+    /// `isVisible` alone is false for a *miniaturized* window, which is
+    /// still very much open: minimize this one, close the other, and the app
+    /// would drop to `.accessory` — leaving a window in the Dock with no Dock
+    /// icon or Cmd-Tab entry left to restore it by, exactly what the guard
+    /// this feeds exists to prevent.
+    var isWindowOpen: Bool {
+        guard let window else { return false }
+        return window.isVisible || window.isMiniaturized
+    }
 
     /// `selectingProjectId` is a clicked "waiting on you" notification's
     /// `WaitingNotification.projectId` — the unique id of the project the
