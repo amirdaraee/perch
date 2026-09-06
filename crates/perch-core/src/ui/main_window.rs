@@ -79,6 +79,14 @@ pub struct ProjectDetail {
     /// assembled from a raw number in a shell, for the same reason every
     /// other string on this struct is finished in Rust.
     pub notify_default_label: String,
+    /// The same global threshold `notify_default_label` spells out, as the
+    /// number itself: the value a shell's "Custom" minute control starts at
+    /// before the user has chosen one. It exists so that seeding is a read
+    /// of this field rather than a literal in the shell (which drifts the
+    /// moment the default moves) or a parse of the label above (which is
+    /// prose, and not a data format). The two are always composed from the
+    /// same value and can never disagree.
+    pub notify_default_minutes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -325,6 +333,7 @@ pub fn build_project_detail(
         archived: meta.archived,
         notify: meta.notify,
         notify_default_label: default_notify_label(settings.waiting_after_minutes),
+        notify_default_minutes: settings.waiting_after_minutes,
     })
 }
 
@@ -735,6 +744,42 @@ mod tests {
             d.notify_default_label.contains("10 minutes"),
             "notify_default_label always reflects the *global* setting, \
              regardless of this project's own override: {}",
+            d.notify_default_label
+        );
+    }
+
+    // The label is for reading, not for parsing. A shell seeding a minute
+    // control needs the number itself, and it must be the same number the
+    // label was composed from — not a literal of the shell's own.
+    #[test]
+    fn the_default_threshold_is_carried_as_a_number_beside_its_label() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let pid = project_with_session(&db, "-a-p", "/a/proj", "s1", 100 * DAY, 1);
+        db.set_notify_override(pid, &NotifyOverride::Off).unwrap();
+        let settings = Settings {
+            waiting_after_minutes: 25,
+            ..Settings::default()
+        };
+
+        let d = build_project_detail(&db, pid, &[], 100 * DAY, &settings).unwrap();
+        assert_eq!(
+            d.notify_default_minutes, 25,
+            "the number behind notify_default_label, present whatever this \
+             project's own override is"
+        );
+
+        // Move the global setting: the number must move with it, or a shell
+        // seeded from it drifts exactly the way a hardcoded literal does.
+        let settings = Settings {
+            waiting_after_minutes: 7,
+            ..Settings::default()
+        };
+        let d = build_project_detail(&db, pid, &[], 100 * DAY, &settings).unwrap();
+        assert_eq!(d.notify_default_minutes, 7);
+        assert!(
+            d.notify_default_label.contains("7 minutes"),
+            "the number and the label must never disagree: {}",
             d.notify_default_label
         );
     }
