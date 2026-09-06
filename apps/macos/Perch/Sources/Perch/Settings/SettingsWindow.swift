@@ -32,7 +32,15 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     /// Read by `MainWindowController` (via `AppDelegate`) for the same reason
     /// in reverse.
-    var isWindowOpen: Bool { window?.isVisible ?? false }
+    /// `isVisible` alone is false for a *miniaturized* window, which is
+    /// still very much open: minimize this one, close the other, and the app
+    /// would drop to `.accessory` — leaving a window in the Dock with no Dock
+    /// icon or Cmd-Tab entry left to restore it by, exactly what the guard
+    /// this feeds exists to prevent.
+    var isWindowOpen: Bool {
+        guard let window else { return false }
+        return window.isVisible || window.isMiniaturized
+    }
 
     func show() {
         refreshToken += 1
