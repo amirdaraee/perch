@@ -54,14 +54,25 @@ pub struct DiagnosticsModel {
 /// record — not a debug label. Every branch names the pid; `NotClaude` also
 /// names what the process actually is, because "not claude" alone leaves the
 /// reader no wiser about what they're looking at.
-fn verdict_label(pid: i32, verdict: &RecordVerdict) -> String {
+///
+/// `unreadable` distinguishes the two ways a record can end up `Unparsable`:
+/// the file itself could not be opened (permissions, or it vanished between
+/// listing and reading), versus a file that opened fine but whose content
+/// is not JSON `parse_session_record` understands. These point a confused
+/// user at two different problems — a filesystem issue versus a corrupt or
+/// unexpected record — so collapsing them into one message would send them
+/// to debug the wrong one.
+fn verdict_label(pid: i32, verdict: &RecordVerdict, unreadable: bool) -> String {
     match verdict {
         RecordVerdict::Accepted => format!("showing: pid {pid} is running claude"),
         RecordVerdict::NoSuchProcess => format!("ignored: pid {pid} is not running"),
         RecordVerdict::NotClaude { actual } => {
             format!("ignored: pid {pid} is `{actual}`, not `claude`")
         }
-        RecordVerdict::Unparsable => "ignored: this record could not be parsed".to_string(),
+        RecordVerdict::Unparsable if unreadable => {
+            "ignored: this record could not be read".to_string()
+        }
+        RecordVerdict::Unparsable => "ignored: this record's JSON could not be parsed".to_string(),
     }
 }
 
@@ -105,21 +116,31 @@ fn count_or_dash(count: anyhow::Result<i64>) -> String {
 }
 
 /// Build one row per session record file, explaining `live::decide_record`'s
-/// verdict for it. A record that fails to even read from disk is reported
-/// the same way as one whose JSON doesn't parse — either way there is
-/// nothing to show but that it was ignored.
+/// verdict for it. A record that fails to even be read from disk gets its
+/// own `unreadable` label rather than being folded into "could not be
+/// parsed" — see [`verdict_label`] for why that distinction matters.
 fn record_row(path: &std::path::Path, probe: &dyn ProcessProbe) -> RecordRow {
     let file = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string());
 
-    let decision = match std::fs::read_to_string(path) {
-        Ok(text) => live::decide_record(&text, probe),
-        Err(_) => RecordDecision::Unparsable,
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(_) => {
+            let verdict = RecordVerdict::Unparsable;
+            let verdict_label = verdict_label(0, &verdict, true);
+            return RecordRow {
+                file,
+                pid: 0,
+                session_id: String::new(),
+                verdict,
+                verdict_label,
+            };
+        }
     };
 
-    let (pid, session_id, verdict) = match decision {
+    let (pid, session_id, verdict) = match live::decide_record(&text, probe) {
         RecordDecision::Accepted(session) => {
             (session.pid, session.session_id, RecordVerdict::Accepted)
         }
@@ -131,13 +152,14 @@ fn record_row(path: &std::path::Path, probe: &dyn ProcessProbe) -> RecordRow {
             session_id,
             actual,
         } => (pid, session_id, RecordVerdict::NotClaude { actual }),
-        // Nothing parsed, so there is no pid or session id to report —
-        // 0 / "" here mirror the same absent-numeric/absent-string sentinels
-        // `parse_session_record`'s own helpers already use.
+        // The file read fine but its JSON didn't parse, so there is no pid
+        // or session id to report — 0 / "" here mirror the same
+        // absent-numeric/absent-string sentinels `parse_session_record`'s
+        // own helpers already use.
         RecordDecision::Unparsable => (0, String::new(), RecordVerdict::Unparsable),
     };
 
-    let verdict_label = verdict_label(pid, &verdict);
+    let verdict_label = verdict_label(pid, &verdict, false);
     RecordRow {
         file,
         pid,
@@ -346,7 +368,43 @@ mod tests {
         assert_eq!(row.pid, 0);
         assert_eq!(row.session_id, "");
         assert!(row.verdict_label.contains("ignored"));
+        assert!(
+            row.verdict_label.contains("parsed"),
+            "a malformed record must say *parsed*, not *read*: {}",
+            row.verdict_label
+        );
+        assert!(!row.verdict_label.contains("could not be read"));
         assert_eq!(row.file, "9999.json");
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_read_is_distinguished_from_one_that_wont_parse() {
+        // `record_files` only ever returns paths that were a regular file at
+        // listing time, so the only realistic way `record_row`'s own read
+        // fails is a race (the file vanishes or a permission changes between
+        // listing and reading) -- not reproducible deterministically without
+        // `chmod`, which a root-equivalent test runner can bypass anyway (see
+        // `settings::store`'s own note on this). A directory standing in for
+        // the file's path makes `read_to_string` fail the exact same way
+        // (an I/O error, not a parse error) without either problem, so this
+        // calls `record_row` directly rather than going through
+        // `build_diagnostics` and `record_files`.
+        let tmp = tempfile::tempdir().unwrap();
+        let unreadable = tmp.path().join("4824.json");
+        std::fs::create_dir(&unreadable).unwrap();
+        let probe = FakeProbe::new(&[]);
+
+        let row = record_row(&unreadable, &probe);
+
+        assert_eq!(row.verdict, RecordVerdict::Unparsable);
+        assert_eq!(row.pid, 0);
+        assert_eq!(row.session_id, "");
+        assert!(
+            row.verdict_label.contains("could not be read"),
+            "an I/O failure must say *read*, not *parsed*: {}",
+            row.verdict_label
+        );
+        assert!(!row.verdict_label.contains("parsed"));
     }
 
     #[test]
@@ -502,5 +560,93 @@ mod tests {
         let model = diagnostics_for(&sessions_dir, &probe, &settings_path);
 
         assert_eq!(model.config_dir_source, "setting");
+    }
+
+    // The three tests below are the only ones in this module that touch the
+    // real process environment, so — like `settings::store`'s own
+    // `PERCH_CONFIG`/`PERCH_DATA_DIR` tests — they take `ENV_LOCK` first:
+    // `cargo test` runs a crate's tests in parallel threads within one
+    // process, and any two tests mutating `CLAUDE_CONFIG_DIR` or
+    // `XDG_CONFIG_HOME` concurrently would race for real, not just in
+    // theory. Reusing the crate-wide lock (rather than a second one here)
+    // means a test in `settings::store` and a test here can't race past
+    // each other either. Each restores whatever was there before it, so a
+    // developer's own shell environment isn't left altered.
+    use crate::settings::store::ENV_LOCK;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        prior: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prior = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prior }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let prior = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn build_diagnostics_reports_claude_config_dir_when_the_env_var_is_set() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _claude = EnvVarGuard::set("CLAUDE_CONFIG_DIR", "/env/claude");
+        let _xdg = EnvVarGuard::unset("XDG_CONFIG_HOME");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = sessions_dir_under(&tmp);
+        let probe = FakeProbe::new(&[]);
+        let settings_path = tmp.path().join("config.toml"); // no override
+
+        let model = diagnostics_for(&sessions_dir, &probe, &settings_path);
+
+        assert_eq!(model.config_dir_source, "CLAUDE_CONFIG_DIR");
+    }
+
+    #[test]
+    fn build_diagnostics_reports_xdg_when_only_it_is_set() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _claude = EnvVarGuard::unset("CLAUDE_CONFIG_DIR");
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", "/env/xdg");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = sessions_dir_under(&tmp);
+        let probe = FakeProbe::new(&[]);
+        let settings_path = tmp.path().join("config.toml"); // no override
+
+        let model = diagnostics_for(&sessions_dir, &probe, &settings_path);
+
+        assert_eq!(model.config_dir_source, "XDG");
+    }
+
+    #[test]
+    fn build_diagnostics_reports_default_when_neither_env_var_is_set() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _claude = EnvVarGuard::unset("CLAUDE_CONFIG_DIR");
+        let _xdg = EnvVarGuard::unset("XDG_CONFIG_HOME");
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = sessions_dir_under(&tmp);
+        let probe = FakeProbe::new(&[]);
+        let settings_path = tmp.path().join("config.toml"); // no override
+
+        let model = diagnostics_for(&sessions_dir, &probe, &settings_path);
+
+        assert_eq!(model.config_dir_source, "default");
     }
 }
