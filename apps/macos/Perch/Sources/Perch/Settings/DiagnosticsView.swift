@@ -11,6 +11,12 @@ import PerchFFI
 /// fields alongside it.
 struct DiagnosticsView: View {
     let engine: PerchEngine
+    /// Bumped by `SettingsWindowController.show()` each time the settings
+    /// window is (re)presented. Without keying `.task` on this, reopening
+    /// the window after visiting this tab once would keep showing whatever
+    /// snapshot was current the first time — exactly wrong for the one pane
+    /// whose job is answering "why isn't my session showing up *right now*?"
+    let refreshToken: Int
 
     @State private var model: DiagnosticsModel?
     @State private var loadError: String?
@@ -28,7 +34,7 @@ struct DiagnosticsView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .task { await load() }
+        .task(id: refreshToken) { await load() }
     }
 
     @ViewBuilder
