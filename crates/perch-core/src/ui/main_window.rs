@@ -122,6 +122,15 @@ fn default_notify_label(waiting_after_minutes: u32) -> String {
     )
 }
 
+/// The `NotifyOverride::Custom` counterpart to `default_notify_label`, for the
+/// value a shell's stepper is *currently* showing rather than one already
+/// stored. It exists so that number is pluralized here and not in the shell:
+/// the sibling above is only reached for a persisted setting, which left the
+/// live stepper as the one place a UI still had to compose a sentence itself.
+pub fn custom_notify_label(minutes: u32) -> String {
+    format!("After {}", plural(i64::from(minutes), "minute", "minutes"))
+}
+
 /// `elapsed_or_dash` already treats a non-positive timestamp as absent; this
 /// just extends that to the `Option` these queries actually return, rather
 /// than re-deciding what "absent" means a second time.
@@ -782,5 +791,20 @@ mod tests {
             "the number and the label must never disagree: {}",
             d.notify_default_label
         );
+    }
+}
+
+#[cfg(test)]
+mod custom_notify_label_tests {
+    use super::custom_notify_label;
+
+    #[test]
+    fn a_single_minute_is_not_pluralized() {
+        assert_eq!(custom_notify_label(1), "After 1 minute");
+    }
+
+    #[test]
+    fn more_than_one_minute_is_pluralized() {
+        assert_eq!(custom_notify_label(25), "After 25 minutes");
     }
 }

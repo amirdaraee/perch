@@ -217,7 +217,7 @@ struct ProjectDetailPane: View {
             }
 
             Stepper(value: customMinutesBinding(detail), in: 1...240) {
-                Text("After \(customMinutesBinding(detail).wrappedValue) minutes")
+                Text(customNotifyLabel(minutes: customMinutesBinding(detail).wrappedValue))
             }
             .disabled(notifyMode != .custom)
         }
