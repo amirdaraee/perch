@@ -84,7 +84,20 @@ fn defaults_loaded(error: Option<String>) -> Loaded {
 pub fn load(path: &Path) -> Loaded {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(_) => return defaults_loaded(None),
+        // Absence is the one kind of trouble this function stays silent
+        // about -- a first run has no settings file, and that is not an
+        // error. Anything else that stops the file from being read (wrong
+        // permissions, a directory sitting where the file should be, ...)
+        // must say so instead of taking the identical silent path: a user
+        // whose hand-edits quietly stopped taking effect deserves to know
+        // why, exactly like a parse failure below.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return defaults_loaded(None),
+        Err(e) => {
+            return defaults_loaded(Some(format!(
+                "{}: could not read settings ({e}); using defaults",
+                path.display()
+            )))
+        }
     };
 
     let mut doc: DocumentMut = match text.parse() {
@@ -150,6 +163,15 @@ pub fn load(path: &Path) -> Loaded {
 /// function exists anyway so the day a second version is introduced, adding
 /// its one-shot upgrade is not a special case needing its own plumbing: it
 /// goes here, exactly as `db::migrate`'s v1 -> v2 step does for the database.
+///
+/// Ordering assumption a future upgrade step must preserve: this runs on
+/// `doc` *before* `load` deserializes it into `Settings` via
+/// `toml_edit::de::from_str`. Whatever an upgrade rewrites, it must leave
+/// behind a document that deserialization can still parse into `Settings`
+/// (every key present or defaultable, every value the expected type) --
+/// otherwise a migrated file fails the *next* line down as if it were
+/// simply malformed, which is indistinguishable to the user from the
+/// migration never having run at all.
 fn migrate(_doc: &mut DocumentMut, existing_version: i64) {
     if existing_version < SETTINGS_VERSION {
         // No upgrade steps yet.
@@ -477,6 +499,29 @@ mod tests {
             .expect("a hand-edited file that did not parse must say so");
         assert!(
             err.contains("config.toml") || err.contains("parse"),
+            "actionable: {err}"
+        );
+    }
+
+    #[test]
+    fn a_file_that_exists_but_cannot_be_read_yields_defaults_and_says_so() {
+        // `chmod 000` is not a portable way to trigger a read failure in a
+        // test environment (a root-equivalent test runner can read it
+        // anyway), so this uses an equally valid trigger the brief allows:
+        // a directory sitting where the settings file is expected.
+        // `fs::read_to_string` on a directory fails with a kind other than
+        // `NotFound` -- exactly the "present but unreadable" case that must
+        // not be confused with a first run.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("config.toml");
+        std::fs::create_dir(&p).unwrap();
+        let l = load(&p);
+        assert_eq!(l.settings.poll_seconds, 5, "the app still runs");
+        let err = l.error.expect(
+            "present but unreadable must not be silent like a missing file — it must say so",
+        );
+        assert!(
+            err.contains("config.toml") || err.contains("read"),
             "actionable: {err}"
         );
     }
