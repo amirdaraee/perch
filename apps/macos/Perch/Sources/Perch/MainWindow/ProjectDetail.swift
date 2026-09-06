@@ -42,18 +42,23 @@ struct ProjectDetailPane: View {
         case .default, .none: return .default
         }
     }
-    /// Fallback source for the stepper while `notifyMode != .custom`: an
-    /// arbitrary UI seed (not sourced from Rust — noted as a follow-up, not
-    /// fixed in this pass), overwritten only by `seedCustomMinutes` (a fresh
+    /// Fallback source for the stepper while `notifyMode != .custom`, and
+    /// `nil` until there is one: written only by `seedCustomMinutes` (a fresh
     /// `.custom` override from the server) or by dialing the stepper itself.
-    /// `customMinutesBinding.get` prefers `detail`'s own value whenever the
+    /// While it is `nil`, `customMinutesBinding` reads the *global* default's
+    /// own minute count out of `ProjectDetail.notifyDefaultMinutes` — the
+    /// number behind the "Default — waits N minutes" label shown right beside
+    /// this control. The seed is a product decision, so it comes from Rust
+    /// like every other one; a literal here would silently drift the moment
+    /// the Rust default moved.
+    ///
+    /// `customMinutesBinding` prefers `detail`'s own value whenever the
     /// override truly is `.custom` — that's what makes a stepper edit that
     /// fails snap back to the last *persisted* number instead of keeping the
     /// optimistic one — and only falls back to this field when `detail`
     /// doesn't carry a custom value at all, which is what keeps a dialed-in
-    /// number alive across a Default/Off detour (see judgement call in the
-    /// task report).
-    @State private var customMinutes: UInt32 = 25
+    /// number alive across a Default/Off detour.
+    @State private var customMinutes: UInt32?
 
     var body: some View {
         Group {
@@ -193,7 +198,7 @@ struct ProjectDetailPane: View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Notifications").font(.caption2).foregroundStyle(.secondary).textCase(.uppercase)
 
-            Picker("Notifications", selection: notifyModeBinding) {
+            Picker("Notifications", selection: notifyModeBinding(detail)) {
                 Text("Default").tag(NotifyMode.default)
                 Text("Custom").tag(NotifyMode.custom)
                 Text("Off").tag(NotifyMode.off)
@@ -211,8 +216,8 @@ struct ProjectDetailPane: View {
                     .foregroundStyle(.secondary)
             }
 
-            Stepper(value: customMinutesBinding, in: 1...240) {
-                Text("After \(customMinutes) minutes")
+            Stepper(value: customMinutesBinding(detail), in: 1...240) {
+                Text("After \(customMinutesBinding(detail).wrappedValue) minutes")
             }
             .disabled(notifyMode != .custom)
         }
@@ -316,18 +321,30 @@ struct ProjectDetailPane: View {
         )
     }
 
-    private var notifyModeBinding: Binding<NotifyMode> {
+    /// Takes `detail` rather than reading the optional `@State` one, because
+    /// switching to Custom has to send a number and the number it sends is
+    /// whatever the stepper is showing — which, before the user has dialled
+    /// anything, is the global default carried on `detail` itself.
+    private func notifyModeBinding(_ detail: ProjectDetail) -> Binding<NotifyMode> {
         Binding(
             // No optimistic assignment here — `notifyMode` reads straight
             // from `detail`, so a `setNotifyOverride` that throws leaves the
             // picker showing exactly what it showed before the tap, same as
             // `pinnedBinding`/`archivedBinding`.
             get: { notifyMode },
-            set: { newMode in Task { await setNotify(mode: newMode, minutes: customMinutes) } }
+            set: { newMode in
+                let minutes = customMinutesBinding(detail).wrappedValue
+                Task { await setNotify(mode: newMode, minutes: minutes) }
+            }
         )
     }
 
-    private var customMinutesBinding: Binding<UInt32> {
+    /// Also takes `detail`, so the un-dialled seed has a definite source:
+    /// `notifyDefaultMinutes`, the global threshold Rust composed the
+    /// neighbouring "Default — waits N minutes" label from. Nothing here
+    /// invents a starting number, and nothing parses that label to recover
+    /// one.
+    private func customMinutesBinding(_ detail: ProjectDetail) -> Binding<UInt32> {
         Binding(
             get: {
                 // Prefer `detail`'s own number whenever the override truly is
@@ -336,9 +353,10 @@ struct ProjectDetailPane: View {
                 // keeping the optimistic one. Only outside `.custom` (where
                 // `detail` has no minutes to read) does this fall back to the
                 // locally-tracked seed, which is what keeps a dialed-in
-                // number alive across a Default/Off detour.
-                if case .custom(let afterMinutes) = detail?.notify { return afterMinutes }
-                return customMinutes
+                // number alive across a Default/Off detour — and, before
+                // anything has been dialled, to the global default.
+                if case .custom(let afterMinutes) = detail.notify { return afterMinutes }
+                return customMinutes ?? detail.notifyDefaultMinutes
             },
             set: { newValue in
                 customMinutes = newValue
