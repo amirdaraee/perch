@@ -447,6 +447,16 @@ impl Db {
             .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))?)
     }
 
+    /// The most recent turn timestamp anywhere in the index, or `None` when
+    /// nothing has been indexed yet. `ui::diagnostics` uses this as its one
+    /// freshness signal ("last_indexed") rather than a wall-clock time of
+    /// when a scan last ran, which nothing in this schema records.
+    pub fn last_turn_ts(&self) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT MAX(ts) FROM turns", [], |r| r.get(0))?)
+    }
+
     pub fn session_message_count(&self, session_id: &str) -> Result<u64> {
         let found = self.conn.query_row(
             "SELECT message_count FROM sessions WHERE id = ?1",
@@ -837,6 +847,46 @@ mod tests {
         assert_eq!(db.turn_count().unwrap(), 0);
         assert_eq!(db.project_count().unwrap(), 1);
         assert_eq!(db.note(id).unwrap().as_deref(), Some("keep me"));
+    }
+
+    #[test]
+    fn last_turn_ts_is_none_until_something_is_indexed() {
+        let db = open_in_memory().unwrap();
+        assert_eq!(
+            db.last_turn_ts().unwrap(),
+            None,
+            "an empty index has no last-indexed timestamp to report"
+        );
+
+        let id = db.upsert_project("slug", "/Users/a/proj", false).unwrap();
+        db.upsert_session(&session("s1", id, 0)).unwrap();
+        db.insert_turns(
+            "s1",
+            &[
+                Turn {
+                    ts: 10,
+                    model: "m".into(),
+                    usage: TurnUsage::default(),
+                },
+                Turn {
+                    ts: 30,
+                    model: "m".into(),
+                    usage: TurnUsage::default(),
+                },
+                Turn {
+                    ts: 20,
+                    model: "m".into(),
+                    usage: TurnUsage::default(),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.last_turn_ts().unwrap(),
+            Some(30),
+            "the newest turn's timestamp, not insertion order"
+        );
     }
 
     #[test]
