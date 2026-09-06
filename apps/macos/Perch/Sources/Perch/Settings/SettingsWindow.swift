@@ -305,10 +305,25 @@ struct SettingsRootView: View {
     /// edit (a flip, a single-choice pick, a stepper click), not free typing,
     /// so there is no keystroke-storm risk in writing it straight through.
 
+    /// `get` reads macOS's own registration (`LoginItem.isRegistered`), never
+    /// the stored `launchAtLogin` value — the two can disagree (removed via
+    /// System Settings, or a fresh install with a stale hand-edited file),
+    /// and the control must always reflect what is actually registered, not
+    /// what Perch last wrote to disk. `set` registers/unregisters first;
+    /// only on success does it persist the setting, so a refused request
+    /// never leaves a stored `true` that isn't backed by a real
+    /// registration.
     private var launchAtLoginBinding: Binding<Bool> {
         Binding(
-            get: { model?.settings.launchAtLogin ?? false },
-            set: { v in update { $0.launchAtLogin = v } }
+            get: { LoginItem.isRegistered },
+            set: { v in
+                do {
+                    try LoginItem.setRegistered(v)
+                    update { $0.launchAtLogin = v }
+                } catch {
+                    actionError = error.localizedDescription
+                }
+            }
         )
     }
 

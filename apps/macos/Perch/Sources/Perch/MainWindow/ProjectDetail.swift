@@ -364,7 +364,16 @@ struct ProjectDetailPane: View {
             actionError = EngineUnavailable().localizedDescription
             return
         }
-        do { try Launcher.run(command) } catch { self.actionError = error.localizedDescription }
+        // Read fresh at the moment of launch, not cached from whenever this
+        // view first loaded — a `preferredTerminal` change (from this
+        // window, or a hand-edited config.toml) is picked up on the very
+        // next launch with no extra plumbing.
+        let terminal = await engine.settings()?.settings.preferredTerminal ?? "Terminal"
+        do {
+            try Launcher.run(command, terminal: terminal)
+        } catch {
+            self.actionError = error.localizedDescription
+        }
     }
 
     private func load() async {

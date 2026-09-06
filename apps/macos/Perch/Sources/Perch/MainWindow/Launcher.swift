@@ -25,7 +25,15 @@ enum LauncherError: LocalizedError {
 /// POSIX-single-quoted for every value it embeds; it is used verbatim here,
 /// with no additional escaping or interpolation.
 enum Launcher {
-    static func run(_ command: TerminalCommand) throws {
+    /// `terminal` is the `preferredTerminal` setting's value ("Terminal",
+    /// "iTerm2", ...) — the caller reads it fresh at the moment of launch
+    /// (see `ProjectDetailPane.launch`), so a hand-edited or just-saved
+    /// change always takes effect on the very next launch, with no
+    /// caching or restart involved. Unrecognized here, or recognized but not
+    /// actually installed, both fall back to Terminal.app (see `bundleId`
+    /// and the `??` below) rather than failing outright — the setting is a
+    /// preference, not a hard requirement.
+    static func run(_ command: TerminalCommand, terminal: String = "Terminal") throws {
         let dir = try scriptDirectory()
         sweep(dir)
 
@@ -46,9 +54,25 @@ enum Launcher {
         }
 
         let config = NSWorkspace.OpenConfiguration()
-        guard let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal")
+        guard
+            let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId(for: terminal))
+                ?? NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal")
         else { throw LauncherError.noTerminal }
         NSWorkspace.shared.open([script], withApplicationAt: app, configuration: config)
+    }
+
+    /// Maps a `preferredTerminal` setting value to the bundle identifier
+    /// `NSWorkspace` needs to launch it. Anything this switch doesn't
+    /// recognize falls through to `"com.apple.Terminal"` here too — `run`'s
+    /// own `??` fallback above only catches a *recognized* app that isn't
+    /// actually installed; an unrecognized name (a future terminal Perch
+    /// doesn't know yet, or a stale hand-typed value) needs the same
+    /// fallback one step earlier.
+    private static func bundleId(for name: String) -> String {
+        switch name {
+        case "iTerm2": return "com.googlecode.iterm2"
+        default: return "com.apple.Terminal"
+        }
     }
 
     /// Perch's own directory — the read-only promise about ~/.claude is unaffected.
