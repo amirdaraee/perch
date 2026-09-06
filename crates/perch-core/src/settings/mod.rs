@@ -11,6 +11,8 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+pub mod store;
+
 /// Bumped whenever the on-disk shape changes in a way a migration needs to
 /// know about. Not itself a field of [`Settings`] — later tasks write it
 /// alongside the settings tables.
@@ -29,6 +31,24 @@ pub enum MenuBarDisplay {
     CountAndWaiting,
 }
 
+impl MenuBarDisplay {
+    /// Every wire value this binary recognizes for `menu_bar.display`. Kept
+    /// as one array so `Deserialize` below (accepting these) and
+    /// `store::load` (detecting anything *outside* this set, to report the
+    /// silent-degrade case `Deserialize` cannot report on its own) share a
+    /// single source of truth instead of two hand-maintained lists.
+    pub const KNOWN_WIRE_VALUES: [&'static str; 3] = ["icon", "count", "count-and-waiting"];
+
+    /// The exact string this variant round-trips to on the wire.
+    pub(crate) fn as_wire_str(self) -> &'static str {
+        match self {
+            MenuBarDisplay::Icon => "icon",
+            MenuBarDisplay::Count => "count",
+            MenuBarDisplay::CountAndWaiting => "count-and-waiting",
+        }
+    }
+}
+
 /// Deserialized by hand, not derived: an unrecognized wire value (an older or
 /// newer Perch's variant name the user has never heard of, or a plain typo in
 /// a hand-edited file) must degrade to the default display rather than
@@ -36,6 +56,11 @@ pub enum MenuBarDisplay {
 /// `Deserialize` — even with `#[serde(other)]` — would still need a variant
 /// to land on, and a rejected value would bubble up as a hard error that
 /// takes every other setting in the file down with it.
+///
+/// This silent degrade is exactly why `settings::store::load` separately
+/// inspects the raw document for `menu_bar.display` and reports it via a
+/// note when the value is not one of [`MenuBarDisplay::KNOWN_WIRE_VALUES`] —
+/// this impl has no path back to a caller-visible note, only this default.
 impl<'de> Deserialize<'de> for MenuBarDisplay {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

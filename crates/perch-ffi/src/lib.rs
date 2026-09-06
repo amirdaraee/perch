@@ -573,25 +573,15 @@ fn db_err(e: impl std::fmt::Display) -> PerchError {
 ///
 /// Honours `PERCH_DATA_DIR` (the directory to hold `index.db`) when set, so
 /// tests never touch the user's real index; falls back to the platform
-/// default app-data directory otherwise.
+/// default app-data directory otherwise. The resolution itself now lives in
+/// `perch_core::settings::store::app_data_dir` (moved there in the settings
+/// task, which needed the identical directory for `config.toml`) — this
+/// just appends this file's own name to it.
 fn app_data_db() -> Result<PathBuf, PerchError> {
-    if let Ok(dir) = std::env::var("PERCH_DATA_DIR") {
-        return Ok(PathBuf::from(dir).join("index.db"));
-    }
-    let home = std::env::var("HOME").map_err(|_| PerchError::Io {
-        message: "HOME is not set".into(),
+    let dir = perch_core::settings::store::app_data_dir().map_err(|e| PerchError::Io {
+        message: e.to_string(),
     })?;
-    #[cfg(target_os = "macos")]
-    let base = PathBuf::from(home)
-        .join("Library")
-        .join("Application Support")
-        .join("Perch");
-    #[cfg(not(target_os = "macos"))]
-    let base = PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("perch");
-    Ok(base.join("index.db"))
+    Ok(dir.join("index.db"))
 }
 
 /// The parts of `Perch` the watcher closure needs, without holding an
