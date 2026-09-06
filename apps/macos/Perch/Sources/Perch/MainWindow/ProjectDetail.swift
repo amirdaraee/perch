@@ -23,6 +23,22 @@ struct ProjectDetailPane: View {
     @State private var isRenaming = false
     @State private var renameDraft: String = ""
 
+    /// Local UI-only projection of `NotifyOverride`'s three cases onto the
+    /// segmented control's selection. `NotifyOverride.custom` carries a
+    /// minutes payload that doesn't fit a plain `Hashable` picker tag, so the
+    /// number lives separately in `customMinutes`.
+    private enum NotifyMode: Hashable {
+        case `default`, custom, off
+    }
+    @State private var notifyMode: NotifyMode = .default
+    /// The custom threshold, kept even while `notifyMode` isn't `.custom` —
+    /// see judgement call in the task report: switching Default → Custom →
+    /// Default → Custom within one visit to a project should not reset the
+    /// number the user had just dialed in. Only reseeded from the server
+    /// (`seedNotify`) on load or after an edit actually returns a `.custom`
+    /// override, so a detour through Default/Off never overwrites it.
+    @State private var customMinutes: UInt32 = 25
+
     var body: some View {
         Group {
             if let detail {
@@ -74,6 +90,7 @@ struct ProjectDetailPane: View {
 
                 totals(detail)
                 noteEditor(detail)
+                notifySection(detail)
                 sparkline(detail)
                 sessionList(detail)
             }
@@ -146,6 +163,42 @@ struct ProjectDetailPane: View {
                 .onChange(of: noteFocused) { _, focused in
                     if !focused { Task { await saveNoteIfChanged() } }
                 }
+        }
+    }
+
+    /// The milestone's distinguishing decision: the per-project notification
+    /// override lives here, on the project the user is already looking at —
+    /// not as a row in the settings window. Default/Custom/Off; the custom
+    /// stepper stays visible but disabled unless Custom is selected, matching
+    /// Task 7's settings window (dependent controls grey out, they don't
+    /// vanish).
+    @ViewBuilder
+    private func notifySection(_ detail: ProjectDetail) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Notifications").font(.caption2).foregroundStyle(.secondary).textCase(.uppercase)
+
+            Picker("Notifications", selection: notifyModeBinding) {
+                Text("Default").tag(NotifyMode.default)
+                Text("Custom").tag(NotifyMode.custom)
+                Text("Off").tag(NotifyMode.off)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 280)
+
+            // Shows what "Default" currently means so the user isn't
+            // choosing blind — `notifyDefaultLabel` is already a finished
+            // sentence fragment composed in Rust, never assembled here.
+            if notifyMode == .default {
+                Text(detail.notifyDefaultLabel)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Stepper(value: customMinutesBinding, in: 1...240) {
+                Text("After \(customMinutes) minutes")
+            }
+            .disabled(notifyMode != .custom)
         }
     }
 
@@ -247,6 +300,31 @@ struct ProjectDetailPane: View {
         )
     }
 
+    private var notifyModeBinding: Binding<NotifyMode> {
+        Binding(
+            get: { notifyMode },
+            set: { newMode in
+                notifyMode = newMode
+                Task { await setNotify(mode: newMode, minutes: customMinutes) }
+            }
+        )
+    }
+
+    private var customMinutesBinding: Binding<UInt32> {
+        Binding(
+            get: { customMinutes },
+            set: { newValue in
+                customMinutes = newValue
+                // The stepper is disabled outside `.custom` (SwiftUI blocks
+                // the interaction that would call this setter); the guard is
+                // defence-in-depth only, matching this file's existing
+                // `guard d.id == projectId` in `apply(_:)`.
+                guard notifyMode == .custom else { return }
+                Task { await setNotify(mode: .custom, minutes: newValue) }
+            }
+        )
+    }
+
     // MARK: - Actions
 
     /// Every terminal launch funnels through here so failures surface
@@ -268,8 +346,24 @@ struct ProjectDetailPane: View {
         case .success(let d):
             detail = d
             noteDraft = d.note
+            seedNotify(from: d.notify)
         case .failure(let e):
             loadError = e.localizedDescription
+        }
+    }
+
+    /// Mirrors `detail`/`noteDraft`'s seeding above: the notify control must
+    /// show the project's *actual* current state on load, not whatever this
+    /// enum's default happens to be.
+    private func seedNotify(from override: NotifyOverride) {
+        switch override {
+        case .default:
+            notifyMode = .default
+        case .off:
+            notifyMode = .off
+        case .custom(let afterMinutes):
+            notifyMode = .custom
+            customMinutes = afterMinutes
         }
     }
 
@@ -294,6 +388,11 @@ struct ProjectDetailPane: View {
             guard d.id == projectId else { return }
             detail = d
             noteDraft = d.note
+            // `set_notify_override` clamps the custom threshold in Rust
+            // (1...240); reseeding from what came back — rather than trusting
+            // whatever the stepper last showed — is what makes a clamped
+            // value display as clamped.
+            seedNotify(from: d.notify)
             await onChanged()
         case .failure(let e):
             actionError = e.localizedDescription
@@ -313,6 +412,17 @@ struct ProjectDetailPane: View {
     private func setArchived(_ archived: Bool) async {
         guard let detail else { return }
         await apply(await engine.setArchived(projectId: detail.id, archived: archived))
+    }
+
+    private func setNotify(mode: NotifyMode, minutes: UInt32) async {
+        guard let detail else { return }
+        let override: NotifyOverride
+        switch mode {
+        case .default: override = .default
+        case .off: override = .off
+        case .custom: override = .custom(afterMinutes: minutes)
+        }
+        await apply(await engine.setNotifyOverride(projectId: detail.id, override: override))
     }
 
     private func rename() async {
