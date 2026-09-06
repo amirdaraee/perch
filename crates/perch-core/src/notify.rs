@@ -75,12 +75,18 @@ pub fn decide(
     let mut notifications = Vec::new();
     let mut remembered = HashSet::new();
 
-    // Note: `settings.waiting_enabled` is checked per-episode below, *after* the
-    // already-fired check, rather than as an early return here. An early return
-    // would discard `already_notified` outright — so disabling the feature mid-block,
-    // then re-enabling it while the same episode is still continuously waiting,
-    // would forget it fired and notify again. Toggling the setting must only
-    // suppress new firings, never erase memory of episodes already notified.
+    // Note: both `settings.waiting_enabled` and a project's `NotifyOverride::Off`
+    // are checked per-episode below, *after* the already-fired check, rather than
+    // as an early return / short-circuit. Either gate discarding `already_notified`
+    // outright would mean: an episode fires, the user mutes it (globally, or by
+    // setting that one project to Off), then unmutes it while the same episode is
+    // still continuously waiting — and it fires again. Muting must only suppress
+    // *new* firings, never erase memory of an episode already notified for.
+    //
+    // Symmetrically, an episode that has genuinely never fired must NOT enter
+    // memory while muted — so unmuting later still delivers an alert that was
+    // never actually sent. That's why both gates `continue` without touching
+    // `remembered` when reached (i.e. only for an episode not already notified).
 
     for session in live {
         let SessionStatus::Waiting { reason, since_ms } = &session.status else {
@@ -93,12 +99,6 @@ pub fn decide(
             continue;
         }
 
-        let Some(threshold_ms) = effective_threshold_ms(settings, override_for(&session.cwd))
-        else {
-            // `Off`: never notify, and never remember, for this project.
-            continue;
-        };
-
         let episode = Episode {
             session_id: session.session_id.clone(),
             waiting_since: *since_ms,
@@ -107,7 +107,8 @@ pub fn decide(
         if already_notified.contains(&episode) {
             // Already fired for this exact episode: keep remembering it, but
             // don't fire again while it stays the same episode. This holds
-            // regardless of `waiting_enabled` — see the note above.
+            // regardless of `waiting_enabled` or a project's `Off` override —
+            // see the note above.
             remembered.insert(episode);
             continue;
         }
@@ -117,6 +118,14 @@ pub fn decide(
             // nothing yet to remember either (only a fired episode is memory).
             continue;
         }
+
+        let Some(threshold_ms) = effective_threshold_ms(settings, override_for(&session.cwd))
+        else {
+            // `Off` and this episode has never fired: same as the disabled case
+            // above — no notification, and nothing enters memory, so switching
+            // the project back to Default later can still deliver it.
+            continue;
+        };
 
         let elapsed_ms = now_ms - since_ms;
         if elapsed_ms < threshold_ms {
@@ -306,6 +315,66 @@ mod tests {
         assert_eq!(
             n[0].session_id, "b",
             "only the project that did not opt out"
+        );
+    }
+
+    // Beyond the brief (review round 2, item 1): the per-project `Off` override
+    // must not erase memory either — the same bug as `waiting_enabled`, one level
+    // down. Fire on Default, mute the project (Off), unmute it (Default) while
+    // the same session is still continuously blocked in the same episode: it
+    // must not fire again, and the memory must survive the muted call untouched.
+    #[test]
+    fn muting_and_unmuting_a_project_mid_episode_does_not_refire() {
+        let live = [waiting("a", "/noisy", 0, "interactive")];
+
+        // Fires once on Default.
+        let (n, seen) = decide(&live, &on(), &no_override(), &HashSet::new(), 10 * MIN);
+        assert_eq!(n.len(), 1);
+
+        // Muted, session still blocked in the same episode: no firing, and the
+        // memory of the already-fired episode must survive the muted call.
+        let off = |_: &str| NotifyOverride::Off;
+        let (n2, seen2) = decide(&live, &on(), &off, &seen, 20 * MIN);
+        assert!(n2.is_empty(), "muted: nothing fires");
+        assert_eq!(
+            seen2, seen,
+            "muting must not discard memory of an already-fired episode"
+        );
+
+        // Unmuted, same episode still blocked: must not fire again.
+        let (n3, _) = decide(&live, &on(), &no_override(), &seen2, 30 * MIN);
+        assert!(
+            n3.is_empty(),
+            "unmuting must not resurrect a repeat notification for the same episode"
+        );
+    }
+
+    // Beyond the brief (review round 2, item 2): symmetrically, a project set to
+    // Off must not swallow an alert that was never delivered. A session blocked
+    // past the threshold while its project is Off must not enter memory; setting
+    // the project back to Default must then fire for that genuinely un-notified
+    // block, not silently stay quiet because Off had "already handled" it.
+    #[test]
+    fn unmuting_a_project_still_delivers_an_alert_that_was_never_sent() {
+        let live = [waiting("a", "/muted", 0, "interactive")];
+        let off = |_: &str| NotifyOverride::Off;
+
+        // Off the whole time, well past what the threshold would be: never fires,
+        // and — critically — never enters memory either.
+        let (n, seen) = decide(&live, &on(), &off, &HashSet::new(), 60 * MIN);
+        assert!(
+            n.is_empty(),
+            "Off: never fires, no matter how long it's waited"
+        );
+        assert!(seen.is_empty(), "Off: nothing enters memory while muted");
+
+        // Switched back to Default, same session still blocked past the (global)
+        // threshold: this is a genuinely un-notified episode and must fire.
+        let (n2, _) = decide(&live, &on(), &no_override(), &seen, 70 * MIN);
+        assert_eq!(
+            n2.len(),
+            1,
+            "unmuting must not silently swallow an alert that was never sent"
         );
     }
 
