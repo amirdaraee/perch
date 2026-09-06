@@ -326,7 +326,23 @@ struct SettingsRootView: View {
 
     // MARK: - Load / save
 
+    /// Runs once per `refreshToken` — i.e. once per fresh presentation of the
+    /// window, including a reopen after it was previously closed.
+    /// `SettingsWindowController.show()` reuses the same `NSHostingView` and
+    /// only swaps `.rootView`, so SwiftUI preserves this view's `@State`
+    /// across a close/reopen (the same reuse that makes `refreshToken`
+    /// necessary at all) — without clearing `actionError` here, a save that
+    /// failed, closed, and was reopened later would show a stale
+    /// save-failure banner with nothing currently wrong. Cleared
+    /// unconditionally at the top, before the fetch below, rather than only
+    /// in `apply()`: `apply()` only runs if `engine.settings()` succeeds, so
+    /// clearing there would leave a stale `actionError` on screen alongside
+    /// a fresh `loadError` if the engine happened to be unavailable on this
+    /// particular reopen. This does not affect an in-session save: nothing
+    /// but a reopen re-runs `load()`, so a banner a save just produced is
+    /// never wiped before the user can read it.
     private func load() async {
+        actionError = nil
         guard let m = await engine.settings() else {
             loadError = EngineUnavailable().localizedDescription
             return
