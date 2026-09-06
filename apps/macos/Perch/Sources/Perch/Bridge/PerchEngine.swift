@@ -99,6 +99,31 @@ final class PerchEngine: ObservableObject {
             perch.openCommand(cwd: cwd)
         }.value
     }
+
+    /// `nil` only means the engine itself isn't running — Rust's own read
+    /// never fails (a bad on-disk file degrades to defaults, reported via
+    /// `SettingsModel.error`/`.notes`, not a thrown error).
+    func settings() async -> SettingsModel? {
+        guard let perch else { return nil }
+        return await Task.detached(priority: .userInitiated) { perch.settings() }.value
+    }
+
+    /// Throws only when the write itself fails (e.g. the config directory
+    /// isn't writable); a merely out-of-range value is clamped and reported
+    /// back in the returned model's `notes`, not rejected.
+    func saveSettings(_ s: Settings) async -> Result<SettingsModel, Error> {
+        guard let perch else { return .failure(EngineUnavailable()) }
+        return await Task.detached(priority: .userInitiated) {
+            Result { try perch.saveSettings(s: s) }
+        }.value
+    }
+
+    /// Backs the diagnostics pane — a full re-index can make this slow, so
+    /// it gets the same off-main-thread treatment as every other read here.
+    func diagnostics() async -> DiagnosticsModel? {
+        guard let perch else { return nil }
+        return await Task.detached(priority: .userInitiated) { perch.diagnostics() }.value
+    }
 }
 
 struct EngineUnavailable: LocalizedError {
