@@ -26,17 +26,33 @@ struct ProjectDetailPane: View {
     /// Local UI-only projection of `NotifyOverride`'s three cases onto the
     /// segmented control's selection. `NotifyOverride.custom` carries a
     /// minutes payload that doesn't fit a plain `Hashable` picker tag, so the
-    /// number lives separately in `customMinutes`.
+    /// number is handled separately by `customMinutesBinding`.
     private enum NotifyMode: Hashable {
         case `default`, custom, off
     }
-    @State private var notifyMode: NotifyMode = .default
-    /// The custom threshold, kept even while `notifyMode` isn't `.custom` —
-    /// see judgement call in the task report: switching Default → Custom →
-    /// Default → Custom within one visit to a project should not reset the
-    /// number the user had just dialed in. Only reseeded from the server
-    /// (`seedNotify`) on load or after an edit actually returns a `.custom`
-    /// override, so a detour through Default/Off never overwrites it.
+    /// Derived from `detail`, never separately mutated — same shape as
+    /// `pinnedBinding`/`archivedBinding` above, and for the same reason: a
+    /// `setNotifyOverride` call that throws must leave the segmented control
+    /// showing what the project's override actually still is, not whatever
+    /// was optimistically selected before the write failed.
+    private var notifyMode: NotifyMode {
+        switch detail?.notify {
+        case .off: return .off
+        case .custom: return .custom
+        case .default, .none: return .default
+        }
+    }
+    /// Fallback source for the stepper while `notifyMode != .custom`: an
+    /// arbitrary UI seed (not sourced from Rust — noted as a follow-up, not
+    /// fixed in this pass), overwritten only by `seedCustomMinutes` (a fresh
+    /// `.custom` override from the server) or by dialing the stepper itself.
+    /// `customMinutesBinding.get` prefers `detail`'s own value whenever the
+    /// override truly is `.custom` — that's what makes a stepper edit that
+    /// fails snap back to the last *persisted* number instead of keeping the
+    /// optimistic one — and only falls back to this field when `detail`
+    /// doesn't carry a custom value at all, which is what keeps a dialed-in
+    /// number alive across a Default/Off detour (see judgement call in the
+    /// task report).
     @State private var customMinutes: UInt32 = 25
 
     var body: some View {
@@ -302,17 +318,28 @@ struct ProjectDetailPane: View {
 
     private var notifyModeBinding: Binding<NotifyMode> {
         Binding(
+            // No optimistic assignment here — `notifyMode` reads straight
+            // from `detail`, so a `setNotifyOverride` that throws leaves the
+            // picker showing exactly what it showed before the tap, same as
+            // `pinnedBinding`/`archivedBinding`.
             get: { notifyMode },
-            set: { newMode in
-                notifyMode = newMode
-                Task { await setNotify(mode: newMode, minutes: customMinutes) }
-            }
+            set: { newMode in Task { await setNotify(mode: newMode, minutes: customMinutes) } }
         )
     }
 
     private var customMinutesBinding: Binding<UInt32> {
         Binding(
-            get: { customMinutes },
+            get: {
+                // Prefer `detail`'s own number whenever the override truly is
+                // `.custom` — that's what makes a stepper edit that fails
+                // snap back to the last *persisted* minutes instead of
+                // keeping the optimistic one. Only outside `.custom` (where
+                // `detail` has no minutes to read) does this fall back to the
+                // locally-tracked seed, which is what keeps a dialed-in
+                // number alive across a Default/Off detour.
+                if case .custom(let afterMinutes) = detail?.notify { return afterMinutes }
+                return customMinutes
+            },
             set: { newValue in
                 customMinutes = newValue
                 // The stepper is disabled outside `.custom` (SwiftUI blocks
@@ -346,25 +373,20 @@ struct ProjectDetailPane: View {
         case .success(let d):
             detail = d
             noteDraft = d.note
-            seedNotify(from: d.notify)
+            seedCustomMinutes(from: d.notify)
         case .failure(let e):
             loadError = e.localizedDescription
         }
     }
 
-    /// Mirrors `detail`/`noteDraft`'s seeding above: the notify control must
-    /// show the project's *actual* current state on load, not whatever this
-    /// enum's default happens to be.
-    private func seedNotify(from override: NotifyOverride) {
-        switch override {
-        case .default:
-            notifyMode = .default
-        case .off:
-            notifyMode = .off
-        case .custom(let afterMinutes):
-            notifyMode = .custom
-            customMinutes = afterMinutes
-        }
+    /// `notifyMode` reads straight from `detail`, so it needs no seeding.
+    /// `customMinutes` is the one bit of notify state actually kept in local
+    /// `@State` (as a fallback for while the override isn't `.custom` — see
+    /// its declaration above), so it's what this seeds from a fresh/refreshed
+    /// override, same moment `detail`/`noteDraft` get seeded.
+    private func seedCustomMinutes(from override: NotifyOverride) {
+        guard case .custom(let afterMinutes) = override else { return }
+        customMinutes = afterMinutes
     }
 
     /// Adopts the refreshed model an edit method returns, rather than
@@ -389,12 +411,18 @@ struct ProjectDetailPane: View {
             detail = d
             noteDraft = d.note
             // `set_notify_override` clamps the custom threshold in Rust
-            // (1...240); reseeding from what came back — rather than trusting
-            // whatever the stepper last showed — is what makes a clamped
-            // value display as clamped.
-            seedNotify(from: d.notify)
+            // (1...240); `notifyMode` already reads straight from `detail`,
+            // so only `customMinutes`'s fallback needs reseeding here — this
+            // is what makes a clamped value display as clamped.
+            seedCustomMinutes(from: d.notify)
             await onChanged()
         case .failure(let e):
+            // Deliberately no re-seed here: `notifyMode` and
+            // `customMinutesBinding.get`'s primary path both read straight
+            // from `detail`, which a failure never touches — so a rejected
+            // `setNotifyOverride` already leaves the notify control showing
+            // exactly the pre-edit, still-persisted state without anything
+            // extra to restore.
             actionError = e.localizedDescription
         }
     }
