@@ -35,6 +35,12 @@ pub enum NotifyOverride {
     Custom { after_minutes: u32 },
 }
 
+/// Same bound `Settings::validated` clamps `waiting_after_minutes` to. Rust
+/// owns this validation everywhere, not just in the global setting, so a
+/// shell (Swift stepper or otherwise) can't store a nonsense value by simply
+/// skipping its own bounds check.
+const NOTIFY_AFTER_MINUTES_RANGE: std::ops::RangeInclusive<u32> = 1..=240;
+
 impl NotifyOverride {
     fn mode_str(&self) -> &'static str {
         match self {
@@ -48,6 +54,21 @@ impl NotifyOverride {
         match self {
             NotifyOverride::Custom { after_minutes } => Some(*after_minutes),
             _ => None,
+        }
+    }
+
+    /// Clamp `Custom { after_minutes }` into `NOTIFY_AFTER_MINUTES_RANGE`,
+    /// mirroring `Settings::validated`'s clamp of `waiting_after_minutes`.
+    /// `Default` and `Off` carry no minute count and are returned unchanged.
+    fn clamped(self) -> NotifyOverride {
+        match self {
+            NotifyOverride::Custom { after_minutes } => NotifyOverride::Custom {
+                after_minutes: after_minutes.clamp(
+                    *NOTIFY_AFTER_MINUTES_RANGE.start(),
+                    *NOTIFY_AFTER_MINUTES_RANGE.end(),
+                ),
+            },
+            other => other,
         }
     }
 
@@ -333,6 +354,7 @@ impl Db {
     /// "never overwritten by indexing" line), so this never touches the
     /// derived columns `upsert_project` maintains.
     pub fn set_notify_override(&self, project_id: i64, o: &NotifyOverride) -> Result<()> {
+        let o = o.clamped();
         self.conn.execute(
             "UPDATE projects SET notify_mode = ?2, notify_after_minutes = ?3 WHERE id = ?1",
             params![project_id, o.mode_str(), o.after_minutes()],
@@ -1005,6 +1027,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(db.project_meta(id).unwrap().notify, NotifyOverride::Default);
+    }
+
+    #[test]
+    fn a_custom_mode_with_no_minute_count_degrades_to_default() {
+        // Unlike the unknown-mode test above, this exercises the "custom"
+        // arm of `from_columns` specifically: a `notify_mode = 'custom'` row
+        // whose `notify_after_minutes` is NULL (never produced by
+        // `set_notify_override` itself, but a hand-edited or corrupted row
+        // could have it) must not panic or fabricate a minute count.
+        let db = open_in_memory().unwrap();
+        let id = db.upsert_project("-a-b", "/a/b", false).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE projects SET notify_mode = 'custom', notify_after_minutes = NULL WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        assert_eq!(db.project_meta(id).unwrap().notify, NotifyOverride::Default);
+    }
+
+    #[test]
+    fn custom_after_minutes_is_clamped_to_the_same_bound_as_the_global_setting() {
+        // Rust must own this validation everywhere, not just in the Swift
+        // stepper: `set_notify_override` clamps into the same 1..=240 range
+        // `Settings::validated` uses for `waiting_after_minutes`.
+        let db = open_in_memory().unwrap();
+        let id = db.upsert_project("-a-b", "/a/b", false).unwrap();
+
+        db.set_notify_override(id, &NotifyOverride::Custom { after_minutes: 0 })
+            .unwrap();
+        assert_eq!(
+            db.project_meta(id).unwrap().notify,
+            NotifyOverride::Custom { after_minutes: 1 },
+            "0 must clamp up to the lower bound"
+        );
+
+        db.set_notify_override(
+            id,
+            &NotifyOverride::Custom {
+                after_minutes: 9_999,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.project_meta(id).unwrap().notify,
+            NotifyOverride::Custom { after_minutes: 240 },
+            "an absurdly large value must clamp down to the upper bound"
+        );
     }
 
     #[test]
