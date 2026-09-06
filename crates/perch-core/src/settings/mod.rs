@@ -10,6 +10,7 @@
 //! [`SettingsFile`] rather than derived directly on the flat struct.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::path::Path;
 
 pub mod store;
 
@@ -116,6 +117,17 @@ impl Settings {
     /// changed, so a hand-edited file is never silently ignored *or* silently
     /// obeyed: an out-of-range value still runs (clamped), and the user is
     /// told it happened.
+    ///
+    /// `claude_config_dir` is the one field whose "out of range" can only be
+    /// answered by looking at the disk, so this is the one place that does:
+    /// a path that is not a directory is dropped back to "" (auto-detect)
+    /// and reported, exactly like a clamp. It is dropped here, rather than
+    /// refused wherever it is *used*, so that every consumer -- `Perch::new`,
+    /// the running engine's settings watch, and the diagnostics pane's
+    /// "where did this directory come from" verdict -- sees one and the same
+    /// answer, and none of them can be brought down by a value the others
+    /// have already ruled out. A setting that points somewhere wrong must
+    /// degrade to auto-detection, never to an app that will not open.
     pub fn validated(self) -> (Settings, Vec<String>) {
         let mut settings = self;
         let mut notes = Vec::new();
@@ -136,6 +148,15 @@ impl Settings {
                 settings.waiting_after_minutes
             ));
             settings.waiting_after_minutes = clamped_wait;
+        }
+
+        let configured_dir = settings.claude_config_dir.trim();
+        if !configured_dir.is_empty() && !Path::new(configured_dir).is_dir() {
+            notes.push(format!(
+                "claude_config_dir was {configured_dir:?}, which is not a directory; \
+                 ignoring it and auto-detecting Claude Code's directory instead"
+            ));
+            settings.claude_config_dir = String::new();
         }
 
         (settings, notes)
@@ -315,6 +336,44 @@ mod tests {
         let (s, notes) = s.validated();
         assert_eq!(s.poll_seconds, 30);
         assert_eq!(s.waiting_after_minutes, 60);
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn a_claude_config_dir_that_is_not_a_directory_is_dropped_and_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let not_a_dir = tmp.path().join("regular-file");
+        std::fs::write(&not_a_dir, b"i am a file, not a directory").unwrap();
+
+        let s = Settings {
+            claude_config_dir: not_a_dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let (s, notes) = s.validated();
+
+        assert_eq!(
+            s.claude_config_dir, "",
+            "an unusable override must degrade to auto-detection, never be handed on \
+             to a caller that would then refuse to start"
+        );
+        assert_eq!(notes.len(), 1, "and it is never dropped silently");
+        assert!(
+            notes[0].contains("claude_config_dir"),
+            "actionable: {}",
+            notes[0]
+        );
+    }
+
+    #[test]
+    fn a_claude_config_dir_that_is_a_real_directory_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = Settings {
+            claude_config_dir: tmp.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let (s, notes) = s.validated();
+
+        assert_eq!(s.claude_config_dir, tmp.path().to_string_lossy());
         assert!(notes.is_empty());
     }
 

@@ -62,6 +62,39 @@ mod tests {
     }
 
     #[test]
+    fn a_claude_config_dir_that_is_not_a_directory_earns_a_note_the_window_can_show() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        let not_a_dir = tmp.path().join("regular-file");
+        std::fs::write(&not_a_dir, b"i am a file").unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "[general]\nclaude_config_dir = {:?}\n",
+                not_a_dir.to_string_lossy()
+            ),
+        )
+        .unwrap();
+
+        let model = build_settings(&path);
+
+        assert_eq!(
+            model.settings.claude_config_dir, "",
+            "the window must not echo back a value nothing will honour"
+        );
+        assert_eq!(model.notes.len(), 1);
+        assert!(
+            model.notes[0].contains("claude_config_dir"),
+            "actionable: {}",
+            model.notes[0]
+        );
+        assert!(
+            model.error.is_none(),
+            "a rejected directory is not a file that failed to parse"
+        );
+    }
+
+    #[test]
     fn a_clamped_value_earns_a_note_and_no_error() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("config.toml");
