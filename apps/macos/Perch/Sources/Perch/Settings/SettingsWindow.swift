@@ -98,6 +98,19 @@ struct SettingsRootView: View {
     let engine: PerchEngine
     let refreshToken: Int
 
+    /// Observed, not merely read: `Notifier` re-reads macOS's authorization
+    /// on every delivery, so a permission granted or revoked while this
+    /// window is open — or a delivery macOS refused — repaints the pane
+    /// below without waiting for a reopen.
+    @ObservedObject private var notifier: Notifier
+
+    @MainActor
+    init(engine: PerchEngine, refreshToken: Int) {
+        self.engine = engine
+        self.refreshToken = refreshToken
+        _notifier = ObservedObject(wrappedValue: engine.notifier)
+    }
+
     @State private var model: SettingsModel?
     /// Set only when the *initial* `settings()` read fails (the engine isn't
     /// running) — rendered only while there is no model yet.
@@ -111,15 +124,6 @@ struct SettingsRootView: View {
 
     @State private var claudeDirDraft: String = ""
     @FocusState private var claudeDirFocused: Bool
-
-    /// True when the OS has explicitly denied Perch permission to show
-    /// notifications — checked (without prompting) on every `load()`, so a
-    /// denial made from System Settings after this window last loaded is
-    /// caught the next time it's reopened, not just right after this pane's
-    /// own toggle triggers a request. `waitingEnabledBinding` reads this so
-    /// the toggle never shows "on" while nothing would actually be
-    /// delivered — see its own comment.
-    @State private var notificationAuthDenied = false
 
     /// Chains queued saves so a second control's edit always builds on the
     /// model left by the first save's `apply()`, not on the pre-edit
@@ -138,6 +142,19 @@ struct SettingsRootView: View {
     /// literal below — the whole terminal-choice seam is being replaced next
     /// milestone, when Rust supplies the detected-terminal list.
     private static let defaults = PerchFFI.defaultSettings()
+
+    /// macOS has been asked and said no: the toggle is forced off *and*
+    /// disabled, because nothing the user does in this window can change it.
+    private var notificationsDenied: Bool { notifier.authorization == .denied }
+
+    /// Anything short of "would actually be shown" — `.notDetermined`
+    /// included. This, not `notificationsDenied`, is what the toggle and its
+    /// dependent controls read: `.notDetermined` is the state a
+    /// `waiting_enabled = true` hand-edited into config.toml leaves behind,
+    /// and it delivers exactly as little as a denial. The toggle stays
+    /// *enabled* in that state, though — flipping it on is precisely what
+    /// asks macOS for permission.
+    private var notificationsDeliverable: Bool { notifier.canDeliver }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -273,9 +290,9 @@ struct SettingsRootView: View {
     private var notificationsPane: some View {
         Form {
             Toggle("Notify when a session is waiting on you", isOn: waitingEnabledBinding)
-                .disabled(notificationAuthDenied)
+                .disabled(notificationsDenied)
 
-            if notificationAuthDenied {
+            if notificationsDenied {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Perch isn't allowed to show notifications.")
                         .foregroundStyle(.red)
@@ -283,13 +300,30 @@ struct SettingsRootView: View {
                 }
                 .font(.callout)
                 .padding(.vertical, 4)
+            } else if !notificationsDeliverable && storedWaitingEnabled {
+                // The settings file says on, macOS has never been asked. The
+                // toggle above already reads OFF, which is the honest state —
+                // this says why it disagrees with the file the user edited,
+                // and what to do about it.
+                Text("The settings file turns these on, but macOS hasn't been asked for permission yet. Switch this on here to ask.")
+                    .foregroundStyle(.orange)
+                    .font(.callout)
+                    .padding(.vertical, 4)
+            }
+
+            // macOS refused a delivery Rust had already decided on. Reported
+            // verbatim rather than swallowed — see `Notifier.lastFailure`.
+            if let failure = notifier.lastFailure {
+                Text(failure)
+                    .foregroundStyle(.red)
+                    .font(.callout)
+                    .padding(.vertical, 4)
             }
 
             // Dependent controls stay visible and greyed rather than
             // disappearing — hiding them would conceal what is configurable
             // and make the window twitch when the toggle above flips.
-            let enabled = (model?.settings.waitingEnabled ?? Self.defaults.waitingEnabled)
-                && !notificationAuthDenied
+            let enabled = storedWaitingEnabled && notificationsDeliverable
 
             Stepper(value: waitingAfterMinutesBinding, in: 1...240) {
                 Text(waitingAfterMinutesLabel(minutes: waitingAfterMinutesBinding.wrappedValue))
@@ -361,33 +395,33 @@ struct SettingsRootView: View {
         )
     }
 
-    /// `get` reports `false` while `notificationAuthDenied` — even if the
-    /// stored setting is still `true` from before a revocation — so the
-    /// toggle never shows "on" while nothing would actually be delivered.
-    /// `set`'s ON branch requests authorization *at the moment the user asks
-    /// for it*, never before: granted, it saves `true` and clears any prior
-    /// denial; refused, it records the denial and leaves the persisted
-    /// setting `false` rather than saving a preference that would silently
-    /// do nothing.
+    /// What the settings file says, before macOS gets a say.
+    private var storedWaitingEnabled: Bool {
+        model?.settings.waitingEnabled ?? Self.defaults.waitingEnabled
+    }
+
+    /// `get` reports `false` unless a notification would actually be shown —
+    /// a revoked permission, and equally a `waiting_enabled = true` hand-
+    /// edited into config.toml that macOS has never been asked about, so the
+    /// toggle can never sit on over a channel delivering nothing. `set`'s ON
+    /// branch requests authorization *at the moment the user asks for it*,
+    /// never before: granted, it saves `true`; refused, it leaves the
+    /// persisted setting `false` rather than saving a preference that would
+    /// silently do nothing. Both branches leave `notifier.authorization`
+    /// holding whatever macOS now says — `requestAuthorization` re-reads it —
+    /// so this binding's `get` needs no separate flag of its own to keep in
+    /// step.
     private var waitingEnabledBinding: Binding<Bool> {
         Binding(
-            get: {
-                !notificationAuthDenied
-                    && (model?.settings.waitingEnabled ?? Self.defaults.waitingEnabled)
-            },
+            get: { notificationsDeliverable && storedWaitingEnabled },
             set: { v in
                 guard v else {
                     update { $0.waitingEnabled = false }
                     return
                 }
                 Task {
-                    if await engine.notifier.requestAuthorization() {
-                        notificationAuthDenied = false
-                        update { $0.waitingEnabled = true }
-                    } else {
-                        notificationAuthDenied = true
-                        update { $0.waitingEnabled = false }
-                    }
+                    let granted = await engine.notifier.requestAuthorization()
+                    update { $0.waitingEnabled = granted }
                 }
             }
         )
@@ -432,10 +466,11 @@ struct SettingsRootView: View {
         }
         apply(m)
         // Never prompts — just reads whatever the OS currently says, so a
-        // denial made from System Settings since this window last loaded
-        // (including one from a run that never touched this toggle at all)
-        // is reflected the next time the window opens.
-        notificationAuthDenied = await engine.notifier.authorizationStatus() == .denied
+        // permission granted or denied from System Settings since this window
+        // last loaded (including from a run that never touched this toggle at
+        // all) is reflected the next time the window opens. Every subsequent
+        // delivery re-reads it too, so an open window keeps up.
+        await engine.notifier.refreshAuthorization()
     }
 
     /// Queues `mutate` behind whatever save is already pending, rather than

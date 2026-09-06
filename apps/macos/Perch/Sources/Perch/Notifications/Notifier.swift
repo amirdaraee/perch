@@ -17,7 +17,30 @@ import PerchFFI
 /// actor themselves before touching anything — the same shape
 /// `PerchEngine`'s `Listener` uses for `onModel`/`onNotifications`.
 @MainActor
-final class Notifier: NSObject, UNUserNotificationCenterDelegate {
+final class Notifier: NSObject, ObservableObject, UNUserNotificationCenterDelegate {
+    /// What macOS currently says about Perch's permission to post
+    /// notifications; `nil` only before the first check. Published because it
+    /// is the only honest answer to "is the Settings toggle telling the
+    /// truth?" — that toggle reads OFF unless this is `.authorized` or
+    /// `.provisional`, so a `waiting_enabled = true` hand-edited into
+    /// config.toml (a supported edit: the file is watched, and Rust will
+    /// happily decide and compose notifications from it) can never show as ON
+    /// while `.notDetermined` means nothing would actually be delivered.
+    @Published private(set) var authorization: UNAuthorizationStatus?
+
+    /// The last thing macOS refused, verbatim as it described it — an
+    /// authorization request that threw, or a `center.add` that failed.
+    /// Cleared by the next delivery that succeeds. `center.add`'s error used
+    /// to be discarded entirely, which left a notification that never
+    /// appeared indistinguishable from one that was never earned.
+    @Published private(set) var lastFailure: String?
+
+    /// Whether a notification handed to `deliver` would actually be shown.
+    /// `.notDetermined` is not `.denied`, but it delivers exactly as little.
+    var canDeliver: Bool {
+        authorization == .authorized || authorization == .provisional
+    }
+
     /// The clicked notification's `sessionId`/`projectId` — a plain mirror of
     /// the two `WaitingNotification` fields that went into its `userInfo`,
     /// not anything decided here. `projectId` is what identifies the project
@@ -39,20 +62,32 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     /// toggle reflect a denial instead of sitting on while delivering
     /// nothing.
     func requestAuthorization() async -> Bool {
+        var granted = false
         do {
-            return try await UNUserNotificationCenter.current()
+            granted = try await UNUserNotificationCenter.current()
                 .requestAuthorization(options: [.alert, .sound])
         } catch {
-            return false
+            lastFailure = error.localizedDescription
         }
+        // Re-read rather than trusting `granted`: the request's own answer
+        // says what just happened, `notificationSettings()` says what is now
+        // true, and everything else in this app keys off the latter.
+        await refreshAuthorization()
+        return granted
     }
 
-    /// The *current* authorization state, without prompting — used to paint
-    /// the Settings toggle correctly on load, including the case where the
-    /// user granted access in a previous run and later revoked it from
-    /// System Settings without ever touching Perch's toggle again.
-    func authorizationStatus() async -> UNAuthorizationStatus {
-        await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+    /// Re-reads the *current* authorization state, without prompting, into
+    /// `authorization` — used to paint the Settings toggle correctly on load,
+    /// including the case where the user granted access in a previous run and
+    /// later revoked it from System Settings without ever touching Perch's
+    /// toggle again, and again before every delivery.
+    @discardableResult
+    func refreshAuthorization() async -> UNAuthorizationStatus {
+        let status = await UNUserNotificationCenter.current()
+            .notificationSettings()
+            .authorizationStatus
+        authorization = status
+        return status
     }
 
     /// Delivers each item's `title`/`body` exactly as Rust composed them —
@@ -64,8 +99,24 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     /// call rather than anything derived from `sessionId` — keying it on
     /// session identity would itself be a dedupe decision, and that decision
     /// already lives in Rust, not here.
-    func deliver(_ items: [WaitingNotification]) {
+    func deliver(_ items: [WaitingNotification]) async {
+        guard !items.isEmpty else { return }
         let center = UNUserNotificationCenter.current()
+
+        // Checked on every batch, not once at launch. Authorization can be
+        // granted or revoked from System Settings at any moment, and Rust
+        // reaches this method from a `waiting_enabled` the user may have
+        // hand-edited into config.toml without this app's toggle ever being
+        // touched — in which case authorization is still `.notDetermined` and
+        // every `add` below would fail with
+        // `UNErrorCodeNotificationsNotAllowed`. Rust decides *whether* a
+        // session has earned a notification; only macOS knows whether it may
+        // be shown, and only asking can tell us. Publishing the answer is
+        // what stops the Settings toggle asserting ON over a channel that
+        // delivers nothing.
+        await refreshAuthorization()
+        guard canDeliver else { return }
+
         for item in items {
             let content = UNMutableNotificationContent()
             content.title = item.title
@@ -84,7 +135,15 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
                 content: content,
                 trigger: nil
             )
-            center.add(request)
+            do {
+                try await center.add(request)
+                lastFailure = nil
+            } catch {
+                // Reported, never discarded: this is the difference between
+                // "no session was waiting" and "one was, and you were never
+                // told" — which is the whole of what this type is for.
+                lastFailure = error.localizedDescription
+            }
         }
     }
 
