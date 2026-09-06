@@ -1133,6 +1133,29 @@ pub fn custom_notify_label(minutes: u32) -> String {
     perch_core::ui::main_window::custom_notify_label(minutes)
 }
 
+/// The settings window's two stepper captions, free-standing for the same
+/// reason `custom_notify_label` is: they read no state, and they exist so the
+/// number a stepper is showing is pluralized here rather than interpolated
+/// into a sentence by the shell.
+#[uniffi::export]
+pub fn poll_seconds_label(seconds: u32) -> String {
+    core_ui_settings::poll_seconds_label(seconds)
+}
+
+#[uniffi::export]
+pub fn waiting_after_minutes_label(minutes: u32) -> String {
+    core_ui_settings::waiting_after_minutes_label(minutes)
+}
+
+/// The settings a first run starts from. Exported so a shell showing a
+/// control before its model has loaded can seed it from Rust's own default
+/// instead of re-declaring one of its own — a literal in the shell is a
+/// second source of truth that drifts the moment this one changes.
+#[uniffi::export]
+pub fn default_settings() -> Settings {
+    perch_core::settings::Settings::default().into()
+}
+
 #[uniffi::export]
 impl Perch {
     /// `config_dir: None` resolves per spec §3 (CLAUDE_CONFIG_DIR → XDG →
