@@ -187,14 +187,21 @@ jobs:
           # would plausibly be added first. All three must hold no
           # filesystem-writing API outside of Perch's own data.
           #
-          # `create_dir_all` is deliberately NOT in this list, and db.rs
-          # (perch-core) is deliberately excluded: it creates the parent
-          # directory of Perch's OWN index database and opens that database,
-          # which is Perch's file, not Claude Code's. Nothing under
-          # crates/perch-ffi/src or src-tauri/src is excluded — commands.rs
-          # performs no writes of its own (it delegates to db::open), and it is
-          # the file most likely to gain one, so it is audited like every other
-          # module.
+          # `create_dir_all` is deliberately NOT in this list, and exactly two
+          # files under perch-core are deliberately excluded, each for a write
+          # to Perch's OWN data, never anything inside the Claude Code
+          # directory: db.rs creates the parent directory of and opens Perch's
+          # own index database, and settings/store.rs creates the parent
+          # directory of and writes Perch's own config.toml. Both exclusions
+          # below use `-path` (the full path from the repo root) rather than
+          # `-name` (the basename alone) — `-name 'db.rs'` or `-name
+          # 'store.rs'` would silently exclude *any* file with that basename
+          # anywhere under the tree, not just these two exact files. Copy this
+          # `-path`, not `-name`, if a third file ever needs excluding here.
+          # Nothing under crates/perch-ffi/src or src-tauri/src is excluded —
+          # commands.rs performs no writes of its own (it delegates to
+          # db::open), and it is the file most likely to gain one, so it is
+          # audited like every other module.
           WRITES='fs::write|fs::remove_file|fs::remove_dir|File::create|OpenOptions'
           FFI_SRC_DIR=crates/perch-ffi/src
           SRC_TAURI_SRC_DIR=src-tauri/src
@@ -262,8 +269,40 @@ jobs:
           fi
           rm -rf "$SELFTEST_ROOT"
 
+          # Positive control proving the perch-core exclusions are matched by
+          # full path, not basename: a decoy file with the *same basename* as
+          # an excluded file, but at a *different path* (never the real source
+          # tree — this lives entirely under /tmp), must still trip the
+          # guard. If either exclusion below used `-name` instead of `-path`,
+          # these decoys would be silently excluded too and this self-test
+          # would fail. Mirrors the analogous same-basename check the Swift
+          # guard already runs for LauncherHelper.swift.
+          SELFTEST_ROOT=/tmp/no-network-selftest-write-core-path
+          rm -rf "$SELFTEST_ROOT"
+          mkdir -p "$SELFTEST_ROOT/crates/perch-core/src/decoy"
+          mkdir -p "$SELFTEST_ROOT/crates/perch-core/src/settings/decoy"
+          printf 'fn main() { fs::write("/tmp/x", "y").unwrap(); }\n' \
+            > "$SELFTEST_ROOT/crates/perch-core/src/decoy/db.rs"
+          printf 'fn main() { fs::write("/tmp/x", "y").unwrap(); }\n' \
+            > "$SELFTEST_ROOT/crates/perch-core/src/settings/decoy/store.rs"
+          offending=0
+          for f in $(cd "$SELFTEST_ROOT" && find crates/perch-core/src -name '*.rs' \
+                       ! -path 'crates/perch-core/src/db.rs' \
+                       ! -path 'crates/perch-core/src/settings/store.rs'); do
+            if prod "$SELFTEST_ROOT/$f" | grep -qE "$WRITES"; then
+              offending=1
+            fi
+          done
+          if [ "$offending" -ne 1 ]; then
+            echo "::error::Guard self-test failed: a same-basename decoy (db.rs or store.rs) at a different path was wrongly excluded — the exclusion must match by full path, not basename."
+            exit 1
+          fi
+          rm -rf "$SELFTEST_ROOT"
+
           offenders=0
-          for f in $(find crates/perch-core/src -name '*.rs' ! -name 'db.rs') \
+          for f in $(find crates/perch-core/src -name '*.rs' \
+                       ! -path 'crates/perch-core/src/db.rs' \
+                       ! -path 'crates/perch-core/src/settings/store.rs') \
                    $(find "$FFI_SRC_DIR" -name '*.rs') \
                    $(find "$SRC_TAURI_SRC_DIR" -name '*.rs'); do
             if prod "$f" | grep -E "$WRITES"; then
@@ -275,7 +314,7 @@ jobs:
             exit 1
           fi
 
-          echo "no filesystem writes found in perch-core (db.rs excluded), $FFI_SRC_DIR, or $SRC_TAURI_SRC_DIR (nothing excluded)"
+          echo "no filesystem writes found in perch-core (db.rs and settings/store.rs excluded), $FFI_SRC_DIR, or $SRC_TAURI_SRC_DIR (nothing excluded)"
 
       - name: Assert forbidden crates are unreachable in the resolved dependency graph
         run: |
