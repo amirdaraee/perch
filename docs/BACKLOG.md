@@ -133,8 +133,22 @@ Status legend: **now** = next task · **next** = this milestone or the following
 
 ## Next — settings & polish
 
-- **Settings search and per-section reset.** Deferred until the settings surface is bigger
-  than four tabs and eight fields — not worth the added UI before then.
+- **The settings window redesign is specced and planned, not built.** Nine panes, twenty-six
+  settings, and six new capabilities including the search and per-pane reset that were
+  deferred here while the surface was only four tabs and eight fields. See
+  `docs/superpowers/specs/2026-09-06-settings-window-redesign.md` and
+  `docs/superpowers/plans/2026-09-07-settings-window-redesign.md`.
+- **The four `ui::watcher` tests are wall-clock flaky under compile load.** All four passed
+  5/5 on an idle machine and all four failed together on the first run after a checkout,
+  when `cargo` was still building other crates' test binaries. They assert against real
+  timeouts, so a cold CI cache is exactly the condition that trips them. Worth rewriting
+  against an injectable clock rather than raising the timeouts, which only moves the
+  threshold. A vacuous test has already hidden in this module once, so any rewrite needs
+  proof it still fails when the behaviour it names regresses.
+- **`preferred_terminal` crosses the FFI as a bare string** and `Launcher.swift` compares
+  against its values, unlike `menu_bar_display`'s enum. A hand-edited unknown terminal
+  renders a picker with nothing selected. The redesign's Task 8 fixes the Rust half by
+  supplying detected terminals; the Swift comparison outlives it.
 - **Light-mode palette** — the popover is dark-only today.
 - **Keyboard**: ⌥-click the tray for the menu; ↑↓ to move between sessions, ⏎ to jump.
 - **First-run state**: "No Claude Code data found at …" with a path picker, instead of an
