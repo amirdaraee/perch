@@ -23,6 +23,43 @@ struct ProjectDetailPane: View {
     @State private var isRenaming = false
     @State private var renameDraft: String = ""
 
+    /// Local UI-only projection of `NotifyOverride`'s three cases onto the
+    /// segmented control's selection. `NotifyOverride.custom` carries a
+    /// minutes payload that doesn't fit a plain `Hashable` picker tag, so the
+    /// number is handled separately by `customMinutesBinding`.
+    private enum NotifyMode: Hashable {
+        case `default`, custom, off
+    }
+    /// Derived from `detail`, never separately mutated — same shape as
+    /// `pinnedBinding`/`archivedBinding` above, and for the same reason: a
+    /// `setNotifyOverride` call that throws must leave the segmented control
+    /// showing what the project's override actually still is, not whatever
+    /// was optimistically selected before the write failed.
+    private var notifyMode: NotifyMode {
+        switch detail?.notify {
+        case .off: return .off
+        case .custom: return .custom
+        case .default, .none: return .default
+        }
+    }
+    /// Fallback source for the stepper while `notifyMode != .custom`, and
+    /// `nil` until there is one: written only by `seedCustomMinutes` (a fresh
+    /// `.custom` override from the server) or by dialing the stepper itself.
+    /// While it is `nil`, `customMinutesBinding` reads the *global* default's
+    /// own minute count out of `ProjectDetail.notifyDefaultMinutes` — the
+    /// number behind the "Default — waits N minutes" label shown right beside
+    /// this control. The seed is a product decision, so it comes from Rust
+    /// like every other one; a literal here would silently drift the moment
+    /// the Rust default moved.
+    ///
+    /// `customMinutesBinding` prefers `detail`'s own value whenever the
+    /// override truly is `.custom` — that's what makes a stepper edit that
+    /// fails snap back to the last *persisted* number instead of keeping the
+    /// optimistic one — and only falls back to this field when `detail`
+    /// doesn't carry a custom value at all, which is what keeps a dialed-in
+    /// number alive across a Default/Off detour.
+    @State private var customMinutes: UInt32?
+
     var body: some View {
         Group {
             if let detail {
@@ -74,6 +111,7 @@ struct ProjectDetailPane: View {
 
                 totals(detail)
                 noteEditor(detail)
+                notifySection(detail)
                 sparkline(detail)
                 sessionList(detail)
             }
@@ -146,6 +184,42 @@ struct ProjectDetailPane: View {
                 .onChange(of: noteFocused) { _, focused in
                     if !focused { Task { await saveNoteIfChanged() } }
                 }
+        }
+    }
+
+    /// The milestone's distinguishing decision: the per-project notification
+    /// override lives here, on the project the user is already looking at —
+    /// not as a row in the settings window. Default/Custom/Off; the custom
+    /// stepper stays visible but disabled unless Custom is selected, matching
+    /// Task 7's settings window (dependent controls grey out, they don't
+    /// vanish).
+    @ViewBuilder
+    private func notifySection(_ detail: ProjectDetail) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Notifications").font(.caption2).foregroundStyle(.secondary).textCase(.uppercase)
+
+            Picker("Notifications", selection: notifyModeBinding(detail)) {
+                Text("Default").tag(NotifyMode.default)
+                Text("Custom").tag(NotifyMode.custom)
+                Text("Off").tag(NotifyMode.off)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 280)
+
+            // Shows what "Default" currently means so the user isn't
+            // choosing blind — `notifyDefaultLabel` is already a finished
+            // sentence fragment composed in Rust, never assembled here.
+            if notifyMode == .default {
+                Text(detail.notifyDefaultLabel)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Stepper(value: customMinutesBinding(detail), in: 1...240) {
+                Text(customNotifyLabel(minutes: customMinutesBinding(detail).wrappedValue))
+            }
+            .disabled(notifyMode != .custom)
         }
     }
 
@@ -247,6 +321,55 @@ struct ProjectDetailPane: View {
         )
     }
 
+    /// Takes `detail` rather than reading the optional `@State` one, because
+    /// switching to Custom has to send a number and the number it sends is
+    /// whatever the stepper is showing — which, before the user has dialled
+    /// anything, is the global default carried on `detail` itself.
+    private func notifyModeBinding(_ detail: ProjectDetail) -> Binding<NotifyMode> {
+        Binding(
+            // No optimistic assignment here — `notifyMode` reads straight
+            // from `detail`, so a `setNotifyOverride` that throws leaves the
+            // picker showing exactly what it showed before the tap, same as
+            // `pinnedBinding`/`archivedBinding`.
+            get: { notifyMode },
+            set: { newMode in
+                let minutes = customMinutesBinding(detail).wrappedValue
+                Task { await setNotify(mode: newMode, minutes: minutes) }
+            }
+        )
+    }
+
+    /// Also takes `detail`, so the un-dialled seed has a definite source:
+    /// `notifyDefaultMinutes`, the global threshold Rust composed the
+    /// neighbouring "Default — waits N minutes" label from. Nothing here
+    /// invents a starting number, and nothing parses that label to recover
+    /// one.
+    private func customMinutesBinding(_ detail: ProjectDetail) -> Binding<UInt32> {
+        Binding(
+            get: {
+                // Prefer `detail`'s own number whenever the override truly is
+                // `.custom` — that's what makes a stepper edit that fails
+                // snap back to the last *persisted* minutes instead of
+                // keeping the optimistic one. Only outside `.custom` (where
+                // `detail` has no minutes to read) does this fall back to the
+                // locally-tracked seed, which is what keeps a dialed-in
+                // number alive across a Default/Off detour — and, before
+                // anything has been dialled, to the global default.
+                if case .custom(let afterMinutes) = detail.notify { return afterMinutes }
+                return customMinutes ?? detail.notifyDefaultMinutes
+            },
+            set: { newValue in
+                customMinutes = newValue
+                // The stepper is disabled outside `.custom` (SwiftUI blocks
+                // the interaction that would call this setter); the guard is
+                // defence-in-depth only, matching this file's existing
+                // `guard d.id == projectId` in `apply(_:)`.
+                guard notifyMode == .custom else { return }
+                Task { await setNotify(mode: .custom, minutes: newValue) }
+            }
+        )
+    }
+
     // MARK: - Actions
 
     /// Every terminal launch funnels through here so failures surface
@@ -259,7 +382,16 @@ struct ProjectDetailPane: View {
             actionError = EngineUnavailable().localizedDescription
             return
         }
-        do { try Launcher.run(command) } catch { self.actionError = error.localizedDescription }
+        // Read fresh at the moment of launch, not cached from whenever this
+        // view first loaded — a `preferredTerminal` change (from this
+        // window, or a hand-edited config.toml) is picked up on the very
+        // next launch with no extra plumbing.
+        let terminal = await engine.settings()?.settings.preferredTerminal ?? "Terminal"
+        do {
+            try Launcher.run(command, terminal: terminal)
+        } catch {
+            self.actionError = error.localizedDescription
+        }
     }
 
     private func load() async {
@@ -268,9 +400,20 @@ struct ProjectDetailPane: View {
         case .success(let d):
             detail = d
             noteDraft = d.note
+            seedCustomMinutes(from: d.notify)
         case .failure(let e):
             loadError = e.localizedDescription
         }
+    }
+
+    /// `notifyMode` reads straight from `detail`, so it needs no seeding.
+    /// `customMinutes` is the one bit of notify state actually kept in local
+    /// `@State` (as a fallback for while the override isn't `.custom` — see
+    /// its declaration above), so it's what this seeds from a fresh/refreshed
+    /// override, same moment `detail`/`noteDraft` get seeded.
+    private func seedCustomMinutes(from override: NotifyOverride) {
+        guard case .custom(let afterMinutes) = override else { return }
+        customMinutes = afterMinutes
     }
 
     /// Adopts the refreshed model an edit method returns, rather than
@@ -292,10 +435,27 @@ struct ProjectDetailPane: View {
         switch result {
         case .success(let d):
             guard d.id == projectId else { return }
+            // Cleared here, not only set in the failure arm below: without
+            // this, a rejected pin toggle leaves its banner on screen through
+            // every later edit that succeeds, asserting a failure that is no
+            // longer true. `SettingsRootView.load()` carries the same fix for
+            // the same reason.
+            actionError = nil
             detail = d
             noteDraft = d.note
+            // `set_notify_override` clamps the custom threshold in Rust
+            // (1...240); `notifyMode` already reads straight from `detail`,
+            // so only `customMinutes`'s fallback needs reseeding here — this
+            // is what makes a clamped value display as clamped.
+            seedCustomMinutes(from: d.notify)
             await onChanged()
         case .failure(let e):
+            // Deliberately no re-seed here: `notifyMode` and
+            // `customMinutesBinding.get`'s primary path both read straight
+            // from `detail`, which a failure never touches — so a rejected
+            // `setNotifyOverride` already leaves the notify control showing
+            // exactly the pre-edit, still-persisted state without anything
+            // extra to restore.
             actionError = e.localizedDescription
         }
     }
@@ -313,6 +473,17 @@ struct ProjectDetailPane: View {
     private func setArchived(_ archived: Bool) async {
         guard let detail else { return }
         await apply(await engine.setArchived(projectId: detail.id, archived: archived))
+    }
+
+    private func setNotify(mode: NotifyMode, minutes: UInt32) async {
+        guard let detail else { return }
+        let override: NotifyOverride
+        switch mode {
+        case .default: override = .default
+        case .off: override = .off
+        case .custom: override = .custom(afterMinutes: minutes)
+        }
+        await apply(await engine.setNotifyOverride(projectId: detail.id, override: override))
     }
 
     private func rename() async {

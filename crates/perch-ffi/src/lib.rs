@@ -3,10 +3,15 @@
 
 use perch_core::db::Db;
 use perch_core::platform::RealProcessProbe;
-use perch_core::ui::{main_window, model as core_model, usage as core_usage, watcher};
-use perch_core::{config, db, index, live, pricing};
+use perch_core::ui::{
+    diagnostics as core_diagnostics, main_window, model as core_model,
+    settings as core_ui_settings, usage as core_usage, watcher,
+};
+use perch_core::{config, db, index, live, notify, pricing, query, settings};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 uniffi::setup_scaffolding!();
 
@@ -242,6 +247,17 @@ pub struct ProjectDetail {
     pub pinned: bool,
     pub archived: bool,
     pub path_exists: bool,
+    /// This project's own notification override — not the global setting.
+    pub notify: NotifyOverride,
+    /// What `NotifyOverride::Default` currently means, spelled out (see
+    /// `main_window::default_notify_label`) — always present, regardless of
+    /// `notify`'s own value. For display only: never parse it.
+    pub notify_default_label: String,
+    /// The number behind that label — the global "waiting on you" threshold
+    /// in minutes. What a shell seeds its "Custom" minute control from, so
+    /// the starting value is Rust's product decision rather than a literal
+    /// in the shell that drifts when the default moves.
+    pub notify_default_minutes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -401,6 +417,9 @@ impl From<main_window::ProjectDetail> for ProjectDetail {
             pinned,
             archived,
             path_exists,
+            notify,
+            notify_default_label,
+            notify_default_minutes,
         } = d;
         ProjectDetail {
             id,
@@ -412,6 +431,9 @@ impl From<main_window::ProjectDetail> for ProjectDetail {
             session_count,
             sparkline: sparkline.into_iter().map(Into::into).collect(),
             sessions: sessions.into_iter().map(Into::into).collect(),
+            notify: notify.into(),
+            notify_default_label,
+            notify_default_minutes,
             pinned,
             archived,
             path_exists,
@@ -542,18 +564,346 @@ impl From<perch_core::actions::TerminalCommand> for TerminalCommand {
     }
 }
 
+// --- Settings, diagnostics, the per-project override, and notifications ---
+// Everything below mirrors `perch_core::settings`, `perch_core::ui::settings`,
+// `perch_core::ui::diagnostics`, `perch_core::db::NotifyOverride` and
+// `perch_core::notify::Notification`. `Settings` and `NotifyOverride` cross
+// the boundary in *both* directions (a shell both reads and writes them), so
+// each gets a `From` impl each way; both directions destructure their source
+// for the same reason every other mirror in this file does — so a field
+// added on either side becomes a compile error here, not a silent gap.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MenuBarDisplay {
+    Icon,
+    Count,
+    CountAndWaiting,
+}
+
+impl From<settings::MenuBarDisplay> for MenuBarDisplay {
+    fn from(d: settings::MenuBarDisplay) -> Self {
+        match d {
+            settings::MenuBarDisplay::Icon => MenuBarDisplay::Icon,
+            settings::MenuBarDisplay::Count => MenuBarDisplay::Count,
+            settings::MenuBarDisplay::CountAndWaiting => MenuBarDisplay::CountAndWaiting,
+        }
+    }
+}
+
+impl From<MenuBarDisplay> for settings::MenuBarDisplay {
+    fn from(d: MenuBarDisplay) -> Self {
+        match d {
+            MenuBarDisplay::Icon => settings::MenuBarDisplay::Icon,
+            MenuBarDisplay::Count => settings::MenuBarDisplay::Count,
+            MenuBarDisplay::CountAndWaiting => settings::MenuBarDisplay::CountAndWaiting,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct Settings {
+    pub launch_at_login: bool,
+    pub claude_config_dir: String,
+    pub menu_bar_display: MenuBarDisplay,
+    pub poll_seconds: u32,
+    pub waiting_enabled: bool,
+    pub waiting_after_minutes: u32,
+    pub include_background: bool,
+    pub preferred_terminal: String,
+}
+
+impl From<settings::Settings> for Settings {
+    fn from(s: settings::Settings) -> Self {
+        let settings::Settings {
+            launch_at_login,
+            claude_config_dir,
+            menu_bar_display,
+            poll_seconds,
+            waiting_enabled,
+            waiting_after_minutes,
+            include_background,
+            preferred_terminal,
+        } = s;
+        Settings {
+            launch_at_login,
+            claude_config_dir,
+            menu_bar_display: menu_bar_display.into(),
+            poll_seconds,
+            waiting_enabled,
+            waiting_after_minutes,
+            include_background,
+            preferred_terminal,
+        }
+    }
+}
+
+impl From<Settings> for settings::Settings {
+    fn from(s: Settings) -> Self {
+        let Settings {
+            launch_at_login,
+            claude_config_dir,
+            menu_bar_display,
+            poll_seconds,
+            waiting_enabled,
+            waiting_after_minutes,
+            include_background,
+            preferred_terminal,
+        } = s;
+        settings::Settings {
+            launch_at_login,
+            claude_config_dir,
+            menu_bar_display: menu_bar_display.into(),
+            poll_seconds,
+            waiting_enabled,
+            waiting_after_minutes,
+            include_background,
+            preferred_terminal,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct SettingsModel {
+    pub settings: Settings,
+    pub config_path: String,
+    pub notes: Vec<String>,
+    pub error: Option<String>,
+}
+
+impl From<core_ui_settings::SettingsModel> for SettingsModel {
+    fn from(m: core_ui_settings::SettingsModel) -> Self {
+        let core_ui_settings::SettingsModel {
+            settings,
+            config_path,
+            notes,
+            error,
+        } = m;
+        SettingsModel {
+            settings: settings.into(),
+            config_path,
+            notes,
+            error,
+        }
+    }
+}
+
+/// Per-project override of the global notification setting (see
+/// `db::NotifyOverride`). Crosses the boundary both ways: `set_notify_override`
+/// takes one as input, and `ProjectDetail.notify` reports a project's current
+/// one back — so, like `Settings`, it gets a `From` each way, both
+/// destructuring for the same reason as every other conversion here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum NotifyOverride {
+    Default,
+    Off,
+    Custom { after_minutes: u32 },
+}
+
+impl From<NotifyOverride> for db::NotifyOverride {
+    fn from(o: NotifyOverride) -> Self {
+        match o {
+            NotifyOverride::Default => db::NotifyOverride::Default,
+            NotifyOverride::Off => db::NotifyOverride::Off,
+            NotifyOverride::Custom { after_minutes } => {
+                db::NotifyOverride::Custom { after_minutes }
+            }
+        }
+    }
+}
+
+impl From<db::NotifyOverride> for NotifyOverride {
+    fn from(o: db::NotifyOverride) -> Self {
+        match o {
+            db::NotifyOverride::Default => NotifyOverride::Default,
+            db::NotifyOverride::Off => NotifyOverride::Off,
+            db::NotifyOverride::Custom { after_minutes } => {
+                NotifyOverride::Custom { after_minutes }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum RecordVerdict {
+    Accepted,
+    NoSuchProcess,
+    NotClaude { actual: String },
+    Unparsable,
+}
+
+impl From<core_diagnostics::RecordVerdict> for RecordVerdict {
+    fn from(v: core_diagnostics::RecordVerdict) -> Self {
+        match v {
+            core_diagnostics::RecordVerdict::Accepted => RecordVerdict::Accepted,
+            core_diagnostics::RecordVerdict::NoSuchProcess => RecordVerdict::NoSuchProcess,
+            core_diagnostics::RecordVerdict::NotClaude { actual } => {
+                RecordVerdict::NotClaude { actual }
+            }
+            core_diagnostics::RecordVerdict::Unparsable => RecordVerdict::Unparsable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct RecordRow {
+    pub file: String,
+    pub pid: i32,
+    pub session_id: String,
+    pub verdict: RecordVerdict,
+    pub verdict_label: String,
+}
+
+impl From<core_diagnostics::RecordRow> for RecordRow {
+    fn from(r: core_diagnostics::RecordRow) -> Self {
+        let core_diagnostics::RecordRow {
+            file,
+            pid,
+            session_id,
+            verdict,
+            verdict_label,
+        } = r;
+        RecordRow {
+            file,
+            pid,
+            session_id,
+            verdict: verdict.into(),
+            verdict_label,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct DiagnosticsModel {
+    pub config_dir: String,
+    pub config_dir_source: String,
+    pub sessions_dir: String,
+    pub records: Vec<RecordRow>,
+    pub settings_path: String,
+    pub settings_loaded: bool,
+    pub index_path: String,
+    pub index_sessions: String,
+    pub index_turns: String,
+    pub last_indexed: String,
+}
+
+impl From<core_diagnostics::DiagnosticsModel> for DiagnosticsModel {
+    fn from(m: core_diagnostics::DiagnosticsModel) -> Self {
+        let core_diagnostics::DiagnosticsModel {
+            config_dir,
+            config_dir_source,
+            sessions_dir,
+            records,
+            settings_path,
+            settings_loaded,
+            index_path,
+            index_sessions,
+            index_turns,
+            last_indexed,
+        } = m;
+        DiagnosticsModel {
+            config_dir,
+            config_dir_source,
+            sessions_dir,
+            records: records.into_iter().map(Into::into).collect(),
+            settings_path,
+            settings_loaded,
+            index_path,
+            index_sessions,
+            index_turns,
+            last_indexed,
+        }
+    }
+}
+
+/// Mirrors `perch_core::notify::Notification`, named differently on this side
+/// of the boundary: `Notification` is also `Foundation.Notification` in every
+/// Swift file that imports both `PerchFFI` and `Foundation`/`AppKit` (which is
+/// most of them) — the two would collide as soon as either was written
+/// unqualified, so this one is spelled out instead.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct WaitingNotification {
+    pub session_id: String,
+    /// What a click on this alert routes to: the id of the indexed project
+    /// the waiting session is running in — unique, and the same key every
+    /// other model on this boundary is addressed by. `project` below is only
+    /// the directory name Perch displays, and two projects can share one
+    /// (`~/work/api` and `~/personal/api`), so it must never be used to
+    /// identify a project.
+    ///
+    /// `None` when the index has never seen that directory. A shell that
+    /// gets `None` has nothing to select and must select nothing — guessing
+    /// from `project` is exactly the wrong answer this field exists to
+    /// prevent.
+    pub project_id: Option<i64>,
+    pub project: String,
+    pub title: String,
+    pub body: String,
+}
+
+impl From<notify::Notification> for WaitingNotification {
+    fn from(n: notify::Notification) -> Self {
+        let notify::Notification {
+            session_id,
+            project_id,
+            project,
+            title,
+            body,
+        } = n;
+        WaitingNotification {
+            session_id,
+            project_id,
+            project,
+            title,
+            body,
+        }
+    }
+}
+
 /// Implemented by the shell. Called on the watcher thread; the shell hops to its UI thread.
 #[uniffi::export(with_foreign)]
 pub trait PerchListener: Send + Sync {
     fn on_model(&self, model: PopoverModel);
+    /// Edge-triggered "waiting on you" alerts decided by `notify::decide` for
+    /// this tick — never called with an empty vector; a tick with nothing new
+    /// to say simply doesn't call this at all.
+    fn on_notifications(&self, items: Vec<WaitingNotification>);
 }
 
 #[derive(uniffi::Object)]
 pub struct Perch {
-    config_dir: PathBuf,
+    /// Mutable at runtime: a settings-file hand-edit (or a `save_settings`
+    /// call) that changes `claude_config_dir` swaps this in place rather
+    /// than requiring the shell to tear down and reconstruct `Perch` itself
+    /// — see `on_settings_file_changed`.
+    config_dir: Arc<Mutex<PathBuf>>,
     db_path: PathBuf,
+    config_path: PathBuf,
     reindex_error: Arc<Mutex<Option<String>>>,
     handle: Mutex<Option<watcher::WatcherHandle>>,
+    /// The live watch on `config.toml` itself, started by `start()`. `None`
+    /// before `start()` runs (or after `stop()`).
+    settings_watch: Mutex<Option<settings::store::WatchHandle>>,
+    /// Stashed by `start()` so `on_settings_file_changed` can rebuild the
+    /// session watcher against the same listener when `poll_seconds` or
+    /// `claude_config_dir` changes underneath a running engine.
+    listener: Mutex<Option<Arc<dyn PerchListener>>>,
+    /// The settings this engine last saw — compared against on every
+    /// settings-file watch tick so an unrelated poll (the watch fires
+    /// `on_change` on every tick of its own backstop, not only on an actual
+    /// change — see `settings::store::watch`'s own doc comment) is a no-op
+    /// rather than an unconditional restart.
+    last_settings: Mutex<settings::Settings>,
+    /// Episodes already notified for (see `notify::decide`), shared across every
+    /// watcher tick so a still-waiting session is never notified twice. Lives
+    /// here, not in the shell: the shell only ever sees the finished
+    /// `WaitingNotification`s a tick produces, never the bookkeeping behind them.
+    notified: Arc<Mutex<HashSet<notify::Episode>>>,
+    /// Lets a callback that must outlive any single method call (the
+    /// settings watch's `on_change`) reach back into this object without
+    /// holding a strong reference that would keep it alive forever — see
+    /// `start()`. Never upgraded from inside `Perch` itself, only handed to
+    /// that one callback.
+    self_ref: Weak<Perch>,
 }
 
 fn now_ms() -> i64 {
@@ -573,25 +923,39 @@ fn db_err(e: impl std::fmt::Display) -> PerchError {
 ///
 /// Honours `PERCH_DATA_DIR` (the directory to hold `index.db`) when set, so
 /// tests never touch the user's real index; falls back to the platform
-/// default app-data directory otherwise.
+/// default app-data directory otherwise. The resolution itself now lives in
+/// `perch_core::settings::store::app_data_dir` (moved there in the settings
+/// task, which needed the identical directory for `config.toml`) — this
+/// just appends this file's own name to it.
 fn app_data_db() -> Result<PathBuf, PerchError> {
-    if let Ok(dir) = std::env::var("PERCH_DATA_DIR") {
-        return Ok(PathBuf::from(dir).join("index.db"));
-    }
-    let home = std::env::var("HOME").map_err(|_| PerchError::Io {
-        message: "HOME is not set".into(),
+    let dir = settings::store::app_data_dir().map_err(|e| PerchError::Io {
+        message: e.to_string(),
     })?;
-    #[cfg(target_os = "macos")]
-    let base = PathBuf::from(home)
-        .join("Library")
-        .join("Application Support")
-        .join("Perch");
-    #[cfg(not(target_os = "macos"))]
-    let base = PathBuf::from(home)
-        .join(".local")
-        .join("share")
-        .join("perch");
-    Ok(base.join("index.db"))
+    Ok(dir.join("index.db"))
+}
+
+/// Where `config.toml` lives: `PERCH_CONFIG` if set, else `config.toml`
+/// inside the same app-data directory `app_data_db` resolves `index.db`
+/// against (see `settings::store::config_path`).
+fn config_toml_path() -> Result<PathBuf, PerchError> {
+    settings::store::config_path().map_err(|e| PerchError::Io {
+        message: e.to_string(),
+    })
+}
+
+/// The Claude Code directory an empty (or absent) `Perch::new` constructor
+/// override resolves to: the settings file's own `claude_config_dir` when
+/// it names one, else the ordinary environment-based resolution
+/// (`config::config_dir`) every other caller falls through to. This mirrors
+/// `ui::diagnostics::config_dir_source`'s own precedence, which already
+/// reports the settings override as beating every env-derived source — the
+/// two must never disagree about which one wins.
+fn resolve_config_dir_override(claude_config_dir: &str) -> Option<PathBuf> {
+    let trimmed = claude_config_dir.trim();
+    if !trimmed.is_empty() {
+        return Some(PathBuf::from(trimmed));
+    }
+    config::config_dir()
 }
 
 /// The parts of `Perch` the watcher closure needs, without holding an
@@ -600,12 +964,18 @@ fn app_data_db() -> Result<PathBuf, PerchError> {
 /// outcome* only — not a back-reference to `Perch` itself.
 #[derive(Clone)]
 struct ThisPerch {
-    config_dir: PathBuf,
+    config_dir: Arc<Mutex<PathBuf>>,
     db_path: PathBuf,
+    config_path: PathBuf,
     reindex_error: Arc<Mutex<Option<String>>>,
+    notified: Arc<Mutex<HashSet<notify::Episode>>>,
 }
 
 impl ThisPerch {
+    fn config_dir(&self) -> PathBuf {
+        self.config_dir.lock().unwrap().clone()
+    }
+
     fn model_for(&self, sessions: Vec<live::LiveSession>) -> PopoverModel {
         self.core_model_for(sessions).into()
     }
@@ -622,7 +992,17 @@ impl ThisPerch {
         // runs on every watcher tick, not just around a re-index, so it is
         // the only place that ever sees that failure.
         let db_result = db::open(&self.db_path);
-        let mut model = core_model::build_model(db_result.as_ref().ok(), &sessions, now_ms());
+        // Loaded fresh, independently of `notifications_for`'s own load
+        // (same duplication that method already carries, and cheap for the
+        // same reason: parsing one small file): a hand-edited
+        // `menu_bar_display` must be reflected the moment the *next* tick's
+        // model goes out, not only after some separate settings-watch
+        // machinery reacts.
+        let display = settings::store::load(&self.config_path)
+            .settings
+            .menu_bar_display;
+        let mut model =
+            core_model::build_model(db_result.as_ref().ok(), &sessions, now_ms(), display);
         // Neither fold may clobber a more specific error `build_model` itself
         // already produced (e.g. a broken index schema): this tick's open
         // failure is more specific than a possibly-stale re-index failure
@@ -650,75 +1030,250 @@ impl ThisPerch {
                 db::open(&self.db_path).map_err(|e| format!("could not open index: {e}"))?;
             pricing::seed_default_prices(&database)
                 .map_err(|e| format!("could not seed prices: {e}"))?;
-            index::index_all(&database, &config::projects_dir(&self.config_dir))
+            index::index_all(&database, &config::projects_dir(&self.config_dir()))
                 .map_err(|e| format!("could not index sessions: {e}"))?;
             Ok(())
         })();
         *self.reindex_error.lock().unwrap() = outcome.err();
     }
+
+    /// This tick's id and `NotifyOverride` for every project the index knows,
+    /// keyed by the project's `real_path` — the same string `LiveSession::cwd`
+    /// carries (see `main_window`'s identical `l.cwd == s.real_path` match).
+    /// One database round trip per tick, not one per session: both of
+    /// `decide`'s lookups below are pure map lookups over this.
+    ///
+    /// The id rides along with the override rather than costing a second
+    /// query because `project_summaries` already carries it — it is what a
+    /// finished notification points at, so a click routes to the project the
+    /// alert was about rather than to whichever indexed project happens to
+    /// share its directory name.
+    ///
+    /// A database that won't open, or a summary query that fails, yields an
+    /// empty map — every project then falls through to `NotifyOverride::Default`
+    /// (and to no id) for this tick. That is the same graceful-degradation the
+    /// rest of this file gives a watcher tick (see `core_model_for`'s own
+    /// `db::open`): the tick's `PopoverModel.error` already carries an open
+    /// failure when there is one, and `Vec<WaitingNotification>` has no error
+    /// channel of its own to carry a second, redundant report of the identical
+    /// trouble.
+    fn projects_by_cwd(&self) -> HashMap<String, (i64, db::NotifyOverride)> {
+        let Ok(database) = db::open(&self.db_path) else {
+            return HashMap::new();
+        };
+        // One `project_meta` query per *project*, not per session (that's the
+        // shape the brief asked to avoid: an N+1 against live session count).
+        // This is still an N+1 against project count, run once per tick —
+        // a deliberate choice at today's scale, not an oversight: `Db` has no
+        // "every project's meta in one query" method yet, and adding one
+        // purely for this cache would be new surface for a cost that isn't
+        // showing up. Revisit if this is ever measured against hundreds of
+        // projects.
+        query::project_summaries(&database)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|s| {
+                database
+                    .project_meta(s.id)
+                    .ok()
+                    .map(|m| (s.real_path, (s.id, m.notify)))
+            })
+            .collect()
+    }
+
+    /// This tick's edge-triggered notifications (see `notify::decide`),
+    /// updating the shared episode memory in place so the next tick picks up
+    /// exactly where this one left off.
+    fn notifications_for(&self, sessions: &[live::LiveSession]) -> Vec<WaitingNotification> {
+        let loaded_settings = settings::store::load(&self.config_path).settings;
+        let projects = self.projects_by_cwd();
+        let override_for = |cwd: &str| {
+            projects
+                .get(cwd)
+                .map(|(_, notify)| *notify)
+                .unwrap_or(db::NotifyOverride::Default)
+        };
+        // A `cwd` the index has never seen resolves to no id at all — the
+        // notification then names no project rather than a wrong one.
+        let project_id_for = |cwd: &str| projects.get(cwd).map(|(id, _)| *id);
+
+        let mut notified = self.notified.lock().unwrap();
+        let (items, remembered) = notify::decide(
+            sessions,
+            &loaded_settings,
+            &override_for,
+            &project_id_for,
+            &notified,
+            now_ms(),
+        );
+        *notified = remembered;
+        items.into_iter().map(Into::into).collect()
+    }
+
+    /// One watcher tick, start to finish: the model and the notifications it
+    /// earns, both delivered to `listener`. Factored out of `start`'s closure
+    /// so it is directly testable against hand-built `LiveSession`s, without
+    /// a live watcher thread or `RealProcessProbe` needing an actual `claude`
+    /// process to find.
+    fn tick(&self, listener: &dyn PerchListener, sessions: Vec<live::LiveSession>) {
+        let notifications = self.notifications_for(&sessions);
+        listener.on_model(self.model_for(sessions));
+        if !notifications.is_empty() {
+            listener.on_notifications(notifications);
+        }
+    }
+}
+
+/// Composes the "After N minutes" label for a notification override a shell's
+/// stepper is *currently* showing. Free-standing rather than a `Perch` method
+/// because it reads no state: it exists purely so the pluralization happens
+/// here, under the rule that a shell never composes a sentence from a number.
+#[uniffi::export]
+pub fn custom_notify_label(minutes: u32) -> String {
+    perch_core::ui::main_window::custom_notify_label(minutes)
+}
+
+/// The settings window's two stepper captions, free-standing for the same
+/// reason `custom_notify_label` is: they read no state, and they exist so the
+/// number a stepper is showing is pluralized here rather than interpolated
+/// into a sentence by the shell.
+#[uniffi::export]
+pub fn poll_seconds_label(seconds: u32) -> String {
+    core_ui_settings::poll_seconds_label(seconds)
+}
+
+#[uniffi::export]
+pub fn waiting_after_minutes_label(minutes: u32) -> String {
+    core_ui_settings::waiting_after_minutes_label(minutes)
+}
+
+/// The settings a first run starts from. Exported so a shell showing a
+/// control before its model has loaded can seed it from Rust's own default
+/// instead of re-declaring one of its own — a literal in the shell is a
+/// second source of truth that drifts the moment this one changes.
+#[uniffi::export]
+pub fn default_settings() -> Settings {
+    perch_core::settings::Settings::default().into()
 }
 
 #[uniffi::export]
 impl Perch {
-    /// `config_dir: None` resolves per spec §3 (CLAUDE_CONFIG_DIR → XDG → ~/.claude).
+    /// `config_dir: None` resolves per spec §3 (CLAUDE_CONFIG_DIR → XDG →
+    /// ~/.claude) — *unless* the settings file itself names a
+    /// `claude_config_dir` override, which beats every one of those (see
+    /// `resolve_config_dir_override`, and `ui::diagnostics::config_dir_source`,
+    /// which already reports exactly this precedence). An explicit `Some(p)`
+    /// (tests, and any future caller with its own reason to bypass settings
+    /// entirely) still beats both.
+    ///
+    /// A settings override that names something unusable never reaches the
+    /// failure below: `Settings::validated` has already dropped it back to
+    /// auto-detection and earned a note the settings window shows. That
+    /// matters here more than anywhere else — every control in that window
+    /// is disabled while the engine is down, so a constructor that failed on
+    /// a bad `claude_config_dir` would leave the user with no way to edit or
+    /// clear the very field that caused it.
     #[uniffi::constructor]
     pub fn new(config_dir: Option<String>) -> Result<Arc<Self>, PerchError> {
+        let config_path = config_toml_path()?;
         let dir = match config_dir {
             Some(p) => PathBuf::from(p),
-            None => config::config_dir().ok_or(PerchError::NoConfigDir {
-                path: "<unresolved>".into(),
-            })?,
+            None => {
+                let claude_config_dir = settings::store::load(&config_path)
+                    .settings
+                    .claude_config_dir;
+                // `.filter(is_dir).or_else(...)` is defence in depth, not the
+                // mechanism: as the code stands `claude_config_dir` is either
+                // empty or a real directory by the time `load` returns it, so
+                // the filter never fires. It is here because this constructor
+                // is the one place where getting this wrong costs the user
+                // the only UI that could fix it — so it never trusts an
+                // override far enough to refuse to start over one, whatever
+                // some future loader might hand it.
+                resolve_config_dir_override(&claude_config_dir)
+                    .filter(|d| d.is_dir())
+                    .or_else(config::config_dir)
+                    .ok_or(PerchError::NoConfigDir {
+                        path: "<unresolved>".into(),
+                    })?
+            }
         };
         if !dir.is_dir() {
             return Err(PerchError::NoConfigDir {
                 path: dir.to_string_lossy().into_owned(),
             });
         }
-        Ok(Arc::new(Self {
-            config_dir: dir,
-            db_path: app_data_db()?,
+        let db_path = app_data_db()?;
+        Ok(Arc::new_cyclic(|weak| Self {
+            config_dir: Arc::new(Mutex::new(dir)),
+            db_path,
+            config_path,
             reindex_error: Arc::new(Mutex::new(None)),
             handle: Mutex::new(None),
+            settings_watch: Mutex::new(None),
+            listener: Mutex::new(None),
+            last_settings: Mutex::new(settings::Settings::default()),
+            notified: Arc::new(Mutex::new(HashSet::new())),
+            self_ref: weak.clone(),
         }))
     }
 
     /// Synchronous snapshot: sessions from disk, stats from the index if it opens.
     pub fn current(&self) -> PopoverModel {
         let sessions =
-            live::live_sessions(&config::sessions_dir(&self.config_dir), &RealProcessProbe);
+            live::live_sessions(&config::sessions_dir(&self.config_dir()), &RealProcessProbe);
         self.model_for(sessions)
     }
 
     /// Emit the current sessions immediately (from whatever the index
     /// already holds), then re-index in the background and emit again, then
-    /// keep emitting on every change and at least every 5 s.
+    /// keep emitting on every change and at least every `poll_seconds`
+    /// (today's settings value, read once here — see `spawn_watcher` and
+    /// `on_settings_file_changed` for how a later change to it takes effect
+    /// without this method being called again).
+    ///
+    /// Also starts a watch on `config.toml` itself, so a hand-edited
+    /// `poll_seconds` or `claude_config_dir` reaches a *running* engine —
+    /// see `on_settings_file_changed`.
     ///
     /// Idempotent: a second call while already running is a no-op. Re-index
     /// work never runs on the caller's thread (AppKit's main thread calls
     /// this from `applicationDidFinishLaunching`) — see `refresh()`.
     pub fn start(&self, listener: Arc<dyn PerchListener>) {
-        let mut guard = self.handle.lock().unwrap();
-        if guard.is_some() {
-            return;
+        let loaded = settings::store::load(&self.config_path).settings;
+
+        // Checking "already running?" and claiming the slot are one critical
+        // section, the same way `refresh()` and `stop()` each decide inside a
+        // single `self.handle.lock()`. Released and retaken, two callers can
+        // both read `None` and both spawn a watcher — and only the second
+        // ends up in `handle`, so `stop()` can never reach the first.
+        //
+        // Nothing else is locked while this guard is held: `build_watcher`
+        // touches no other field of `self`, and the assignments below wait
+        // until it is dropped. `on_settings_file_changed` takes `listener`
+        // and *then* `handle`, so taking them the other way round here would
+        // be a lock-order inversion between this thread and that one.
+        {
+            let mut handle = self.handle.lock().unwrap();
+            if handle.is_some() {
+                return;
+            }
+            *handle = Some(self.build_watcher(listener.clone(), loaded.poll_seconds));
         }
-        let me = ThisPerch {
-            config_dir: self.config_dir.clone(),
-            db_path: self.db_path.clone(),
-            reindex_error: self.reindex_error.clone(),
-        };
-        let me_for_refresh = me.clone();
-        let cfg = watcher::WatcherConfig::for_dir(config::sessions_dir(&self.config_dir));
-        let h = watcher::spawn(
-            cfg,
-            Arc::new(RealProcessProbe),
-            move |sessions| listener.on_model(me.model_for(sessions)),
-            move || me_for_refresh.reindex(),
-        );
-        // The watcher's own initial emit (above) is prompt but may be built
-        // from a stale or empty index; ask it to re-index and emit again
-        // right away, on its own thread, rather than blocking here for it.
-        h.refresh();
-        *guard = Some(h);
+        *self.last_settings.lock().unwrap() = loaded;
+        *self.listener.lock().unwrap() = Some(listener);
+
+        // `self_ref` upgraded only transiently, inside the callback, each
+        // time it actually fires — never held onto — so this watch thread
+        // can never keep `Perch` alive past the shell's last reference (see
+        // `self_ref`'s own doc comment).
+        let weak = self.self_ref.clone();
+        let watch = settings::store::watch(self.config_path.clone(), move || {
+            if let Some(me) = weak.upgrade() {
+                me.on_settings_file_changed();
+            }
+        });
+        *self.settings_watch.lock().unwrap() = Some(watch);
     }
 
     /// Emit now. Called when the menu opens.
@@ -735,11 +1290,14 @@ impl Perch {
         }
     }
 
-    /// Stop the watcher. Safe to call twice: a second call finds no handle
-    /// and is a no-op.
+    /// Stop the session watcher and the settings-file watch. Safe to call
+    /// twice: a second call finds neither handle and is a no-op.
     pub fn stop(&self) {
         if let Some(h) = self.handle.lock().unwrap().take() {
             h.stop();
+        }
+        if let Some(w) = self.settings_watch.lock().unwrap().take() {
+            w.stop();
         }
     }
 
@@ -749,7 +1307,7 @@ impl Perch {
     /// reason attached to `error` — rather than nothing.
     pub fn main_window(&self) -> MainWindowModel {
         let sessions =
-            live::live_sessions(&config::sessions_dir(&self.config_dir), &RealProcessProbe);
+            live::live_sessions(&config::sessions_dir(&self.config_dir()), &RealProcessProbe);
         let now = self.core_model_for(sessions.clone());
         let db = db::open(&self.db_path).ok();
         main_window::build_main_window(db.as_ref(), now, &sessions, now_ms()).into()
@@ -819,14 +1377,68 @@ impl Perch {
     pub fn open_command(&self, cwd: String) -> TerminalCommand {
         perch_core::actions::TerminalCommand::open(&cwd).into()
     }
+
+    /// Today's settings, the file they came from, and anything wrong with
+    /// that file. Never fails outright — see `settings::store::load`.
+    pub fn settings(&self) -> SettingsModel {
+        core_ui_settings::build_settings(&self.config_path).into()
+    }
+
+    /// Save `s` to disk, format-preserving, then read it straight back —
+    /// so the returned model is exactly what a fresh `settings()` call
+    /// would see, including any clamp `load` applies and the note it earns.
+    pub fn save_settings(&self, s: Settings) -> Result<SettingsModel, PerchError> {
+        settings::store::save(&self.config_path, &s.into()).map_err(|e| PerchError::Io {
+            message: e.to_string(),
+        })?;
+        Ok(self.settings())
+    }
+
+    /// The diagnostics pane's view-model: where Perch thinks the Claude Code
+    /// directory is and why, every session record found there with a
+    /// spelled-out verdict, and the state of Perch's own settings file and
+    /// index. A database that won't open still yields a full picture — with
+    /// dashes for the index-derived fields alone (see
+    /// `ui::diagnostics::build_diagnostics`) — never nothing.
+    pub fn diagnostics(&self) -> DiagnosticsModel {
+        let db = db::open(&self.db_path).ok();
+        core_diagnostics::build_diagnostics(
+            db.as_ref(),
+            &self.config_dir(),
+            &self.config_path,
+            &RealProcessProbe,
+            now_ms(),
+        )
+        .into()
+    }
+
+    /// Set a project's notification override, returning the refreshed detail
+    /// so the shell never has to re-fetch or guess what changed.
+    pub fn set_notify_override(
+        &self,
+        project_id: i64,
+        o: NotifyOverride,
+    ) -> Result<ProjectDetail, PerchError> {
+        let database = self.open_db()?;
+        database
+            .set_notify_override(project_id, &o.into())
+            .map_err(db_err)?;
+        self.detail(&database, project_id)
+    }
 }
 
 impl Perch {
+    fn config_dir(&self) -> PathBuf {
+        self.config_dir.lock().unwrap().clone()
+    }
+
     fn this(&self) -> ThisPerch {
         ThisPerch {
             config_dir: self.config_dir.clone(),
             db_path: self.db_path.clone(),
+            config_path: self.config_path.clone(),
             reindex_error: self.reindex_error.clone(),
+            notified: self.notified.clone(),
         }
     }
 
@@ -845,6 +1457,127 @@ impl Perch {
         self.this().reindex();
     }
 
+    /// (Re)builds the session watcher against the current config dir and
+    /// poll interval, storing it as the running handle and replacing
+    /// whatever was there (if any — the caller is responsible for having
+    /// stopped it first when this is a restart rather than the initial
+    /// `start()`).
+    ///
+    /// Only for a restart, where the handle is taken and replaced in two
+    /// steps under a lock this does not hold. `start()` calls
+    /// `build_watcher` directly instead, because it must decide *and* claim
+    /// inside one critical section — see its own comment.
+    fn spawn_watcher(&self, listener: Arc<dyn PerchListener>, poll_seconds: u32) {
+        *self.handle.lock().unwrap() = Some(self.build_watcher(listener, poll_seconds));
+    }
+
+    /// The watcher itself, built and started but not stored anywhere, so the
+    /// caller decides under which lock it becomes *the* running watcher.
+    /// Reads `config_dir` and nothing else of `self`'s locked state, which
+    /// is what makes it safe to call with `handle` held. Emits once
+    /// immediately (`h.refresh()`) so a start or restart is never silently
+    /// quiet until the next tick.
+    fn build_watcher(
+        &self,
+        listener: Arc<dyn PerchListener>,
+        poll_seconds: u32,
+    ) -> watcher::WatcherHandle {
+        let me = self.this();
+        let me_for_refresh = me.clone();
+        let cfg = watcher::WatcherConfig::for_dir(
+            config::sessions_dir(&self.config_dir()),
+            Duration::from_secs(u64::from(poll_seconds)),
+        );
+        let h = watcher::spawn(
+            cfg,
+            Arc::new(RealProcessProbe),
+            move |sessions| me.tick(listener.as_ref(), sessions),
+            move || me_for_refresh.reindex(),
+        );
+        h.refresh();
+        h
+    }
+
+    /// Called (debounced, trailing-edge, at least once per `config.toml`
+    /// poll tick) by the settings-file watch `start()` sets up. Most ticks
+    /// are not an actual change — `settings::store::watch` fires `on_change`
+    /// on every tick of its own backstop poll, not only when the file
+    /// genuinely changed (documented on that function) — so the very first
+    /// thing this does is compare against `last_settings` and return if
+    /// nothing this engine cares about actually moved. That comparison, not
+    /// a debounce of its own, is what stops an idle engine from restarting
+    /// its watcher every few seconds forever.
+    ///
+    /// Only two fields ever earn a restart here:
+    /// - `claude_config_dir`: re-resolved and swapped into the shared
+    ///   `config_dir` (so every read — `current`, `main_window`,
+    ///   `diagnostics`, the session watcher's own `sessions_dir` — sees it
+    ///   immediately), then a re-index against the new directory.
+    /// - `poll_seconds`: the session watcher's own backstop interval, which
+    ///   only `WatcherConfig` at spawn time can set (see `spawn_watcher`) —
+    ///   there is no live "change this running thread's timer" knob, so the
+    ///   only way to apply a new value is to stop the old watcher and spawn
+    ///   a fresh one.
+    ///
+    /// Every other setting (`menu_bar_display`, `waiting_enabled`,
+    /// `waiting_after_minutes`, `include_background`, `preferred_terminal`)
+    /// is read fresh from disk by whoever needs it on its own next use
+    /// (`core_model_for`, `notifications_for`, or the shell reading
+    /// `settings()` at the moment it acts) — none of them need the watcher
+    /// itself to restart, so none of them are compared here.
+    fn on_settings_file_changed(&self) {
+        let loaded = settings::store::load(&self.config_path).settings;
+        let previous = {
+            let mut last = self.last_settings.lock().unwrap();
+            if *last == loaded {
+                return;
+            }
+            std::mem::replace(&mut *last, loaded.clone())
+        };
+
+        let dir_changed = previous.claude_config_dir != loaded.claude_config_dir;
+        let poll_changed = previous.poll_seconds != loaded.poll_seconds;
+
+        // Only an actual, successful swap of `config_dir` earns a restart on
+        // its own account — a `claude_config_dir` edit that fails to resolve
+        // changes nothing about what the watcher should be doing, so it must
+        // not restart the watcher over a no-op.
+        //
+        // A hand-edit naming something that isn't a directory no longer
+        // arrives here as itself: `Settings::validated` drops it back to ""
+        // on the way out of `load`, with a note the settings window shows —
+        // so what can still fail below is only the *auto-detected* path
+        // having gone away, which no setting can repair and which stderr is
+        // the right (and only) place for.
+        let mut dir_actually_moved = false;
+        if dir_changed {
+            match resolve_config_dir_override(&loaded.claude_config_dir) {
+                Some(resolved) if resolved.is_dir() => {
+                    *self.config_dir.lock().unwrap() = resolved;
+                    self.reindex();
+                    dir_actually_moved = true;
+                }
+                Some(resolved) => eprintln!(
+                    "perch: settings: claude_config_dir {} is not a directory; keeping the previous one",
+                    resolved.display()
+                ),
+                None => eprintln!(
+                    "perch: settings: claude_config_dir cleared, but no directory could be \
+                     auto-detected either; keeping the previous one"
+                ),
+            }
+        }
+
+        if dir_actually_moved || poll_changed {
+            if let Some(listener) = self.listener.lock().unwrap().clone() {
+                if let Some(old) = self.handle.lock().unwrap().take() {
+                    old.stop();
+                }
+                self.spawn_watcher(listener, loaded.poll_seconds);
+            }
+        }
+    }
+
     /// Open Perch's own index database, mapping any failure to the one typed
     /// variant every read/edit method surfaces — never `.ok()`-discarded.
     fn open_db(&self) -> Result<Db, PerchError> {
@@ -856,10 +1589,22 @@ impl Perch {
     /// state rather than making the shell re-fetch or guess what changed.
     fn detail(&self, database: &Db, project_id: i64) -> Result<ProjectDetail, PerchError> {
         let sessions =
-            live::live_sessions(&config::sessions_dir(&self.config_dir), &RealProcessProbe);
-        main_window::build_project_detail(database, project_id, &sessions, now_ms())
-            .map(Into::into)
-            .map_err(db_err)
+            live::live_sessions(&config::sessions_dir(&self.config_dir()), &RealProcessProbe);
+        // `build_project_detail` needs the global `waiting_after_minutes` to
+        // compose `notify_default_label` (what "Default" currently means for
+        // this project) — `&Settings` rather than the bare minute count,
+        // matching `notify::decide`'s own calling convention elsewhere in
+        // this file, and self-documenting at this call site.
+        let loaded_settings = settings::store::load(&self.config_path).settings;
+        main_window::build_project_detail(
+            database,
+            project_id,
+            &sessions,
+            now_ms(),
+            &loaded_settings,
+        )
+        .map(Into::into)
+        .map_err(db_err)
     }
 }
 
@@ -867,12 +1612,19 @@ impl Perch {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex, MutexGuard};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    struct Capture(Mutex<Vec<PopoverModel>>);
+    #[derive(Default)]
+    struct Capture {
+        models: Mutex<Vec<PopoverModel>>,
+        notifications: Mutex<Vec<Vec<WaitingNotification>>>,
+    }
     impl PerchListener for Capture {
         fn on_model(&self, model: PopoverModel) {
-            self.0.lock().unwrap().push(model);
+            self.models.lock().unwrap().push(model);
+        }
+        fn on_notifications(&self, items: Vec<WaitingNotification>) {
+            self.notifications.lock().unwrap().push(items);
         }
     }
 
@@ -906,6 +1658,91 @@ mod tests {
         }
     }
 
+    /// `CLAUDE_CONFIG_DIR` for the life of the guard, restored to whatever
+    /// was there before on drop. Only ever taken while a `DataDirGuard` is
+    /// held — that guard owns `ENV_LOCK`, which is what serializes this
+    /// process-global write against every other env-touching test here.
+    struct ClaudeDirGuard {
+        prior: Option<String>,
+    }
+
+    impl ClaudeDirGuard {
+        fn set(dir: &std::path::Path) -> Self {
+            let prior = std::env::var("CLAUDE_CONFIG_DIR").ok();
+            std::env::set_var("CLAUDE_CONFIG_DIR", dir);
+            Self { prior }
+        }
+    }
+
+    impl Drop for ClaudeDirGuard {
+        fn drop(&mut self) {
+            match &self.prior {
+                Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+                None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+            }
+        }
+    }
+
+    /// `start` is documented idempotent: "a second call while already
+    /// running is a no-op". Two threads arriving together must not both come
+    /// away believing they were the first — that leaves two watcher threads
+    /// polling the same directory, only one of which `handle` still names,
+    /// so `stop()` can never reach the other.
+    ///
+    /// Each thread brings its own listener, which is what makes the failure
+    /// visible rather than inferred: exactly one watcher exists iff at most
+    /// one of the two listeners is ever driven. Rounds, because the window
+    /// between the check and the claim is short and a single round can get
+    /// lucky — this is a race, so the test drives at it repeatedly rather
+    /// than pretending one attempt proves anything.
+    #[test]
+    fn two_threads_calling_start_at_once_only_ever_start_one_watcher() {
+        let data = tempfile::tempdir().unwrap();
+        let _env = DataDirGuard::set(data.path());
+        let tmp = tempfile::tempdir().unwrap();
+
+        for round in 0..12 {
+            let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
+            let a = Arc::new(Capture::default());
+            let b = Arc::new(Capture::default());
+            let gate = Arc::new(std::sync::Barrier::new(2));
+
+            let threads: Vec<_> = [a.clone(), b.clone()]
+                .into_iter()
+                .map(|cap| {
+                    let perch = perch.clone();
+                    let gate = gate.clone();
+                    std::thread::spawn(move || {
+                        gate.wait();
+                        perch.start(cap);
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().unwrap();
+            }
+
+            // Long enough for a spawned watcher's immediate emit to land.
+            std::thread::sleep(Duration::from_millis(200));
+            perch.stop();
+
+            let a_emits = a.models.lock().unwrap().len();
+            let b_emits = b.models.lock().unwrap().len();
+            assert!(
+                a_emits == 0 || b_emits == 0,
+                "round {round}: both listeners were driven, so both calls to \
+                 start() spawned a watcher (a={a_emits} emits, b={b_emits} emits) \
+                 — one of those watchers is now unreachable from `handle` and \
+                 stop() will never reach it"
+            );
+            assert!(
+                a_emits > 0 || b_emits > 0,
+                "round {round}: neither listener was driven — the test is not \
+                 observing a running watcher at all"
+            );
+        }
+    }
+
     #[test]
     fn constructs_against_an_empty_config_dir_and_emits_a_model() {
         let tmp = tempfile::tempdir().unwrap();
@@ -918,12 +1755,12 @@ mod tests {
         assert_eq!(snap.stats.window_tokens, "—");
         assert!(snap.live.is_empty());
 
-        let cap = Arc::new(Capture(Mutex::new(Vec::new())));
+        let cap = Arc::new(Capture::default());
         perch.start(cap.clone());
         std::thread::sleep(Duration::from_millis(500));
         perch.stop();
         assert!(
-            !cap.0.lock().unwrap().is_empty(),
+            !cap.models.lock().unwrap().is_empty(),
             "start must emit at least the initial model"
         );
         assert!(
@@ -1025,6 +1862,9 @@ mod tests {
         let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
         assert!(perch.set_pinned(4242, true).is_err());
         assert!(perch.project_detail(4242).is_err());
+        assert!(perch
+            .set_notify_override(4242, NotifyOverride::Off)
+            .is_err());
     }
 
     #[test]
@@ -1038,5 +1878,502 @@ mod tests {
         assert_eq!(c.shell_line, "cd '/a/b' && claude --resume 'abc'");
         let o = perch.open_command("/a/b".into());
         assert_eq!(o.shell_line, "cd '/a/b' && claude");
+    }
+
+    #[test]
+    fn settings_is_reachable_and_starts_at_the_documented_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
+
+        let model = perch.settings();
+        assert_eq!(
+            model.settings.poll_seconds, 5,
+            "a first run has no file yet"
+        );
+        assert!(model.notes.is_empty());
+        assert!(model.error.is_none());
+        assert!(model.config_path.ends_with("config.toml"));
+    }
+
+    #[test]
+    fn save_settings_round_trips_through_a_fresh_settings_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
+
+        let mut s = perch.settings().settings;
+        s.poll_seconds = 30;
+        s.waiting_enabled = true;
+        s.waiting_after_minutes = 20;
+        s.menu_bar_display = MenuBarDisplay::CountAndWaiting;
+
+        let saved = perch.save_settings(s.clone()).unwrap();
+        assert_eq!(
+            saved.settings, s,
+            "save_settings returns exactly what a fresh read sees"
+        );
+
+        let reread = perch.settings();
+        assert_eq!(
+            reread.settings, s,
+            "a later, independent settings() call must see what was saved"
+        );
+    }
+
+    #[test]
+    fn save_settings_clamps_out_of_range_values_and_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
+
+        let mut s = perch.settings().settings;
+        s.poll_seconds = 0;
+        let saved = perch.save_settings(s).unwrap();
+        assert_eq!(saved.settings.poll_seconds, 1, "clamped, not rejected");
+        assert_eq!(saved.notes.len(), 1);
+    }
+
+    #[test]
+    fn diagnostics_is_reachable_against_an_empty_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
+
+        let d = perch.diagnostics();
+        assert!(d.records.is_empty());
+        assert_eq!(d.config_dir, tmp.path().display().to_string());
+        assert!(d.settings_loaded, "no settings file yet is a first run");
+        assert_eq!(
+            d.index_sessions, "0",
+            "a fresh index opens fine and is honestly empty"
+        );
+    }
+
+    #[test]
+    fn set_notify_override_persists_and_returns_the_refreshed_detail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+
+        // Seed a project directly against the same `index.db` `Perch::new`
+        // will resolve (see `app_data_db`), so `set_notify_override` below
+        // has a real row to update.
+        let db_path = data.path().join("index.db");
+        let project_id = {
+            let database = db::open(&db_path).unwrap();
+            database.upsert_project("slug", "/a/proj", false).unwrap()
+        };
+
+        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
+        let detail = perch
+            .set_notify_override(project_id, NotifyOverride::Custom { after_minutes: 45 })
+            .unwrap();
+        assert_eq!(detail.id, project_id);
+        assert_eq!(
+            detail.notify,
+            NotifyOverride::Custom { after_minutes: 45 },
+            "the refreshed detail must show the override it just wrote, not just accept it"
+        );
+        assert!(
+            detail.notify_default_label.contains("10 minutes"),
+            "a first run's global default (10 minutes) must still be reported \
+             even though this project itself is on Custom: {}",
+            detail.notify_default_label
+        );
+
+        let database = db::open(&db_path).unwrap();
+        assert_eq!(
+            database.project_meta(project_id).unwrap().notify,
+            db::NotifyOverride::Custom { after_minutes: 45 },
+            "the override must actually persist, not just echo back in the reply"
+        );
+    }
+
+    #[test]
+    fn a_project_never_given_its_own_override_reports_default_and_the_current_global_label() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+
+        let db_path = data.path().join("index.db");
+        let project_id = {
+            let database = db::open(&db_path).unwrap();
+            database.upsert_project("slug", "/a/proj", false).unwrap()
+        };
+
+        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
+        let mut s = perch.settings().settings;
+        s.waiting_after_minutes = 25;
+        perch.save_settings(s).unwrap();
+
+        let detail = perch.project_detail(project_id).unwrap();
+        assert_eq!(
+            detail.notify,
+            NotifyOverride::Default,
+            "a project never given its own override reads as Default"
+        );
+        assert!(
+            detail.notify_default_label.contains("25 minutes"),
+            "the label must reflect the saved global setting, not a stale default: {}",
+            detail.notify_default_label
+        );
+        assert_eq!(
+            detail.notify_default_minutes, 25,
+            "the number behind that label has to cross the boundary too — it \
+             is what the shell's Custom minute control seeds from, and the \
+             shell must never parse the label to get it"
+        );
+    }
+
+    #[test]
+    fn a_waiting_session_past_threshold_pushes_a_notification_through_the_listener() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
+
+        let mut s = perch.settings().settings;
+        s.waiting_enabled = true;
+        s.waiting_after_minutes = 1; // the shortest allowed threshold
+        perch.save_settings(s).unwrap();
+
+        let since_ms = now_ms() - 2 * 60_000; // 2 minutes ago: past the 1-minute threshold
+        let session = live::LiveSession {
+            pid: 1,
+            session_id: "s1".into(),
+            cwd: "/tmp/proj".into(),
+            name: "s1".into(),
+            kind: "interactive".into(),
+            status: live::SessionStatus::Waiting {
+                reason: None,
+                since_ms,
+            },
+            started_at: since_ms,
+            status_updated_at: since_ms,
+            cc_version: None,
+            socket_path: None,
+        };
+
+        let cap = Arc::new(Capture::default());
+        perch.this().tick(cap.as_ref(), vec![session.clone()]);
+
+        let pushed = cap.notifications.lock().unwrap().clone();
+        assert_eq!(
+            pushed.len(),
+            1,
+            "the push must reach the shell through on_notifications, not just on_model"
+        );
+        assert_eq!(pushed[0].len(), 1);
+        assert_eq!(pushed[0][0].session_id, "s1");
+        assert_eq!(pushed[0][0].project, "proj");
+
+        // Edge-triggered: the same still-waiting episode must not refire on
+        // a later tick — this is what the episode memory living inside
+        // `Perch` (via `this()`, shared through `notified`) buys.
+        perch.this().tick(cap.as_ref(), vec![session]);
+        assert_eq!(
+            cap.notifications.lock().unwrap().len(),
+            1,
+            "no repeat push for the same episode on a later tick"
+        );
+    }
+
+    /// Two indexed projects whose directories share a last path component
+    /// (`~/work/api` and `~/personal/api`) must be tellable apart from the
+    /// notification payload alone. `project` — the directory name — is the
+    /// same string for both, so a shell routing a click on it can only
+    /// guess; `project_id` is what makes the click land on the project the
+    /// alert was actually about.
+    #[test]
+    fn notifications_carry_the_project_id_so_a_shared_directory_name_still_routes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+
+        let db_path = data.path().join("index.db");
+        let (work_api, personal_api) = {
+            let database = db::open(&db_path).unwrap();
+            (
+                database
+                    .upsert_project("-work-api", "/work/api", false)
+                    .unwrap(),
+                database
+                    .upsert_project("-personal-api", "/personal/api", false)
+                    .unwrap(),
+            )
+        };
+        assert_ne!(work_api, personal_api);
+
+        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
+        let mut s = perch.settings().settings;
+        s.waiting_enabled = true;
+        s.waiting_after_minutes = 1;
+        perch.save_settings(s).unwrap();
+
+        let since_ms = now_ms() - 2 * 60_000;
+        let waiting = |id: &str, cwd: &str| live::LiveSession {
+            pid: 1,
+            session_id: id.into(),
+            cwd: cwd.into(),
+            name: id.into(),
+            kind: "interactive".into(),
+            status: live::SessionStatus::Waiting {
+                reason: None,
+                since_ms,
+            },
+            started_at: since_ms,
+            status_updated_at: since_ms,
+            cc_version: None,
+            socket_path: None,
+        };
+
+        let cap = Arc::new(Capture::default());
+        perch.this().tick(
+            cap.as_ref(),
+            vec![
+                waiting("s-work", "/work/api"),
+                waiting("s-personal", "/personal/api"),
+            ],
+        );
+
+        let pushed = cap.notifications.lock().unwrap().clone();
+        assert_eq!(pushed.len(), 1);
+        let mut routed: Vec<(String, Option<i64>, String)> = pushed[0]
+            .iter()
+            .map(|n| (n.session_id.clone(), n.project_id, n.project.clone()))
+            .collect();
+        routed.sort();
+        assert_eq!(
+            routed,
+            vec![
+                ("s-personal".to_string(), Some(personal_api), "api".into()),
+                ("s-work".to_string(), Some(work_api), "api".into()),
+            ],
+            "both alerts say \"api\"; only the id tells the two projects apart"
+        );
+    }
+
+    /// A waiting session in a directory the index has never seen has no
+    /// project row to point at. The payload says so with `None` rather than
+    /// naming some other project — a click that selects nothing is right,
+    /// a click that silently selects the wrong project is not.
+    #[test]
+    fn an_unindexed_directory_notifies_with_no_project_id_rather_than_a_wrong_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
+
+        let mut s = perch.settings().settings;
+        s.waiting_enabled = true;
+        s.waiting_after_minutes = 1;
+        perch.save_settings(s).unwrap();
+
+        let since_ms = now_ms() - 2 * 60_000;
+        let session = live::LiveSession {
+            pid: 1,
+            session_id: "s1".into(),
+            cwd: "/tmp/never-indexed".into(),
+            name: "s1".into(),
+            kind: "interactive".into(),
+            status: live::SessionStatus::Waiting {
+                reason: None,
+                since_ms,
+            },
+            started_at: since_ms,
+            status_updated_at: since_ms,
+            cc_version: None,
+            socket_path: None,
+        };
+
+        let cap = Arc::new(Capture::default());
+        perch.this().tick(cap.as_ref(), vec![session]);
+        let pushed = cap.notifications.lock().unwrap().clone();
+        assert_eq!(pushed[0][0].project_id, None);
+    }
+
+    #[test]
+    fn a_constructor_override_beats_the_settings_files_claude_config_dir() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+
+        let seed = settings::Settings {
+            claude_config_dir: "/somewhere/settings/points/that/does/not/exist".into(),
+            ..Default::default()
+        };
+        settings::store::save(&data.path().join("config.toml"), &seed).unwrap();
+
+        // An explicit constructor argument still wins over the settings file
+        // — this is what every other test in this module already relies on
+        // to run against a throwaway `tempdir()` regardless of whatever a
+        // stray real `config.toml` says.
+        let perch = Perch::new(Some(dir_a.path().to_string_lossy().into_owned())).unwrap();
+        assert_eq!(perch.config_dir(), dir_a.path());
+    }
+
+    #[test]
+    fn a_blank_settings_override_resolves_via_the_ordinary_environment_precedence() {
+        assert_eq!(resolve_config_dir_override("   "), config::config_dir());
+    }
+
+    #[test]
+    fn a_nonblank_settings_override_beats_the_environment() {
+        assert_eq!(
+            resolve_config_dir_override("/custom/claude"),
+            Some(PathBuf::from("/custom/claude"))
+        );
+    }
+
+    #[test]
+    fn constructing_with_no_override_honours_the_settings_files_claude_config_dir() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+
+        let seed = settings::Settings {
+            claude_config_dir: dir_a.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        settings::store::save(&data.path().join("config.toml"), &seed).unwrap();
+
+        let perch = Perch::new(None).unwrap();
+        assert_eq!(
+            perch.config_dir(),
+            dir_a.path(),
+            "the settings file's override must win over env-based auto-detection"
+        );
+    }
+
+    /// A `claude_config_dir` naming something that is not a directory used to
+    /// fail `Perch::new` outright, and every control in the settings window is
+    /// disabled while the engine is down — so the one field that caused the
+    /// failure could not be edited or cleared from the app at all. The value
+    /// must degrade to auto-detection and say so, never to a window that
+    /// cannot be used to fix it.
+    #[test]
+    fn a_claude_config_dir_that_is_not_a_directory_falls_back_instead_of_bricking_the_app() {
+        let fallback = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+        let _claude = ClaudeDirGuard::set(fallback.path());
+
+        let not_a_dir = data.path().join("regular-file");
+        std::fs::write(&not_a_dir, b"i am a file, not a directory").unwrap();
+        let seed = settings::Settings {
+            claude_config_dir: not_a_dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        settings::store::save(&data.path().join("config.toml"), &seed).unwrap();
+
+        let perch =
+            Perch::new(None).expect("a bad claude_config_dir must never stop Perch from opening");
+        assert_eq!(
+            perch.config_dir(),
+            fallback.path(),
+            "the ordinary resolution order must take over, not the unusable override"
+        );
+
+        let notes = perch.settings().notes;
+        assert!(
+            notes.iter().any(|n| n.contains("claude_config_dir")),
+            "and the settings window must be told why: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_hand_edited_claude_config_dir_moves_a_running_engines_config_dir_without_restarting_perch()
+    {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+        let config_path = data.path().join("config.toml");
+
+        let seed = settings::Settings {
+            claude_config_dir: dir_a.path().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        settings::store::save(&config_path, &seed).unwrap();
+
+        let perch = Perch::new(None).unwrap();
+        assert_eq!(perch.config_dir(), dir_a.path());
+
+        let cap = Arc::new(Capture::default());
+        perch.start(cap.clone());
+
+        // Simulate a hand-edit made outside Perch entirely: load-mutate-save
+        // through the exact same `settings::store` functions a text editor's
+        // save would leave behind on disk, never touching `perch` itself.
+        let mut edited = settings::store::load(&config_path).settings;
+        edited.claude_config_dir = dir_b.path().to_string_lossy().into_owned();
+        settings::store::save(&config_path, &edited).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline && perch.config_dir() != dir_b.path() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            perch.config_dir(),
+            dir_b.path(),
+            "a hand-edited claude_config_dir must reach a running engine on its own, \
+             without the app needing to be restarted"
+        );
+
+        perch.stop();
+    }
+
+    #[test]
+    fn a_hand_edited_poll_seconds_restarts_the_session_watcher_with_the_new_interval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+        let config_path = data.path().join("config.toml");
+
+        // Start slow (30s) -- far longer than this test's own deadline below
+        // -- so any tick this test observes after the edit can only be
+        // explained by the watcher having actually restarted at the new,
+        // much shorter interval, not by the original 30s poll happening to
+        // land inside the window.
+        let seed = settings::Settings {
+            poll_seconds: 30,
+            ..Default::default()
+        };
+        settings::store::save(&config_path, &seed).unwrap();
+
+        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
+        let cap = Arc::new(Capture::default());
+        perch.start(cap.clone());
+
+        // Drain whatever the initial start-up emitted so the counting below
+        // only reflects ticks from after the interval actually changes.
+        std::thread::sleep(Duration::from_millis(300));
+        let before = cap.models.lock().unwrap().len();
+
+        let mut edited = settings::store::load(&config_path).settings;
+        edited.poll_seconds = 1;
+        settings::store::save(&config_path, &edited).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut seen_new_tick = false;
+        while Instant::now() < deadline {
+            if cap.models.lock().unwrap().len() > before {
+                seen_new_tick = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            seen_new_tick,
+            "a hand-edited poll_seconds must restart the watcher at the new interval, \
+             well inside the old 30s poll"
+        );
+
+        perch.stop();
     }
 }

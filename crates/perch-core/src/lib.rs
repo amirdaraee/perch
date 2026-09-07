@@ -7,10 +7,12 @@ pub mod discovery;
 pub mod index;
 pub mod live;
 pub mod model;
+pub mod notify;
 pub mod platform;
 pub mod pricing;
 pub mod query;
 pub mod scan;
+pub mod settings;
 pub mod transcript;
 pub mod ui;
 
