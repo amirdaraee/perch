@@ -187,14 +187,21 @@ jobs:
           # would plausibly be added first. All three must hold no
           # filesystem-writing API outside of Perch's own data.
           #
-          # `create_dir_all` is deliberately NOT in this list, and db.rs
-          # (perch-core) is deliberately excluded: it creates the parent
-          # directory of Perch's OWN index database and opens that database,
-          # which is Perch's file, not Claude Code's. Nothing under
-          # crates/perch-ffi/src or src-tauri/src is excluded — commands.rs
-          # performs no writes of its own (it delegates to db::open), and it is
-          # the file most likely to gain one, so it is audited like every other
-          # module.
+          # `create_dir_all` is deliberately NOT in this list, and exactly two
+          # files under perch-core are deliberately excluded, each for a write
+          # to Perch's OWN data, never anything inside the Claude Code
+          # directory: db.rs creates the parent directory of and opens Perch's
+          # own index database, and settings/store.rs creates the parent
+          # directory of and writes Perch's own config.toml. Both exclusions
+          # below use `-path` (the full path from the repo root) rather than
+          # `-name` (the basename alone) — `-name 'db.rs'` or `-name
+          # 'store.rs'` would silently exclude *any* file with that basename
+          # anywhere under the tree, not just these two exact files. Copy this
+          # `-path`, not `-name`, if a third file ever needs excluding here.
+          # Nothing under crates/perch-ffi/src or src-tauri/src is excluded —
+          # commands.rs performs no writes of its own (it delegates to
+          # db::open), and it is the file most likely to gain one, so it is
+          # audited like every other module.
           WRITES='fs::write|fs::remove_file|fs::remove_dir|File::create|OpenOptions'
           FFI_SRC_DIR=crates/perch-ffi/src
           SRC_TAURI_SRC_DIR=src-tauri/src
@@ -262,8 +269,40 @@ jobs:
           fi
           rm -rf "$SELFTEST_ROOT"
 
+          # Positive control proving the perch-core exclusions are matched by
+          # full path, not basename: a decoy file with the *same basename* as
+          # an excluded file, but at a *different path* (never the real source
+          # tree — this lives entirely under /tmp), must still trip the
+          # guard. If either exclusion below used `-name` instead of `-path`,
+          # these decoys would be silently excluded too and this self-test
+          # would fail. Mirrors the analogous same-basename check the Swift
+          # guard runs for Launcher.swift.
+          SELFTEST_ROOT=/tmp/no-network-selftest-write-core-path
+          rm -rf "$SELFTEST_ROOT"
+          mkdir -p "$SELFTEST_ROOT/crates/perch-core/src/decoy"
+          mkdir -p "$SELFTEST_ROOT/crates/perch-core/src/settings/decoy"
+          printf 'fn main() { fs::write("/tmp/x", "y").unwrap(); }\n' \
+            > "$SELFTEST_ROOT/crates/perch-core/src/decoy/db.rs"
+          printf 'fn main() { fs::write("/tmp/x", "y").unwrap(); }\n' \
+            > "$SELFTEST_ROOT/crates/perch-core/src/settings/decoy/store.rs"
+          offending=0
+          for f in $(cd "$SELFTEST_ROOT" && find crates/perch-core/src -name '*.rs' \
+                       ! -path 'crates/perch-core/src/db.rs' \
+                       ! -path 'crates/perch-core/src/settings/store.rs'); do
+            if prod "$SELFTEST_ROOT/$f" | grep -qE "$WRITES"; then
+              offending=1
+            fi
+          done
+          if [ "$offending" -ne 1 ]; then
+            echo "::error::Guard self-test failed: a same-basename decoy (db.rs or store.rs) at a different path was wrongly excluded — the exclusion must match by full path, not basename."
+            exit 1
+          fi
+          rm -rf "$SELFTEST_ROOT"
+
           offenders=0
-          for f in $(find crates/perch-core/src -name '*.rs' ! -name 'db.rs') \
+          for f in $(find crates/perch-core/src -name '*.rs' \
+                       ! -path 'crates/perch-core/src/db.rs' \
+                       ! -path 'crates/perch-core/src/settings/store.rs') \
                    $(find "$FFI_SRC_DIR" -name '*.rs') \
                    $(find "$SRC_TAURI_SRC_DIR" -name '*.rs'); do
             if prod "$f" | grep -E "$WRITES"; then
@@ -275,7 +314,7 @@ jobs:
             exit 1
           fi
 
-          echo "no filesystem writes found in perch-core (db.rs excluded), $FFI_SRC_DIR, or $SRC_TAURI_SRC_DIR (nothing excluded)"
+          echo "no filesystem writes found in perch-core (db.rs and settings/store.rs excluded), $FFI_SRC_DIR, or $SRC_TAURI_SRC_DIR (nothing excluded)"
 
       - name: Assert forbidden crates are unreachable in the resolved dependency graph
         run: |
@@ -480,15 +519,21 @@ jobs:
 
           WRITE_APIS='\.write\(to:|FileManager\.default\.createDirectory|FileManager\.default\.removeItem|FileManager\.default\.createFile|FileManager\.default\.setAttributes|FileManager\.default\.moveItem|FileManager\.default\.copyItem|FileManager\.default\.trashItem|FileHandle\('
 
-          # A reference to the Claude Code directory itself — as an actual
-          # string literal or identifier a write could plausibly be aimed
-          # at, not the word "Claude" alone (which appears constantly in
-          # doc comments, e.g. "Nothing in Swift reads Claude Code's
-          # files"). Requiring a quote before ".claude" is what excludes
+          # A reference to the Claude Code directory itself — either Swift
+          # constructing a path into it (a string literal containing
+          # ".claude"), or Swift reading CLAUDE_CONFIG_DIR directly (which
+          # would bypass Rust's documented resolution precedence). Not the
+          # word "Claude" alone (which appears constantly in doc comments,
+          # e.g. "Nothing in Swift reads Claude Code's files"), and
+          # deliberately NOT bare camelCase identifiers like
+          # claudeConfigDir/claudeDirDraft/chooseClaudeDir — that is
+          # vocabulary the settings UI (which lets the user point Perch at
+          # their Claude Code directory, entirely through Rust) is allowed
+          # to use. Requiring a quote before ".claude" is what excludes
           # Launcher.swift's own doc comments ("the read-only promise about
           # `~/.claude`", written in backticks, not a Swift string) while
           # still catching a real `"~/.claude"` or `"$HOME/.claude"` literal.
-          CLAUDE_DIR_REF='"[^"]*\.claude|claudeConfig|ClaudeConfig|claudeDir|ClaudeDir|CLAUDE_CONFIG_DIR'
+          CLAUDE_DIR_REF='"[^"]*\.claude|CLAUDE_CONFIG_DIR'
 
           # -H forces the filename prefix even when only one file matches
           # (grep omits it for a single-file argument list otherwise) — the
@@ -514,6 +559,16 @@ jobs:
             echo "::error::Guard self-test failed: the Claude-directory pattern no longer detects a known offender."
             exit 1
           fi
+          # And a bare camelCase identifier — the settings UI's own
+          # vocabulary for the "which directory is Claude Code's" concept,
+          # with no string literal and no env var read — must NOT trip the
+          # pattern, or this guard would be blind exactly where a real
+          # violation is now most likely to appear.
+          printf 'private var claudeConfigDir: String { claudeDirDraft }\n' > /tmp/swift-claudedir-negative-selftest.swift
+          if grep -qE "$CLAUDE_DIR_REF" /tmp/swift-claudedir-negative-selftest.swift; then
+            echo "::error::Guard self-test failed: the Claude-directory pattern now matches a bare identifier, not just path/env-var access."
+            exit 1
+          fi
           # And the real doc comments in Launcher.swift (which mention
           # `~/.claude` in backticks, not a string literal) must NOT trip
           # the Claude-directory pattern — otherwise this guard would be
@@ -529,12 +584,24 @@ jobs:
           # entirely under /tmp) must be found (or, for the Launcher.swift
           # exclusion, deliberately NOT found) through the exact paths the
           # real checks above use.
+          #
+          # The third fixture is a decoy with the *same basename* as the
+          # excluded file at a *different path*: it must still be found,
+          # which is what proves the exclusion matches by full path and not
+          # by basename. Weaken `! -path "$LAUNCHER_PATH"` to
+          # `! -name Launcher.swift` and this decoy disappears from the scan
+          # and this self-test fails — which is the whole point of it, and
+          # the check the Rust guard's own same-basename decoys cite as
+          # their model.
           SELFTEST_ROOT=/tmp/no-network-selftest-swift-write
           rm -rf "$SELFTEST_ROOT"
           mkdir -p "$SELFTEST_ROOT/$SWIFT_APP_SRC_DIR/Nested"
+          mkdir -p "$SELFTEST_ROOT/$SWIFT_APP_SRC_DIR/Decoy"
           mkdir -p "$SELFTEST_ROOT/$(dirname "$LAUNCHER_PATH")"
           printf 'try body.write(to: url, atomically: true, encoding: .utf8)\n' \
             > "$SELFTEST_ROOT/$SWIFT_APP_SRC_DIR/Nested/x.swift"
+          printf 'try body.write(to: url, atomically: true, encoding: .utf8)\n' \
+            > "$SELFTEST_ROOT/$SWIFT_APP_SRC_DIR/Decoy/$(basename "$LAUNCHER_PATH")"
           printf 'try body.write(to: url, atomically: true, encoding: .utf8)\n' \
             > "$SELFTEST_ROOT/$LAUNCHER_PATH"
           selftest_hits=$( cd "$SELFTEST_ROOT" && write_hits || true )
@@ -542,7 +609,11 @@ jobs:
             echo "::error::Guard self-test failed: the Swift write scan no longer reaches a nested $SWIFT_APP_SRC_DIR/**/*.swift."
             exit 1
           fi
-          if printf '%s\n' "$selftest_hits" | grep -q "$LAUNCHER_PATH"; then
+          if ! printf '%s\n' "$selftest_hits" | grep -q "$SWIFT_APP_SRC_DIR/Decoy/$(basename "$LAUNCHER_PATH")"; then
+            echo "::error::Guard self-test failed: a same-basename decoy at a different path was wrongly excluded — the Launcher.swift exclusion must match by full path, not basename."
+            exit 1
+          fi
+          if printf '%s\n' "$selftest_hits" | grep -q "^$LAUNCHER_PATH:"; then
             echo "::error::Guard self-test failed: Launcher.swift is no longer excluded from the write scan."
             exit 1
           fi

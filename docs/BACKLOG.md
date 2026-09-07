@@ -36,29 +36,49 @@ Status legend: **now** = next task · **next** = this milestone or the following
   session history. Pin, archive, and rename all live here too.
 - **Resume and open a project's terminal.** Resume runs `claude --resume <id>` for any past
   session; "Open new session" starts a fresh `claude` in the project's directory. Both are
-  composed in Rust (`perch-core::actions`, every value POSIX-single-quoted) and handed to
-  Terminal.app via a one-shot script written into Perch's own application-support directory
-  — no Automation permission prompt, nothing touches the Claude Code directory.
+  composed in Rust (`perch-core::actions`, every value POSIX-single-quoted) and handed to the
+  preferred terminal from Settings (Terminal.app or iTerm2) via a one-shot script written into
+  Perch's own application-support directory — no Automation permission prompt, nothing touches
+  the Claude Code directory.
 - **Usage view** (spec §9.3). Hero stats, 14 days of token-class stacked bars, a top-projects
   ranking, and a per-model breakdown, as a second tab alongside the project list.
+- **Settings window.** A four-tab window (General, Sessions & Menu Bar, Notifications,
+  Diagnostics) reached from the status-item menu's **Settings…**, covering all eight of
+  Perch's settings — launch at login (`SMAppService`), the Claude Code directory override,
+  menu-bar display mode, poll interval, the three notification settings, and preferred
+  terminal — every one wired to real behaviour, not just stored. Settings live in a watched,
+  versioned `config.toml` under Perch's own application-support directory (`PERCH_CONFIG`
+  overrides the path); a hand edit takes effect without a restart, an out-of-range value is
+  clamped rather than rejected, and a file that won't parse falls back to defaults with the
+  reason shown in the window rather than refusing to start.
+- **Waiting-on-you notification.** The feature the project started from: a session blocked for
+  32 hours with nobody noticing. Turn it on in Settings and Perch tells you, once per episode,
+  when a session has been waiting on you longer than N minutes (default 10; background
+  sessions excluded by default). The decision is made in Rust — pure, edge-triggered, fires
+  exactly once per blocked stretch — Swift only hands the finished strings to
+  `UNUserNotificationCenter`. Authorization is requested when the setting is turned on, never
+  at launch, and a denial is reflected honestly in the toggle. Any project can override the
+  global threshold — Default, a custom number of minutes, or Off — from its own detail pane in
+  the main window, next to pin, archive, and the note.
 
 ---
 
 ## Now
 
-- **Waiting-on-you notification.** macOS alert when a session has been `waiting` longer than
-  N minutes (default 10), once per episode, background sessions excluded by default. This is
-  the feature that solves the 32-hour-blocked-session problem the project started from.
 - **Remove the Tauri app and React frontend.** The native app now has the main window, resume,
   open, and per-project stats — the parity this was waiting on. `src-tauri` and `src/` (the
   React frontend) can come out once the native app is the one people actually run.
 
 ## Next — sessions & projects (Perch's own ground)
 
-- **Preferred-terminal detection.** The design spec calls for resolving the user's terminal by
-  walking the process tree from a live session's pid, rather than a fixed choice. Resume and
-  Open currently hardcode Terminal.app (`Launcher.swift`); this was deliberately deferred to
-  ship the two actions first.
+- **Preferred-terminal auto-detection.** Resume and Open now use a user-selected preferred
+  terminal (Settings; Terminal.app or iTerm2 today, falling back to Terminal.app for anything
+  else). The design spec's original idea — resolving the terminal by walking the process tree
+  from a live session's pid, rather than asking the user to pick — is still undone.
+- **Hooks on session events.** Run a user-configured command when a session starts, ends, or
+  starts waiting on you — the natural next step past a notification. Needs its own trust story
+  before it ships: this would be Perch running an arbitrary user-provided executable, which is
+  a different risk profile from anything else in this read-only, no-network app.
 - **Jump to session.** The original spec §9.4 and this branch's own spec §6 both call for a
   third action alongside Resume and Open: Jump activates the *application* that owns a live
   session (`NSRunningApplication.activate()`, no special permission needed) rather than
@@ -98,21 +118,23 @@ Status legend: **now** = next task · **next** = this milestone or the following
   literals (now mapped by a typed key, but still Swift-authored English); the purist fix is
   putting these in `ui::usage` alongside the rest of the finished strings, so a future
   Linux/Windows shell doesn't reinvent them.
-- **Menu-bar display modes** (from CodexBar): icon only · % · % + countdown · "N ⏳" when
-  blocked. User-selectable; today it is count + ⏳.
+- **Percentage-based menu-bar display modes** (from CodexBar): % · % + countdown. Icon-only,
+  count, and count-plus-waiting-glyph already ship as a user-selectable Settings option; the
+  percentage modes wait on the same OAuth usage endpoint as the item above.
 - **Tiny usage meter in the icon** — a filled-bar glyph that reads at a glance without text.
 - **Stale-data dimming** — dim the icon when the last successful refresh is older than X.
-- **Approaching-limit alert** at a configurable threshold (default 80 %) once per window.
+- **Approaching-limit notification** at a configurable threshold (default 80 %) once per
+  window — the same edge-triggered shape as the waiting-on-you notification. Blocked on the
+  OAuth usage endpoint: spec §8 forbids fabricating a percentage from the estimated tier, and
+  a threshold alert needs a real one.
 - **Burn-rate projection** — "at this pace the window fills in ~1h 50m" (approved mockup).
 - **Verified price table** with an editable UI — today's numbers are placeholders.
 - **Reset-time style** options: countdown vs absolute time (CodexBar has this; cheap).
 
 ## Next — settings & polish
 
-- **Settings window**: refresh interval, notification toggles, menu-bar display mode,
-  preferred terminal for resume, `CLAUDE_CONFIG_DIR` override (a Finder-launched app does not
-  inherit shell env — this is the fix).
-- **Launch at login.**
+- **Settings search and per-section reset.** Deferred until the settings surface is bigger
+  than four tabs and eight fields — not worth the added UI before then.
 - **Light-mode palette** — the popover is dark-only today.
 - **Keyboard**: ⌥-click the tray for the menu; ↑↓ to move between sessions, ⏎ to jump.
 - **First-run state**: "No Claude Code data found at …" with a path picker, instead of an

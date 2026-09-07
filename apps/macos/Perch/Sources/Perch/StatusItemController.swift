@@ -15,6 +15,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// Set by `AppDelegate`. The status item owns the menu, not the window's
     /// lifetime, so it just asks for the window to be shown.
     var onOpenWindow: (() -> Void)?
+    /// Same idea, for the settings window.
+    var onOpenSettings: (() -> Void)?
 
     init(engine: PerchEngine) {
         self.engine = engine
@@ -44,6 +46,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             add(EmptyCard(title: engine.startupError ?? "Starting…", detail: nil))
             menu.addItem(.separator())
             addOpenWindow()
+            addSettings()
             menu.addItem(.separator())
             addQuit()
             return
@@ -67,6 +70,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
         menu.addItem(.separator())
         addOpenWindow()
+        addSettings()
         menu.addItem(.separator())
         addQuit()
     }
@@ -85,10 +89,17 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.addItem(item)
     }
 
+    private func addSettings() {
+        let item = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        item.target = self
+        menu.addItem(item)
+    }
+
     private func addQuit() {
         menu.addItem(withTitle: "Quit Perch", action: #selector(quit), keyEquivalent: "q").target = self
     }
 
     @objc private func openWindow() { onOpenWindow?() }
+    @objc private func openSettings() { onOpenSettings?() }
     @objc private func quit() { NSApp.terminate(nil) }
 }
