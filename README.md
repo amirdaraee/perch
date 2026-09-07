@@ -65,14 +65,57 @@ window closes.
 
 From the project detail pane you can pin, archive, rename, resume an ended session
 (`claude --resume <id>`), or start a fresh one (`claude`) — both in the project's own
-directory. Both actions hand the command to Terminal.app by writing a one-shot script into
-Perch's *own* `~/Library/Application Support/Perch/commands/` directory (swept of anything
-older than a minute) and asking `NSWorkspace` to open it there, which is what avoids the
-Automation permission prompt an AppleScript-driven approach would need. The command line
+directory. Both actions hand the command to your preferred terminal (a Settings toggle —
+Terminal.app or iTerm2 today; anything else falls back to Terminal.app) by writing a one-shot
+script into Perch's *own* `~/Library/Application Support/Perch/commands/` directory (swept of
+anything older than a minute) and asking `NSWorkspace` to open it there, which is what avoids
+the Automation permission prompt an AppleScript-driven approach would need. The command line
 itself is composed in Rust (`perch-core::actions`), which POSIX-single-quotes every value it
 embeds before it ever reaches a shell. None of this touches your Claude Code directory or
 makes a network request — both promises in the [Privacy](#privacy) section above hold for
 the main window exactly as they do for the menu.
+
+### Settings, notifications, and diagnostics
+
+**Settings…** (⌘,) in the status-item menu opens a four-tab window — General, Sessions & Menu
+Bar, Notifications, and Diagnostics — covering all eight of Perch's settings: launch at login,
+the Claude Code directory (auto-detect, or an explicit override for when auto-detection picks
+the wrong one), the menu bar's display mode (icon only, icon + count, or icon + count with a
+distinct glyph when something's waiting on you), the poll interval, the three notification
+settings below, and the preferred terminal. Every setting takes effect immediately; nothing
+needs a relaunch.
+
+Settings live in Perch's *own* `config.toml` — `~/Library/Application Support/Perch/config.toml`,
+never inside your Claude Code directory — as four TOML tables plus a version key. Set
+`PERCH_CONFIG` to point it somewhere else entirely. The file is watched, so a hand edit while
+Perch is running takes effect without a restart; an out-of-range value is clamped rather than
+rejected, and a file that fails to parse falls back to defaults rather than refusing to start —
+either way, the settings window says so.
+
+**The waiting-on-you notification** is the problem Perch was written to solve: a session
+blocked for 32 hours with nobody noticing. Turn it on in Notifications and Perch tells you,
+once per episode, when a session has been waiting on you longer than N minutes (default 10;
+background sessions excluded by default). macOS asks for notification permission at that
+moment, not at launch, and a later denial is reflected honestly in the toggle rather than the
+setting silently doing nothing. The decision of whether and when to fire is made in Rust —
+pure, and edge-triggered so it fires exactly once per blocked stretch — and Swift's only job is
+handing the finished title and body to `UNUserNotificationCenter`. Clicking a notification
+opens the main window with that session's project selected.
+
+Any project can override the global threshold from its own detail pane in the main window,
+next to pin, archive, and the note: Default (follow the setting above), a custom number of
+minutes, or Off. Global defaults live in Settings; per-project exceptions live on the project.
+
+**Diagnostics**, a tab in the Settings window, answers one question a confused person actually
+asks: why isn't my session showing up? For every session record Perch found, it names whether
+the record was accepted or the specific reason it wasn't — no such process, that pid isn't
+`claude`, or the record couldn't be parsed — plus the resolved Claude Code directory and how it
+was resolved, the config file's path and whether it loaded, and the index's path, session and
+turn counts, and last successful run.
+
+None of this touches the promises in [Privacy](#privacy) above: the config file is Perch's own,
+never anything inside your Claude Code directory, and every notification is delivered locally
+by `UNUserNotificationCenter` — nothing described in this section makes a network request.
 
 The Tauri app below stays in the repo, unchanged — removing it is next on the backlog now
 that the native app has reached parity with it.

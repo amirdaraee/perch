@@ -8,15 +8,27 @@ final class PerchEngine: ObservableObject {
     @Published private(set) var model: PopoverModel?
     @Published private(set) var startupError: String?
 
+    /// Owns delivery of the "waiting on you" banner — see its own doc
+    /// comment. Created eagerly, not lazily, so its
+    /// `UNUserNotificationCenterDelegate` is registered before the engine
+    /// itself even starts, in case the app is being launched by clicking a
+    /// notification left over from a previous run.
+    let notifier = Notifier()
+
     private var perch: Perch?
     private var listener: Listener?
 
     func start() {
         do {
             let p = try Perch(configDir: nil)
-            let l = Listener { [weak self] m in
-                Task { @MainActor in self?.model = m }
-            }
+            let l = Listener(
+                deliverModel: { [weak self] m in
+                    Task { @MainActor in self?.model = m }
+                },
+                deliverNotifications: { [weak self] items in
+                    Task { @MainActor in await self?.notifier.deliver(items) }
+                }
+            )
             perch = p
             listener = l
             model = p.current()
@@ -84,6 +96,13 @@ final class PerchEngine: ObservableObject {
         }.value
     }
 
+    func setNotifyOverride(projectId: Int64, override: NotifyOverride) async -> Result<ProjectDetail, Error> {
+        guard let perch else { return .failure(EngineUnavailable()) }
+        return await Task.detached(priority: .userInitiated) {
+            Result { try perch.setNotifyOverride(projectId: projectId, o: override) }
+        }.value
+    }
+
     /// Builders are pure (non-throwing) on the Rust side; `nil` here only
     /// means the engine itself isn't running.
     func resumeCommand(sessionId: String, cwd: String) async -> TerminalCommand? {
@@ -99,15 +118,50 @@ final class PerchEngine: ObservableObject {
             perch.openCommand(cwd: cwd)
         }.value
     }
+
+    /// `nil` only means the engine itself isn't running — Rust's own read
+    /// never fails (a bad on-disk file degrades to defaults, reported via
+    /// `SettingsModel.error`/`.notes`, not a thrown error).
+    func settings() async -> SettingsModel? {
+        guard let perch else { return nil }
+        return await Task.detached(priority: .userInitiated) { perch.settings() }.value
+    }
+
+    /// Throws only when the write itself fails (e.g. the config directory
+    /// isn't writable); a merely out-of-range value is clamped and reported
+    /// back in the returned model's `notes`, not rejected.
+    func saveSettings(_ s: Settings) async -> Result<SettingsModel, Error> {
+        guard let perch else { return .failure(EngineUnavailable()) }
+        return await Task.detached(priority: .userInitiated) {
+            Result { try perch.saveSettings(s: s) }
+        }.value
+    }
+
+    /// Backs the diagnostics pane — a full re-index can make this slow, so
+    /// it gets the same off-main-thread treatment as every other read here.
+    func diagnostics() async -> DiagnosticsModel? {
+        guard let perch else { return nil }
+        return await Task.detached(priority: .userInitiated) { perch.diagnostics() }.value
+    }
 }
 
 struct EngineUnavailable: LocalizedError {
     var errorDescription: String? { "Perch's engine is not running." }
 }
 
-/// Rust calls this on its watcher thread; hop to the main actor before touching UI.
+/// Rust calls both methods on its watcher thread; hop to the main actor before touching UI.
 private final class Listener: PerchListener, @unchecked Sendable {
-    private let deliver: @Sendable (PopoverModel) -> Void
-    init(_ deliver: @escaping @Sendable (PopoverModel) -> Void) { self.deliver = deliver }
-    func onModel(model: PopoverModel) { deliver(model) }
+    private let deliverModel: @Sendable (PopoverModel) -> Void
+    private let deliverNotifications: @Sendable ([WaitingNotification]) -> Void
+
+    init(
+        deliverModel: @escaping @Sendable (PopoverModel) -> Void,
+        deliverNotifications: @escaping @Sendable ([WaitingNotification]) -> Void
+    ) {
+        self.deliverModel = deliverModel
+        self.deliverNotifications = deliverNotifications
+    }
+
+    func onModel(model: PopoverModel) { deliverModel(model) }
+    func onNotifications(items: [WaitingNotification]) { deliverNotifications(items) }
 }

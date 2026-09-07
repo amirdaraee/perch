@@ -5,7 +5,7 @@ use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::path::Path;
 
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 pub struct Db {
     conn: Connection,
@@ -19,6 +19,77 @@ pub struct ProjectMeta {
     pub pinned: bool,
     pub note: Option<String>,
     pub archived: bool,
+    pub notify: NotifyOverride,
+}
+
+/// Per-project override of the global notification setting. Stored on the
+/// project itself (below the user-owned line) so re-indexing never touches
+/// it, same as `note` and `pinned`. `Serialize` so it can ride along on
+/// `ui::main_window::ProjectDetail`, which derives it uniformly with every
+/// other view-model in this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum NotifyOverride {
+    /// Follow whatever the global setting says.
+    Default,
+    /// Never notify for this project, regardless of the global setting.
+    Off,
+    /// Notify after this many minutes, regardless of the global setting.
+    Custom { after_minutes: u32 },
+}
+
+/// Same bound `Settings::validated` clamps `waiting_after_minutes` to. Rust
+/// owns this validation everywhere, not just in the global setting, so a
+/// shell (Swift stepper or otherwise) can't store a nonsense value by simply
+/// skipping its own bounds check.
+const NOTIFY_AFTER_MINUTES_RANGE: std::ops::RangeInclusive<u32> = 1..=240;
+
+impl NotifyOverride {
+    fn mode_str(&self) -> &'static str {
+        match self {
+            NotifyOverride::Default => "default",
+            NotifyOverride::Off => "off",
+            NotifyOverride::Custom { .. } => "custom",
+        }
+    }
+
+    fn after_minutes(&self) -> Option<u32> {
+        match self {
+            NotifyOverride::Custom { after_minutes } => Some(*after_minutes),
+            _ => None,
+        }
+    }
+
+    /// Clamp `Custom { after_minutes }` into `NOTIFY_AFTER_MINUTES_RANGE`,
+    /// mirroring `Settings::validated`'s clamp of `waiting_after_minutes`.
+    /// `Default` and `Off` carry no minute count and are returned unchanged.
+    fn clamped(self) -> NotifyOverride {
+        match self {
+            NotifyOverride::Custom { after_minutes } => NotifyOverride::Custom {
+                after_minutes: after_minutes.clamp(
+                    *NOTIFY_AFTER_MINUTES_RANGE.start(),
+                    *NOTIFY_AFTER_MINUTES_RANGE.end(),
+                ),
+            },
+            other => other,
+        }
+    }
+
+    /// Reconstruct from the stored columns. An unknown `mode` string (written
+    /// by a newer Perch) falls back to `Default` rather than failing — the
+    /// same tolerance the settings enum already has.
+    fn from_columns(mode: &str, after_minutes: Option<i64>) -> NotifyOverride {
+        match mode {
+            "off" => NotifyOverride::Off,
+            "custom" => match after_minutes {
+                Some(n) => NotifyOverride::Custom {
+                    after_minutes: n as u32,
+                },
+                None => NotifyOverride::Default,
+            },
+            "default" => NotifyOverride::Default,
+            _ => NotifyOverride::Default,
+        }
+    }
 }
 
 const SCHEMA: &str = r#"
@@ -34,7 +105,9 @@ CREATE TABLE IF NOT EXISTS projects (
     pinned            INTEGER NOT NULL DEFAULT 0,
     note              TEXT,
     note_updated_at   INTEGER,
-    archived          INTEGER NOT NULL DEFAULT 0
+    archived             INTEGER NOT NULL DEFAULT 0,
+    notify_mode          TEXT NOT NULL DEFAULT 'default',
+    notify_after_minutes INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -138,6 +211,33 @@ fn migrate(conn: &Connection, existing_version: i32) -> Result<()> {
         // data-loss path and needs its own guard.
         conn.execute_batch("UPDATE sessions SET indexed_offset = 0; DELETE FROM turns;")?;
     }
+    if existing_version < 3 {
+        // v2 -> v3: `notify_mode` / `notify_after_minutes` are new, user-owned
+        // columns on `projects` (the per-project notification override).
+        // Unlike the v1 -> v2 step above, adding them needs no re-scan —
+        // nothing derived from transcripts changes shape — so `sessions` and
+        // `turns` are left completely alone here.
+        let has_notify_mode: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('projects') WHERE name = 'notify_mode'")?
+            .exists([])?;
+        if !has_notify_mode {
+            conn.execute(
+                "ALTER TABLE projects ADD COLUMN notify_mode TEXT NOT NULL DEFAULT 'default'",
+                [],
+            )?;
+        }
+        let has_notify_after_minutes: bool = conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('projects') WHERE name = 'notify_after_minutes'",
+            )?
+            .exists([])?;
+        if !has_notify_after_minutes {
+            conn.execute(
+                "ALTER TABLE projects ADD COLUMN notify_after_minutes INTEGER",
+                [],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -233,18 +333,35 @@ impl Db {
 
     pub fn project_meta(&self, project_id: i64) -> Result<ProjectMeta> {
         Ok(self.conn.query_row(
-            "SELECT display_name, status, pinned, note, archived FROM projects WHERE id = ?1",
+            "SELECT display_name, status, pinned, note, archived, notify_mode, notify_after_minutes
+             FROM projects WHERE id = ?1",
             params![project_id],
             |r| {
+                let mode: String = r.get(5)?;
+                let after_minutes: Option<i64> = r.get(6)?;
                 Ok(ProjectMeta {
                     display_name: r.get(0)?,
                     status: r.get(1)?,
                     pinned: r.get::<_, i64>(2)? != 0,
                     note: r.get(3)?,
                     archived: r.get::<_, i64>(4)? != 0,
+                    notify: NotifyOverride::from_columns(&mode, after_minutes),
                 })
             },
         )?)
+    }
+
+    /// Set the per-project notification override. `notify_mode` and
+    /// `notify_after_minutes` are user-owned columns on `projects` (below the
+    /// "never overwritten by indexing" line), so this never touches the
+    /// derived columns `upsert_project` maintains.
+    pub fn set_notify_override(&self, project_id: i64, o: &NotifyOverride) -> Result<()> {
+        let o = o.clamped();
+        self.conn.execute(
+            "UPDATE projects SET notify_mode = ?2, notify_after_minutes = ?3 WHERE id = ?1",
+            params![project_id, o.mode_str(), o.after_minutes()],
+        )?;
+        Ok(())
     }
 
     pub fn set_archived(&self, project_id: i64, archived: bool) -> Result<()> {
@@ -330,6 +447,16 @@ impl Db {
         Ok(self
             .conn
             .query_row("SELECT COUNT(*) FROM turns", [], |r| r.get(0))?)
+    }
+
+    /// The most recent turn timestamp anywhere in the index, or `None` when
+    /// nothing has been indexed yet. `ui::diagnostics` uses this as its one
+    /// freshness signal ("last_indexed") rather than a wall-clock time of
+    /// when a scan last ran, which nothing in this schema records.
+    pub fn last_turn_ts(&self) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row("SELECT MAX(ts) FROM turns", [], |r| r.get(0))?)
     }
 
     pub fn session_message_count(&self, session_id: &str) -> Result<u64> {
@@ -725,6 +852,46 @@ mod tests {
     }
 
     #[test]
+    fn last_turn_ts_is_none_until_something_is_indexed() {
+        let db = open_in_memory().unwrap();
+        assert_eq!(
+            db.last_turn_ts().unwrap(),
+            None,
+            "an empty index has no last-indexed timestamp to report"
+        );
+
+        let id = db.upsert_project("slug", "/Users/a/proj", false).unwrap();
+        db.upsert_session(&session("s1", id, 0)).unwrap();
+        db.insert_turns(
+            "s1",
+            &[
+                Turn {
+                    ts: 10,
+                    model: "m".into(),
+                    usage: TurnUsage::default(),
+                },
+                Turn {
+                    ts: 30,
+                    model: "m".into(),
+                    usage: TurnUsage::default(),
+                },
+                Turn {
+                    ts: 20,
+                    model: "m".into(),
+                    usage: TurnUsage::default(),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.last_turn_ts().unwrap(),
+            Some(30),
+            "the newest turn's timestamp, not insertion order"
+        );
+    }
+
+    #[test]
     fn session_offset_round_trips_and_defaults_to_zero() {
         let db = open_in_memory().unwrap();
         let id = db.upsert_project("slug", "/Users/a/proj", false).unwrap();
@@ -862,5 +1029,234 @@ mod tests {
             db.project_meta(9999).is_err(),
             "a missing project must not read as defaults"
         );
+    }
+
+    #[test]
+    fn a_project_defaults_to_following_the_global_setting() {
+        let db = open_in_memory().unwrap();
+        let id = db.upsert_project("-a-b", "/a/b", false).unwrap();
+        assert_eq!(db.project_meta(id).unwrap().notify, NotifyOverride::Default);
+    }
+
+    #[test]
+    fn the_three_override_states_round_trip() {
+        let db = open_in_memory().unwrap();
+        let id = db.upsert_project("-a-b", "/a/b", false).unwrap();
+        for want in [
+            NotifyOverride::Off,
+            NotifyOverride::Custom { after_minutes: 45 },
+            NotifyOverride::Default,
+        ] {
+            db.set_notify_override(id, &want).unwrap();
+            assert_eq!(db.project_meta(id).unwrap().notify, want);
+        }
+    }
+
+    #[test]
+    fn an_override_survives_reindexing_like_every_other_user_owned_column() {
+        let db = open_in_memory().unwrap();
+        let id = db.upsert_project("-a-b", "/a/b", false).unwrap();
+        db.set_notify_override(id, &NotifyOverride::Custom { after_minutes: 20 })
+            .unwrap();
+        db.set_note(id, "keep me").unwrap();
+
+        assert_eq!(db.upsert_project("-a-b", "/a/b", false).unwrap(), id);
+
+        let m = db.project_meta(id).unwrap();
+        assert_eq!(m.notify, NotifyOverride::Custom { after_minutes: 20 });
+        assert_eq!(m.note.as_deref(), Some("keep me"));
+    }
+
+    #[test]
+    fn an_unknown_notify_mode_string_degrades_to_default() {
+        // A newer Perch's mode value must not break an older one reading it.
+        let db = open_in_memory().unwrap();
+        let id = db.upsert_project("-a-b", "/a/b", false).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE projects SET notify_mode = 'some-future-mode' WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        assert_eq!(db.project_meta(id).unwrap().notify, NotifyOverride::Default);
+    }
+
+    #[test]
+    fn a_custom_mode_with_no_minute_count_degrades_to_default() {
+        // Unlike the unknown-mode test above, this exercises the "custom"
+        // arm of `from_columns` specifically: a `notify_mode = 'custom'` row
+        // whose `notify_after_minutes` is NULL (never produced by
+        // `set_notify_override` itself, but a hand-edited or corrupted row
+        // could have it) must not panic or fabricate a minute count.
+        let db = open_in_memory().unwrap();
+        let id = db.upsert_project("-a-b", "/a/b", false).unwrap();
+        db.conn()
+            .execute(
+                "UPDATE projects SET notify_mode = 'custom', notify_after_minutes = NULL WHERE id = ?1",
+                params![id],
+            )
+            .unwrap();
+        assert_eq!(db.project_meta(id).unwrap().notify, NotifyOverride::Default);
+    }
+
+    #[test]
+    fn custom_after_minutes_is_clamped_to_the_same_bound_as_the_global_setting() {
+        // Rust must own this validation everywhere, not just in the Swift
+        // stepper: `set_notify_override` clamps into the same 1..=240 range
+        // `Settings::validated` uses for `waiting_after_minutes`.
+        let db = open_in_memory().unwrap();
+        let id = db.upsert_project("-a-b", "/a/b", false).unwrap();
+
+        db.set_notify_override(id, &NotifyOverride::Custom { after_minutes: 0 })
+            .unwrap();
+        assert_eq!(
+            db.project_meta(id).unwrap().notify,
+            NotifyOverride::Custom { after_minutes: 1 },
+            "0 must clamp up to the lower bound"
+        );
+
+        db.set_notify_override(
+            id,
+            &NotifyOverride::Custom {
+                after_minutes: 9_999,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db.project_meta(id).unwrap().notify,
+            NotifyOverride::Custom { after_minutes: 240 },
+            "an absurdly large value must clamp down to the upper bound"
+        );
+    }
+
+    #[test]
+    fn the_v3_migration_adds_the_columns_without_touching_indexed_data() {
+        // A v2-shaped database with real turns: unlike v2, this migration must
+        // not force a re-scan, so nothing indexed may be lost.
+        let db = open_in_memory().unwrap();
+        let pid = db.upsert_project("-a-b", "/a/b", false).unwrap();
+        db.upsert_session(&SessionRecord {
+            id: "s1".into(),
+            project_id: pid,
+            file_path: "/tmp/s1.jsonl".into(),
+            file_size: 0,
+            indexed_offset: 777,
+            started_at: Some(1),
+            last_activity_at: Some(2),
+            cwd: None,
+            git_branch: None,
+            cc_version: None,
+            message_count: 1,
+            title: None,
+        })
+        .unwrap();
+        db.insert_turns(
+            "s1",
+            &[Turn {
+                ts: 2,
+                model: "m".into(),
+                usage: TurnUsage::default(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(db.turn_count().unwrap(), 1, "turns survive a v3 migration");
+        assert_eq!(
+            db.session_offset("s1").unwrap(),
+            777,
+            "offsets are not reset"
+        );
+        assert_eq!(
+            db.project_meta(pid).unwrap().notify,
+            NotifyOverride::Default
+        );
+    }
+
+    /// Stronger version of the above: build a genuinely v2-stamped database
+    /// on disk (no `notify_mode`/`notify_after_minutes` columns, `user_version
+    /// = 2`) with real indexed data already present *before* the v3 migration
+    /// runs, then reopen with today's code. This is the regression the v2
+    /// migration's own comment warns about: a reset/delete that runs after
+    /// real rows exist would be a silent data-loss path.
+    #[test]
+    fn v2_database_migrates_to_v3_and_preserves_turns_offsets_and_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("v2.db");
+        {
+            let conn = Connection::open(&p).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE projects (
+                    id                INTEGER PRIMARY KEY,
+                    slug              TEXT NOT NULL UNIQUE,
+                    real_path         TEXT NOT NULL,
+                    path_is_guess     INTEGER NOT NULL DEFAULT 0,
+                    parent_project_id INTEGER REFERENCES projects(id),
+                    display_name      TEXT,
+                    status            TEXT NOT NULL DEFAULT 'active',
+                    pinned            INTEGER NOT NULL DEFAULT 0,
+                    note              TEXT,
+                    note_updated_at   INTEGER,
+                    archived          INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE sessions (
+                    id               TEXT PRIMARY KEY,
+                    project_id       INTEGER NOT NULL REFERENCES projects(id),
+                    file_path        TEXT NOT NULL,
+                    file_size        INTEGER NOT NULL DEFAULT 0,
+                    indexed_offset   INTEGER NOT NULL DEFAULT 0,
+                    started_at       INTEGER,
+                    last_activity_at INTEGER,
+                    cwd              TEXT,
+                    git_branch       TEXT,
+                    cc_version       TEXT,
+                    title            TEXT,
+                    message_count    INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE turns (
+                    session_id     TEXT NOT NULL REFERENCES sessions(id),
+                    ts             INTEGER NOT NULL,
+                    model          TEXT NOT NULL,
+                    input          INTEGER NOT NULL DEFAULT 0,
+                    output         INTEGER NOT NULL DEFAULT 0,
+                    cache_read     INTEGER NOT NULL DEFAULT 0,
+                    cache_write_5m INTEGER NOT NULL DEFAULT 0,
+                    cache_write_1h INTEGER NOT NULL DEFAULT 0,
+                    thinking       INTEGER NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO projects (id, slug, real_path, note) VALUES (1, 'slug', '/a/proj', 'keep me')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, project_id, file_path, file_size, indexed_offset, message_count)
+                 VALUES ('s1', 1, '/tmp/s1.jsonl', 900, 900, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO turns (session_id, ts, model, input, output) VALUES ('s1', 2, 'm', 1, 2)",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 2i32).unwrap();
+        }
+
+        let db = open(&p).unwrap();
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            db.session_offset("s1").unwrap(),
+            900,
+            "a v2 -> v3 migration must not reset offsets"
+        );
+        assert_eq!(
+            db.turn_count().unwrap(),
+            1,
+            "a v2 -> v3 migration must not delete turns"
+        );
+        assert_eq!(db.note(1).unwrap().as_deref(), Some("keep me"));
+        assert_eq!(db.project_meta(1).unwrap().notify, NotifyOverride::Default);
     }
 }

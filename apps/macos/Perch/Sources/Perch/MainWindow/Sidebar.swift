@@ -16,6 +16,11 @@ struct MainWindowRoot: View {
     // `engine.startupError` change to pass those through.
     @ObservedObject var engine: PerchEngine
     let refreshToken: Int
+    /// Set only when this presentation was triggered by clicking a "waiting
+    /// on you" notification — see `MainWindowController.show(selectingProjectId:)`.
+    /// Applied once `reload()` has the project list; `nil` for an ordinary
+    /// open.
+    var selectProjectId: Int64? = nil
 
     @State private var model: MainWindowModel?
     /// Distinguishes "still loading" from "loaded and empty" — both render
@@ -107,6 +112,18 @@ struct MainWindowRoot: View {
     private func reload() async {
         model = await engine.mainWindow()
         hasLoaded = true
+
+        // A notification carries the project's id (`WaitingNotification.projectId`),
+        // which is unique; the displayed directory name is not, and two
+        // projects sharing one used to route to whichever the just-loaded
+        // list happened to hold first. Nothing is matched or compared here
+        // beyond checking the id is still in that list — a project deleted or
+        // re-indexed away since the alert fired selects nothing, rather than
+        // selecting something else.
+        if let id = selectProjectId,
+           model?.projects.contains(where: { $0.id == id }) == true {
+            selection = .project(id)
+        }
     }
 }
 
