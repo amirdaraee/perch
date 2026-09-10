@@ -137,6 +137,44 @@ final class PerchEngine: ObservableObject {
         }.value
     }
 
+    // MARK: - The settings schema
+    //
+    // The settings *window* is built on these three, not on `settings()` /
+    // `saveSettings(_:)` above: Rust owns the panes, the captions, the
+    // enablement and the search, and every write names one key rather than
+    // shipping a whole struct back. `nil` from `settingsSchema` means the
+    // engine itself isn't running — Rust's own read never fails.
+
+    /// `query` is matched in Rust by `filter_panes`. Swift sends keystrokes
+    /// and draws whatever comes back; it does no matching of its own, or the
+    /// window would carry a second, staler copy of every label.
+    func settingsSchema(query: String?) async -> [SettingsPane]? {
+        guard let perch else { return nil }
+        return await Task.detached(priority: .userInitiated) {
+            perch.settingsSchema(query: query)
+        }.value
+    }
+
+    /// Store one value under one key. Returns the schema that resulted plus
+    /// whatever `validated` had to change on the way to disk, so the caller
+    /// never re-reads to see its own write and never has to discover a clamp
+    /// for itself.
+    func setSetting(key: SettingKey, value: SettingValue) async -> Result<SettingsResult, Error> {
+        guard let perch else { return .failure(EngineUnavailable()) }
+        return await Task.detached(priority: .userInitiated) {
+            Result { try perch.setSetting(key: key, value: value) }
+        }.value
+    }
+
+    /// Restore every setting one pane shows to its factory value, leaving
+    /// every other pane alone.
+    func resetPane(_ pane: PaneId) async -> Result<SettingsResult, Error> {
+        guard let perch else { return .failure(EngineUnavailable()) }
+        return await Task.detached(priority: .userInitiated) {
+            Result { try perch.resetPane(pane: pane) }
+        }.value
+    }
+
     /// Backs the diagnostics pane — a full re-index can make this slow, so
     /// it gets the same off-main-thread treatment as every other read here.
     func diagnostics() async -> DiagnosticsModel? {
