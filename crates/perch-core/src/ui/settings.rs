@@ -5,7 +5,7 @@
 
 use crate::settings::store::load;
 use crate::settings::Settings;
-use crate::ui::main_window::plural;
+use crate::ui::format::plural;
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq)]

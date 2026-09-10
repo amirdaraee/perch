@@ -18,9 +18,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::Path;
 
 pub mod keys;
+pub mod schema;
 pub mod store;
 
 pub use keys::*;
+pub use schema::*;
 
 /// Bumped whenever the on-disk shape changes in a way a migration needs to
 /// know about. Not itself a field of [`Settings`] — later tasks write it
