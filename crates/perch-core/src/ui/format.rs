@@ -14,6 +14,19 @@ pub fn human_cost(usd: f64) -> String {
     format!("${usd:.2}")
 }
 
+/// "1 minute", never "1 minutes". One helper, in the one module every shell
+/// already formats through, because a second copy is how two spellings of the
+/// same duration appear -- and this app has shipped "1 seconds" twice. Every
+/// caption that interpolates a count goes through here: the settings schema's
+/// stepper captions, the notification labels, the project row summaries.
+pub fn plural(n: i64, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{n} {many}")
+    }
+}
+
 /// Deliberately no "days" bucket: a session blocked for 32 hours should read
 /// as 32h, which is more alarming than 1d 8h. That alarm is the point.
 pub fn human_elapsed(ms: i64) -> String {
@@ -55,6 +68,15 @@ mod tests {
         assert_eq!(human_cost(0.0), "$0.00");
         assert_eq!(human_cost(8.204), "$8.20");
         assert_eq!(human_cost(38.0), "$38.00");
+    }
+
+    #[test]
+    fn one_is_singular() {
+        // "Check every 1 seconds" has reached a shipped build of this app
+        // twice. This is the whole reason the helper exists.
+        assert_eq!(plural(1, "minute", "minutes"), "1 minute");
+        assert_eq!(plural(0, "minute", "minutes"), "0 minutes");
+        assert_eq!(plural(2, "session", "sessions"), "2 sessions");
     }
 
     #[test]
