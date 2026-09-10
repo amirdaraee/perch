@@ -187,15 +187,34 @@ pub fn build_main_window(
                 .unwrap_or_else(|| dir_name(&s.real_path));
             let session_count = plural(s.sessions, "session", "sessions");
             let tokens = human_tokens(s.usage.total_tokens());
-            let cost = human_cost(s.cost_usd);
+            // Hidden means absent, not "$0.00" — same rule `ui::model` and
+            // `ui::usage` already follow: a blank string here says "the user
+            // hid this", not "this project cost nothing".
+            let cost = if settings.show_cost {
+                human_cost(s.cost_usd)
+            } else {
+                String::new()
+            };
             let last_active = since(now_ms, s.last_activity_at);
             let live_session_count = live.iter().filter(|l| l.cwd == s.real_path).count() as u32;
+            // Composed as optional fragments, not a fixed-arity `format!`, so
+            // a hidden cost drops cleanly instead of leaving a stray " · ".
+            let subtitle = [
+                Some(session_count.clone()),
+                Some(tokens.clone()),
+                (!cost.is_empty()).then(|| cost.clone()),
+                Some(last_active.clone()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
             let row = ProjectRow {
                 id: s.id,
                 name,
                 path: s.real_path.clone(),
                 group,
-                subtitle: format!("{session_count} · {tokens} · {cost} · {last_active}"),
+                subtitle,
                 session_count,
                 tokens,
                 cost,
@@ -292,13 +311,22 @@ pub fn build_project_detail(
         .map(|h| {
             let is_live = live.iter().any(|l| l.session_id == h.id);
             let tokens = human_tokens(h.usage.total_tokens());
-            let cost = human_cost(h.cost_usd);
+            // Hidden means absent, not "$0.00" — same rule as the project
+            // row above.
+            let cost = if settings.show_cost {
+                human_cost(h.cost_usd)
+            } else {
+                String::new()
+            };
             let started = since(now_ms, h.started_at);
             let duration = match (h.started_at, h.last_activity_at) {
                 (Some(a), Some(b)) if b >= a => human_elapsed(b - a),
                 _ => "—".to_string(),
             };
-            let mut parts = vec![format!("{tokens} · {cost}")];
+            let mut parts = vec![tokens.clone()];
+            if !cost.is_empty() {
+                parts.push(cost.clone());
+            }
             if duration != "—" {
                 parts.push(format!("{duration} long"));
             }
@@ -332,7 +360,13 @@ pub fn build_project_detail(
         name,
         note: meta.note.unwrap_or_default(),
         tokens: human_tokens(summary.usage.total_tokens()),
-        cost: human_cost(summary.cost_usd),
+        // Hidden means absent, not "$0.00" — same rule as the project row
+        // and the session history row above.
+        cost: if settings.show_cost {
+            human_cost(summary.cost_usd)
+        } else {
+            String::new()
+        },
         session_count: plural(summary.sessions, "session", "sessions"),
         sparkline,
         sessions,
@@ -889,6 +923,67 @@ mod tests {
             "the number and the label must never disagree: {}",
             d.notify_default_label
         );
+    }
+
+    #[test]
+    fn hiding_cost_hides_it_in_the_main_window_too() {
+        // Task 7 (faa3e8d) wired `show_cost` into the popover and the usage
+        // view but left this file's three sites unconverted: the project
+        // row, the project summary, and the session history row. Off means
+        // absent — a blank string, never a fabricated dollar figure.
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let now = 100 * DAY;
+        let pid = project_with_session(&db, "-a-p", "/a/proj", "s1", now - 3_600_000, 2_000_000);
+        let settings = Settings {
+            show_cost: false,
+            ..Settings::default()
+        };
+
+        let m = build_main_window(Some(&db), PopoverModel::empty(), &[], now, &settings);
+        let row = &m.projects[0];
+        assert_eq!(row.cost, "", "show_cost off hides the project row's cost");
+        assert!(
+            !row.subtitle.contains('$'),
+            "the project row subtitle must not leak a cost when hidden: {}",
+            row.subtitle
+        );
+
+        let d = build_project_detail(&db, pid, &[], now, &settings).unwrap();
+        assert_eq!(d.cost, "", "show_cost off hides the project summary's cost");
+        let session = &d.sessions[0];
+        assert_eq!(
+            session.cost, "",
+            "show_cost off hides the session row's cost"
+        );
+        assert!(
+            !session.detail_line.contains('$'),
+            "the session detail line must not leak a cost when hidden: {}",
+            session.detail_line
+        );
+    }
+
+    #[test]
+    fn showing_cost_leaves_the_main_window_unchanged() {
+        // The other half of the fix: `show_cost = true` (the default) must
+        // reproduce every figure exactly as before, so the fix above cannot
+        // have over-reached.
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let now = 100 * DAY;
+        let pid = project_with_session(&db, "-a-p", "/a/proj", "s1", now - 3_600_000, 2_000_000);
+        let settings = Settings::default();
+        assert!(settings.show_cost, "default is on");
+
+        let m = build_main_window(Some(&db), PopoverModel::empty(), &[], now, &settings);
+        let row = &m.projects[0];
+        assert_eq!(row.cost, "$30.00");
+        assert!(row.subtitle.contains("$30.00"));
+
+        let d = build_project_detail(&db, pid, &[], now, &settings).unwrap();
+        assert_eq!(d.cost, "$30.00");
+        assert_eq!(d.sessions[0].cost, "$30.00");
+        assert!(d.sessions[0].detail_line.contains("$30.00"));
     }
 }
 
