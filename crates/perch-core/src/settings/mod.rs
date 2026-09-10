@@ -17,7 +17,10 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::Path;
 
+pub mod keys;
 pub mod store;
+
+pub use keys::*;
 
 /// Bumped whenever the on-disk shape changes in a way a migration needs to
 /// know about. Not itself a field of [`Settings`] — later tasks write it
@@ -46,11 +49,20 @@ impl MenuBarDisplay {
     pub const KNOWN_WIRE_VALUES: [&'static str; 3] = ["icon", "count", "count-and-waiting"];
 
     /// The exact string this variant round-trips to on the wire.
-    pub(crate) fn as_wire_str(self) -> &'static str {
+    pub fn as_wire_str(self) -> &'static str {
         match self {
             MenuBarDisplay::Icon => "icon",
             MenuBarDisplay::Count => "count",
             MenuBarDisplay::CountAndWaiting => "count-and-waiting",
+        }
+    }
+
+    fn from_wire_str(s: &str) -> Self {
+        match s {
+            "icon" => MenuBarDisplay::Icon,
+            "count-and-waiting" => MenuBarDisplay::CountAndWaiting,
+            // "count" and anything unrecognised both land on the default.
+            _ => MenuBarDisplay::Count,
         }
     }
 }
@@ -73,12 +85,7 @@ impl<'de> Deserialize<'de> for MenuBarDisplay {
         D: Deserializer<'de>,
     {
         let raw = String::deserialize(deserializer)?;
-        Ok(match raw.as_str() {
-            "icon" => MenuBarDisplay::Icon,
-            "count-and-waiting" => MenuBarDisplay::CountAndWaiting,
-            // "count" and anything unrecognised both land on the default.
-            _ => MenuBarDisplay::Count,
-        })
+        Ok(MenuBarDisplay::from_wire_str(&raw))
     }
 }
 
