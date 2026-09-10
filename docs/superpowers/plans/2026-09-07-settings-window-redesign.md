@@ -78,7 +78,7 @@ The disk layout keeps `[general]`, `[menu_bar]`, `[sessions]`, `[notifications]`
 | `[popover]` | `show_waiting`, `show_working`, `show_recent`, `recent_limit`, `row_density`, `show_row_folder`, `show_row_usage` |
 | `[projects]` | `active_within_days`, `show_archived`, `chart_days` |
 | `[usage]` | `top_projects_count`, `top_projects_days`, `burn_rate`, `show_cost` |
-| `[notifications]` | `waiting_enabled`, `waiting_after_minutes`, `include_background`, `sound` |
+| `[notifications]` | `waiting_enabled`, `waiting_after_minutes`, `sound` — plus `include_background`, but **only from Task 3**; in Task 1 it stays under `[sessions]` where it is today |
 
 - [ ] **Step 1: Write the failing round-trip test**
 
@@ -421,10 +421,12 @@ fn a_v2_file_is_left_alone() {
 }
 ```
 
-- [ ] **Step 2: Run it and watch it fail**
+- [ ] **Step 2: Move the reader, then watch the test fail**
+
+The honest red only appears once the *reader* has moved. Do this first: relocate `include_background` from `SessionsSection` to `NotificationsSection` in `settings/mod.rs`. Until you do, a v1 file still parses through the old field and the test passes for the wrong reason — a vacuous green, which this project has been bitten by before.
 
 Run: `cargo test -p perch-core v1_carries_include_background`
-Expected: FAIL — `include_background` is false, because the v1 file's value sits under a section the v2 reader no longer looks in.
+Expected: FAIL — `include_background` is false, because the v1 file's value now sits under a section the reader no longer looks in, and nothing yet carries it across.
 
 - [ ] **Step 3: Implement the migration arm**
 
@@ -1059,6 +1061,8 @@ git commit -m "feat(core): read and write model prices, and find installed termi
 
 **Files:**
 - Modify: `crates/perch-ffi/src/lib.rs`
+
+**Replaces a seam Task 1 had to invent.** `From<Settings> for settings::Settings` could not survive the eighteen new fields: the FFI mirror does not carry them, so the conversion filled them from `Settings::default()` and saving one toggle would have silently reset every hand-edited value of the other eighteen. Task 1 replaced it with `Settings::merged_onto(base)` and made `save_settings` read from disk first. **Do not restore a total `From` here.** Every write goes through a key and a value, so the whole-struct conversion should disappear rather than be repaired.
 
 **Interfaces:**
 - Produces: `Perch::settings_schema(query: Option<String>) -> Vec<SettingsPane>`, `Perch::set_setting(key, value) -> SettingsResult`, `Perch::reset_pane(pane) -> SettingsResult`, `Perch::prices()`, `Perch::set_price`, `Perch::reset_prices`, `Perch::terminals()`.
