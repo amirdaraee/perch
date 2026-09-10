@@ -3,10 +3,9 @@
 
 use crate::db::Db;
 use crate::query::{self, DAY_MS};
+use crate::settings::Settings;
 use crate::ui::format::{human_cost, human_tokens};
 
-const CHART_DAYS: usize = 14;
-const TOP_N: usize = 8;
 const WINDOW_MS: i64 = 5 * 3_600_000;
 const MIN_PROJECTABLE_MS: i64 = 30 * 60_000;
 
@@ -90,18 +89,23 @@ fn observed_elapsed_ms(oldest_ts: Option<i64>, now_ms: i64) -> i64 {
     }
 }
 
-pub fn build_usage(db: &Db, now_ms: i64) -> anyhow::Result<UsageModel> {
+/// `settings.chart_days` spans the daily chart — the same field
+/// `build_project_detail`'s sparkline uses, so the two can never disagree
+/// about their own date range — while `top_projects_count` and
+/// `top_projects_days` shape the ranked list.
+pub fn build_usage(db: &Db, now_ms: i64, settings: &Settings) -> anyhow::Result<UsageModel> {
     let window_since = now_ms - WINDOW_MS;
     let (window, window_cost) = query::usage_since(db, window_since)?;
     let (day, day_cost) = query::usage_since(db, now_ms - DAY_MS)?;
     let (week, _) = query::usage_since(db, now_ms - 7 * DAY_MS)?;
 
-    let days = query::daily_usage(db, CHART_DAYS, now_ms)?;
+    let chart_days = settings.chart_days as usize;
+    let days = query::daily_usage(db, chart_days, now_ms)?;
     let daily: Vec<DailyBar> = days
         .iter()
         .enumerate()
         .map(|(i, d)| {
-            let days_ago = CHART_DAYS - 1 - i;
+            let days_ago = chart_days - 1 - i;
             DailyBar {
                 day_index: i as i32,
                 label: if days_ago == 0 {
@@ -119,15 +123,19 @@ pub fn build_usage(db: &Db, now_ms: i64) -> anyhow::Result<UsageModel> {
         })
         .collect();
 
-    let top_projects = query::top_projects(db, now_ms - 30 * DAY_MS, TOP_N)?
-        .into_iter()
-        .map(|(name, u, cost)| RankedProject {
-            name,
-            tokens: u.total_tokens(),
-            tokens_label: human_tokens(u.total_tokens()),
-            cost: human_cost(cost),
-        })
-        .collect();
+    let top_projects = query::top_projects(
+        db,
+        now_ms - i64::from(settings.top_projects_days) * DAY_MS,
+        settings.top_projects_count as usize,
+    )?
+    .into_iter()
+    .map(|(name, u, cost)| RankedProject {
+        name,
+        tokens: u.total_tokens(),
+        tokens_label: human_tokens(u.total_tokens()),
+        cost: human_cost(cost),
+    })
+    .collect();
 
     let mut by_model_rows = query::usage_by_model(db)?;
     // `usage_by_model` is unordered by omission (no `ORDER BY` in its SQL), so
@@ -219,7 +227,7 @@ mod tests {
     fn an_empty_index_reports_no_data_rather_than_zeroes() {
         let db = open_in_memory().unwrap();
         seed_default_prices(&db).unwrap();
-        let m = build_usage(&db, 100 * DAY_MS).unwrap();
+        let m = build_usage(&db, 100 * DAY_MS, &Settings::default()).unwrap();
         assert!(!m.has_data);
         assert!(m.burn_rate.is_none(), "no projection without data");
         assert!(m.top_projects.is_empty());
@@ -246,7 +254,7 @@ mod tests {
             },
         );
 
-        let m = build_usage(&db, now).unwrap();
+        let m = build_usage(&db, now, &Settings::default()).unwrap();
         let today = m.daily.last().unwrap();
         assert_eq!(today.input, 10);
         assert_eq!(today.output, 20);
@@ -293,7 +301,7 @@ mod tests {
             },
         );
 
-        let m = build_usage(&db, now).unwrap();
+        let m = build_usage(&db, now, &Settings::default()).unwrap();
         assert_eq!(m.top_projects[0].name, "proj");
         assert_eq!(
             m.top_projects[0].tokens, 3_000_000,
@@ -338,7 +346,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let m = build_usage(&db, now).unwrap();
+        let m = build_usage(&db, now, &Settings::default()).unwrap();
         assert!(
             m.burn_rate.is_none(),
             "the oldest turn Perch has seen in this window is 5 minutes old \
@@ -370,7 +378,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let m = build_usage(&db, now).unwrap();
+        let m = build_usage(&db, now, &Settings::default()).unwrap();
         let rate = m.burn_rate.expect(
             "the oldest turn Perch has seen in this window is 1 hour old \
              (over the 30-minute floor), even though now.rem_euclid(WINDOW_MS) \
