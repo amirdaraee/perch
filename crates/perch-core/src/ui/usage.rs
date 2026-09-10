@@ -3,8 +3,8 @@
 
 use crate::db::Db;
 use crate::query::{self, DAY_MS};
-use crate::settings::Settings;
-use crate::ui::format::{human_cost, human_tokens};
+use crate::settings::{BurnRate, Settings};
+use crate::ui::format::{human_cost, human_tokens, plural};
 
 const WINDOW_MS: i64 = 5 * 3_600_000;
 const MIN_PROJECTABLE_MS: i64 = 30 * 60_000;
@@ -54,10 +54,26 @@ pub struct UsageModel {
     pub has_data: bool,
 }
 
-/// Projected tokens per hour for the current 5-hour window, or `None` when the
+/// "1 token", "999 tokens", "2.0M tokens". `plural` owns the singular/plural
+/// spelling and `human_tokens` owns the compact one; below a thousand they
+/// agree on the digits, and above it nothing is ever singular.
+fn tokens_phrase(n: u64) -> String {
+    if n < 1_000 {
+        plural(n as i64, "token", "tokens")
+    } else {
+        format!("{} tokens", human_tokens(n))
+    }
+}
+
+/// The burn-rate line in whichever unit the user asked for, or `None` when the
 /// window is too young or too quiet to project from honestly. Deliberately not
 /// a percentage: the ceiling needs the tier-1 usage endpoint, and the original
 /// spec §8 forbids inventing one.
+///
+/// `MIN_PROJECTABLE_MS` gates *every* mode, before the mode is even consulted.
+/// It is a statistical-soundness floor, not a preference: a rate that appeared
+/// in one unit but not another, for identical data, would be a lie about what
+/// Perch knows.
 ///
 /// `elapsed_ms` is measured from the oldest turn actually seen inside the
 /// window, not from an epoch-aligned boundary. Anthropic's real 5-hour
@@ -69,13 +85,54 @@ pub struct UsageModel {
 /// conservative (it can only *understate* elapsed time, since the real window
 /// may have opened even earlier) and never overstates the confidence of the
 /// projection.
-fn burn_rate(window_tokens: u64, elapsed_ms: i64) -> Option<String> {
-    if window_tokens == 0 || elapsed_ms < MIN_PROJECTABLE_MS {
+fn burn_rate(
+    mode: BurnRate,
+    show_cost: bool,
+    window_tokens: u64,
+    window_cost: f64,
+    elapsed_ms: i64,
+) -> Option<String> {
+    if mode == BurnRate::Off || window_tokens == 0 || elapsed_ms < MIN_PROJECTABLE_MS {
         return None;
     }
     let hours = elapsed_ms as f64 / 3_600_000.0;
-    let per_hour = (window_tokens as f64 / hours).round() as u64;
-    Some(format!("≈{}/h at this pace", human_tokens(per_hour)))
+
+    // A dollar-denominated mode with dollars switched off falls back to
+    // tokens rather than to silence. Silence means one specific thing in this
+    // view — "not enough data in this window to project a rate", which is
+    // what the settings preview says in as many words — and saying that of a
+    // window full of data would be a lie in the opposite direction from the
+    // one `MIN_PROJECTABLE_MS` guards against. The pace is known; only the
+    // currency is unwelcome.
+    let mode = match (mode, show_cost) {
+        (BurnRate::CostPerHour | BurnRate::CostPerDay, false) => BurnRate::TokensPerHour,
+        (m, _) => m,
+    };
+
+    Some(match mode {
+        // Returned above; repeated only to keep the match exhaustive, so a
+        // sixth mode is a compile error here rather than a silent default.
+        BurnRate::Off => return None,
+        BurnRate::TokensPerHour => format!(
+            "≈{} per hour at this pace",
+            tokens_phrase((window_tokens as f64 / hours).round() as u64)
+        ),
+        BurnRate::CostPerHour => format!("≈{}/hr at this pace", human_cost(window_cost / hours)),
+        BurnRate::CostPerDay => {
+            format!(
+                "≈{}/day at this pace",
+                human_cost(window_cost / hours * 24.0)
+            )
+        }
+        // The whole window's total at this pace, not a rate — and still only
+        // ever offered from a window long enough to project from.
+        BurnRate::ProjectedWindow => format!(
+            "≈{} by the end of this window",
+            tokens_phrase(
+                (window_tokens as f64 * (WINDOW_MS as f64 / elapsed_ms as f64)).round() as u64
+            )
+        ),
+    })
 }
 
 /// How long ago the oldest observed turn happened, relative to `now_ms` — i.e.
@@ -98,6 +155,16 @@ pub fn build_usage(db: &Db, now_ms: i64, settings: &Settings) -> anyhow::Result<
     let (window, window_cost) = query::usage_since(db, window_since)?;
     let (day, day_cost) = query::usage_since(db, now_ms - DAY_MS)?;
     let (week, _) = query::usage_since(db, now_ms - 7 * DAY_MS)?;
+
+    // `show_cost` off means absent, not "$0.00": a fabricated zero would read
+    // as a priced model that cost nothing.
+    let shown_cost = |usd: f64| {
+        if settings.show_cost {
+            human_cost(usd)
+        } else {
+            String::new()
+        }
+    };
 
     let chart_days = settings.chart_days as usize;
     let days = query::daily_usage(db, chart_days, now_ms)?;
@@ -133,7 +200,7 @@ pub fn build_usage(db: &Db, now_ms: i64, settings: &Settings) -> anyhow::Result<
         name,
         tokens: u.total_tokens(),
         tokens_label: human_tokens(u.total_tokens()),
-        cost: human_cost(cost),
+        cost: shown_cost(cost),
     })
     .collect();
 
@@ -153,7 +220,7 @@ pub fn build_usage(db: &Db, now_ms: i64, settings: &Settings) -> anyhow::Result<
             model,
             tokens: u.total_tokens(),
             tokens_label: human_tokens(u.total_tokens()),
-            cost: human_cost(cost),
+            cost: shown_cost(cost),
         })
         .collect();
 
@@ -164,7 +231,7 @@ pub fn build_usage(db: &Db, now_ms: i64, settings: &Settings) -> anyhow::Result<
         HeroStat {
             label: "5-hour window".into(),
             value: human_tokens(window.total_tokens()),
-            caption: Some(human_cost(window_cost)),
+            caption: settings.show_cost.then(|| human_cost(window_cost)),
         },
         HeroStat {
             label: "Week".into(),
@@ -174,13 +241,19 @@ pub fn build_usage(db: &Db, now_ms: i64, settings: &Settings) -> anyhow::Result<
         HeroStat {
             label: "24 hours".into(),
             value: human_tokens(day.total_tokens()),
-            caption: Some(human_cost(day_cost)),
+            caption: settings.show_cost.then(|| human_cost(day_cost)),
         },
     ];
 
     Ok(UsageModel {
         has_data: db.turn_count()? > 0,
-        burn_rate: burn_rate(window.total_tokens(), elapsed_in_window),
+        burn_rate: burn_rate(
+            settings.burn_rate,
+            settings.show_cost,
+            window.total_tokens(),
+            window_cost,
+            elapsed_in_window,
+        ),
         hero,
         daily,
         top_projects,
@@ -378,7 +451,14 @@ mod tests {
                 ..Default::default()
             },
         );
-        let m = build_usage(&db, now, &Settings::default()).unwrap();
+        // Tokens per hour, named explicitly: this test pins an elapsed-time
+        // *basis*, so it wants the unit that shows that basis's arithmetic
+        // directly rather than whichever unit happens to be the default.
+        let s = Settings {
+            burn_rate: BurnRate::TokensPerHour,
+            ..Settings::default()
+        };
+        let m = build_usage(&db, now, &s).unwrap();
         let rate = m.burn_rate.expect(
             "the oldest turn Perch has seen in this window is 1 hour old \
              (over the 30-minute floor), even though now.rem_euclid(WINDOW_MS) \
@@ -387,10 +467,177 @@ mod tests {
         // 2,000,000 tokens observed over exactly 1 hour of history projects
         // to exactly 2,000,000/h — pinning the actual figure, not just that
         // it reads as a rate.
-        assert_eq!(rate, "≈2.0M/h at this pace");
+        assert_eq!(rate, "≈2.0M tokens per hour at this pace");
         assert!(
             !rate.contains('%'),
             "never a percentage of a ceiling Perch does not know"
         );
+    }
+
+    /// A window with plenty of history and plenty of tokens: every burn-rate
+    /// mode has something to say about it.
+    fn busy_db() -> (Db, i64) {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let now = 600_000;
+        seed(
+            &db,
+            "s1",
+            now - 3_600_000, // an hour of observed history
+            "claude-fable-5",
+            TurnUsage {
+                input: 2_000_000, // $15/Mtok → $30.00 over that hour
+                ..Default::default()
+            },
+        );
+        (db, now)
+    }
+
+    /// The same tokens, but only ten minutes of observed history — under
+    /// `MIN_PROJECTABLE_MS`, so there is nothing honest to project from.
+    fn thin_db() -> (Db, i64) {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let now = 600_000;
+        seed(
+            &db,
+            "s1",
+            now - 600_000,
+            "claude-fable-5",
+            TurnUsage {
+                input: 2_000_000,
+                ..Default::default()
+            },
+        );
+        (db, now)
+    }
+
+    #[test]
+    fn burn_rate_off_produces_no_line_at_all() {
+        let (db, now) = busy_db();
+        let s = Settings {
+            burn_rate: BurnRate::Off,
+            ..Settings::default()
+        };
+        assert!(build_usage(&db, now, &s).unwrap().burn_rate.is_none());
+    }
+
+    #[test]
+    fn each_burn_rate_mode_names_its_own_unit() {
+        let (db, now) = busy_db();
+        let cases = [
+            (BurnRate::TokensPerHour, "per hour"),
+            (BurnRate::CostPerHour, "/hr"),
+            (BurnRate::CostPerDay, "/day"),
+            (BurnRate::ProjectedWindow, "by the end of this window"),
+        ];
+        for (mode, expected) in cases {
+            let s = Settings {
+                burn_rate: mode,
+                ..Settings::default()
+            };
+            let line = build_usage(&db, now, &s)
+                .unwrap()
+                .burn_rate
+                .expect("an hour of history and two million tokens is enough");
+            assert!(line.contains(expected), "{mode:?} produced {line:?}");
+        }
+    }
+
+    #[test]
+    fn the_figures_each_mode_reports_are_the_ones_the_window_earns() {
+        let (db, now) = busy_db();
+        // 2,000,000 tokens at $15/Mtok over exactly one observed hour.
+        let cases = [
+            (
+                BurnRate::TokensPerHour,
+                "≈2.0M tokens per hour at this pace",
+            ),
+            (BurnRate::CostPerHour, "≈$30.00/hr at this pace"),
+            (BurnRate::CostPerDay, "≈$720.00/day at this pace"),
+            (
+                BurnRate::ProjectedWindow,
+                "≈10.0M tokens by the end of this window",
+            ),
+        ];
+        for (mode, expected) in cases {
+            let s = Settings {
+                burn_rate: mode,
+                ..Settings::default()
+            };
+            assert_eq!(
+                build_usage(&db, now, &s).unwrap().burn_rate.as_deref(),
+                Some(expected),
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// `MIN_PROJECTABLE_MS` is a statistical floor, not a preference: no
+    /// display mode may talk a projection out of a window too short to
+    /// support one. A rate that appeared in one unit but not another, for
+    /// identical data, would be a lie about what Perch knows.
+    #[test]
+    fn a_thin_window_still_suppresses_every_mode() {
+        let (db, now) = thin_db();
+        for mode in [
+            BurnRate::TokensPerHour,
+            BurnRate::CostPerHour,
+            BurnRate::CostPerDay,
+            BurnRate::ProjectedWindow,
+        ] {
+            let s = Settings {
+                burn_rate: mode,
+                ..Settings::default()
+            };
+            assert!(
+                build_usage(&db, now, &s).unwrap().burn_rate.is_none(),
+                "{mode:?} projected from ten minutes of history"
+            );
+        }
+    }
+
+    #[test]
+    fn hiding_cost_hides_it_everywhere_it_would_appear() {
+        let (db, now) = busy_db();
+        let s = Settings {
+            show_cost: false,
+            ..Settings::default() // whose burn_rate is a *cost* per hour
+        };
+        let m = build_usage(&db, now, &s).unwrap();
+        assert!(m.hero.iter().all(|h| !h.value.contains('$')));
+        assert!(
+            m.hero.iter().all(|h| h.caption.is_none()),
+            "the hero captions are the costs; hidden means absent, not $0.00"
+        );
+        assert_eq!(m.burn_rate.as_deref().unwrap_or("").matches('$').count(), 0);
+        assert!(m.top_projects.iter().all(|p| !p.cost.contains('$')));
+        assert!(m.by_model.iter().all(|r| !r.cost.contains('$')));
+    }
+
+    #[test]
+    fn a_cost_burn_rate_with_cost_hidden_still_reports_the_pace() {
+        let (db, now) = busy_db();
+        let s = Settings {
+            show_cost: false,
+            burn_rate: BurnRate::CostPerHour,
+            ..Settings::default()
+        };
+        // Silence would read as "not enough data to project" — which is what
+        // the settings preview says a missing line means. The pace is known;
+        // only the currency is unwelcome.
+        assert_eq!(
+            build_usage(&db, now, &s).unwrap().burn_rate.as_deref(),
+            Some("≈2.0M tokens per hour at this pace")
+        );
+    }
+
+    #[test]
+    fn showing_cost_still_shows_it() {
+        let (db, now) = busy_db();
+        let m = build_usage(&db, now, &Settings::default()).unwrap();
+        assert_eq!(m.hero[0].caption.as_deref(), Some("$30.00"));
+        assert_eq!(m.top_projects[0].cost, "$30.00");
+        assert_eq!(m.by_model[0].cost, "$30.00");
     }
 }
