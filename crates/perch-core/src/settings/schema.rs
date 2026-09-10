@@ -295,6 +295,44 @@ pub fn build_schema(s: &Settings, cx: &SchemaContext) -> Vec<SettingsPane> {
     ]
 }
 
+/// Restore every setting `pane_id` shows to its factory value, leaving every
+/// other pane's settings exactly as they are.
+///
+/// The keys come from the schema rather than from a list written beside it,
+/// and each one is restored by reading [`Settings::default`] through
+/// [`Settings::get`] and writing it back through [`Settings::set`] — never by
+/// assigning a field. That is what keeps this correct when a twenty-seventh
+/// setting is added: `set` is exhaustive over [`SettingKey`], and
+/// `every_setting_key_appears_in_exactly_one_pane` guarantees the new key is
+/// in some pane, so the new setting resets with its pane without anyone
+/// remembering to come back here.
+///
+/// [`PaneId::Prices`], [`PaneId::Diagnostics`] and [`PaneId::Advanced`] carry
+/// no rows, so they own no keys and this is a no-op over them. Reaching for
+/// "everything" in that case would turn a reset of the price table into a
+/// reset of the whole app.
+pub fn reset_pane(s: &mut Settings, pane_id: PaneId) {
+    // The context only decides captions, counts and enablement — never which
+    // rows exist — so the empty one names the same keys as any other, and
+    // keeps this function as free of the index and the terminal detector as
+    // `build_schema` itself.
+    let keys: Vec<SettingKey> = build_schema(s, &SchemaContext::empty())
+        .iter()
+        .filter(|p| p.id == pane_id)
+        .flat_map(|p| p.groups.iter())
+        .flat_map(|g| g.rows.iter())
+        .filter_map(|r| r.key)
+        .collect();
+
+    let defaults = Settings::default();
+    for key in keys {
+        // `defaults.get(key)` is by construction the shape `set` wants for
+        // that key, so this cannot fail; ignoring it keeps `reset_pane`
+        // infallible rather than inventing an error no caller could act on.
+        let _ = s.set(key, defaults.get(key));
+    }
+}
+
 // --- The panes ------------------------------------------------------------
 
 fn general_pane(s: &Settings, cx: &SchemaContext) -> SettingsPane {
@@ -1065,6 +1103,20 @@ pub(crate) mod test_support {
             .unwrap_or_else(|| panic!("{key:?} has no row"))
     }
 
+    /// How many rows survived a filter.
+    pub(crate) fn count_rows(panes: &[SettingsPane]) -> usize {
+        all_rows(panes).len()
+    }
+
+    /// The first row of the first pane that has one. Panics if there is
+    /// none, which is what a search test asserting a hit wants.
+    pub(crate) fn first_row(panes: &[SettingsPane]) -> &SettingRow {
+        all_rows(panes)
+            .into_iter()
+            .next()
+            .expect("no pane kept a row")
+    }
+
     pub(crate) fn pane(panes: &[SettingsPane], id: PaneId) -> &SettingsPane {
         panes
             .iter()
@@ -1294,6 +1346,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn resetting_a_pane_restores_only_its_own_keys() {
+        let mut s = Settings {
+            poll_seconds: 30,          // General
+            waiting_after_minutes: 99, // Notifications
+            ..Settings::default()
+        };
+
+        reset_pane(&mut s, PaneId::General);
+
+        assert_eq!(
+            s.poll_seconds,
+            Settings::default().poll_seconds,
+            "its own key resets"
+        );
+        assert_eq!(
+            s.waiting_after_minutes, 99,
+            "another pane's key is untouched"
+        );
+    }
+
+    #[test]
+    fn resetting_a_rowless_pane_changes_nothing() {
+        // Prices, Diagnostics and Advanced hold no rows, so they own no keys.
+        // A reset over one of them must be a no-op rather than reaching for
+        // "everything", which is the shape this mistake takes.
+        let mut s = Settings {
+            poll_seconds: 30,
+            waiting_after_minutes: 99,
+            ..Settings::default()
+        };
+        let before = s.clone();
+
+        for id in [PaneId::Prices, PaneId::Diagnostics, PaneId::Advanced] {
+            reset_pane(&mut s, id);
+        }
+
+        assert_eq!(s, before, "a rowless pane owns no keys to reset");
     }
 
     #[test]
