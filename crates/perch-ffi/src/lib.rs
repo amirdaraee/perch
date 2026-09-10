@@ -7,7 +7,7 @@ use perch_core::ui::{
     diagnostics as core_diagnostics, main_window, model as core_model,
     settings as core_ui_settings, usage as core_usage, watcher,
 };
-use perch_core::{config, db, index, live, notify, pricing, query, settings};
+use perch_core::{config, db, index, live, notify, pricing, query, settings, terminals};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
@@ -109,6 +109,13 @@ pub enum PerchError {
     Database { message: String },
     #[error("io error: {message}")]
     Io { message: String },
+    /// A `set_setting` whose value did not fit its key — a boolean sent for a
+    /// count, or a choice string outside the enum the key is drawn from. A
+    /// report about the *caller*, not user-facing copy: anything may arrive
+    /// across this boundary, and a shell that sends the wrong shape must be
+    /// told rather than crash the app it is drawing.
+    #[error("{message}")]
+    Setting { message: String },
 }
 
 impl From<core_model::Status> for Status {
@@ -940,6 +947,562 @@ impl From<notify::Notification> for WaitingNotification {
     }
 }
 
+// --- The settings schema, its edits, its resets, prices and terminals ---
+//
+// Everything below mirrors `perch_core::settings::schema`,
+// `perch_core::settings::keys`, `perch_core::pricing` and
+// `perch_core::terminals`. This is the surface the settings *window* is built
+// on; the flat `Settings` record above is the older, eight-field one the
+// popover's own settings sheet still uses, and the two are deliberately not
+// the same shape (see `Settings`' own doc comment).
+//
+// `SettingKey`, `SettingValue` and `PaneId` cross in *both* directions — a
+// shell reads a row and writes one back, and reset takes a pane it was handed
+// — so each gets a `From` each way. Every conversion destructures its source,
+// like every other mirror in this file, so a variant or a field added on
+// either side becomes a compile error here rather than a silent gap.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PaneId {
+    General,
+    MenuBar,
+    Popover,
+    Projects,
+    Usage,
+    Prices,
+    Notifications,
+    Diagnostics,
+    Advanced,
+}
+
+impl From<settings::PaneId> for PaneId {
+    fn from(p: settings::PaneId) -> Self {
+        match p {
+            settings::PaneId::General => PaneId::General,
+            settings::PaneId::MenuBar => PaneId::MenuBar,
+            settings::PaneId::Popover => PaneId::Popover,
+            settings::PaneId::Projects => PaneId::Projects,
+            settings::PaneId::Usage => PaneId::Usage,
+            settings::PaneId::Prices => PaneId::Prices,
+            settings::PaneId::Notifications => PaneId::Notifications,
+            settings::PaneId::Diagnostics => PaneId::Diagnostics,
+            settings::PaneId::Advanced => PaneId::Advanced,
+        }
+    }
+}
+
+impl From<PaneId> for settings::PaneId {
+    fn from(p: PaneId) -> Self {
+        match p {
+            PaneId::General => settings::PaneId::General,
+            PaneId::MenuBar => settings::PaneId::MenuBar,
+            PaneId::Popover => settings::PaneId::Popover,
+            PaneId::Projects => settings::PaneId::Projects,
+            PaneId::Usage => settings::PaneId::Usage,
+            PaneId::Prices => settings::PaneId::Prices,
+            PaneId::Notifications => settings::PaneId::Notifications,
+            PaneId::Diagnostics => settings::PaneId::Diagnostics,
+            PaneId::Advanced => settings::PaneId::Advanced,
+        }
+    }
+}
+
+/// A semantic icon, never an SF Symbol name — the shell maps this to whatever
+/// glyph it draws, which is the one macOS-specific fact the settings window
+/// keeps in Swift. One way only: nothing sends an icon back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum IconId {
+    General,
+    MenuBar,
+    Popover,
+    Projects,
+    Usage,
+    Prices,
+    Notifications,
+    Diagnostics,
+    Advanced,
+}
+
+impl From<settings::IconId> for IconId {
+    fn from(i: settings::IconId) -> Self {
+        match i {
+            settings::IconId::General => IconId::General,
+            settings::IconId::MenuBar => IconId::MenuBar,
+            settings::IconId::Popover => IconId::Popover,
+            settings::IconId::Projects => IconId::Projects,
+            settings::IconId::Usage => IconId::Usage,
+            settings::IconId::Prices => IconId::Prices,
+            settings::IconId::Notifications => IconId::Notifications,
+            settings::IconId::Diagnostics => IconId::Diagnostics,
+            settings::IconId::Advanced => IconId::Advanced,
+        }
+    }
+}
+
+/// Every setting addressed as data. A shell never names a field; it hands
+/// back the key it was given on the row it drew.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SettingKey {
+    LaunchAtLogin,
+    ClaudeConfigDir,
+    MenuBarDisplay,
+    MenuBarIcon,
+    DimWhenStale,
+    StaleAfterMinutes,
+    PollSeconds,
+    PreferredTerminal,
+    ShowWaiting,
+    ShowWorking,
+    ShowRecent,
+    RecentLimit,
+    RowDensity,
+    ShowRowFolder,
+    ShowRowUsage,
+    ActiveWithinDays,
+    ShowArchived,
+    ChartDays,
+    TopProjectsCount,
+    TopProjectsDays,
+    BurnRate,
+    ShowCost,
+    WaitingEnabled,
+    WaitingAfterMinutes,
+    IncludeBackground,
+    Sound,
+}
+
+impl From<settings::SettingKey> for SettingKey {
+    fn from(k: settings::SettingKey) -> Self {
+        match k {
+            settings::SettingKey::LaunchAtLogin => SettingKey::LaunchAtLogin,
+            settings::SettingKey::ClaudeConfigDir => SettingKey::ClaudeConfigDir,
+            settings::SettingKey::MenuBarDisplay => SettingKey::MenuBarDisplay,
+            settings::SettingKey::MenuBarIcon => SettingKey::MenuBarIcon,
+            settings::SettingKey::DimWhenStale => SettingKey::DimWhenStale,
+            settings::SettingKey::StaleAfterMinutes => SettingKey::StaleAfterMinutes,
+            settings::SettingKey::PollSeconds => SettingKey::PollSeconds,
+            settings::SettingKey::PreferredTerminal => SettingKey::PreferredTerminal,
+            settings::SettingKey::ShowWaiting => SettingKey::ShowWaiting,
+            settings::SettingKey::ShowWorking => SettingKey::ShowWorking,
+            settings::SettingKey::ShowRecent => SettingKey::ShowRecent,
+            settings::SettingKey::RecentLimit => SettingKey::RecentLimit,
+            settings::SettingKey::RowDensity => SettingKey::RowDensity,
+            settings::SettingKey::ShowRowFolder => SettingKey::ShowRowFolder,
+            settings::SettingKey::ShowRowUsage => SettingKey::ShowRowUsage,
+            settings::SettingKey::ActiveWithinDays => SettingKey::ActiveWithinDays,
+            settings::SettingKey::ShowArchived => SettingKey::ShowArchived,
+            settings::SettingKey::ChartDays => SettingKey::ChartDays,
+            settings::SettingKey::TopProjectsCount => SettingKey::TopProjectsCount,
+            settings::SettingKey::TopProjectsDays => SettingKey::TopProjectsDays,
+            settings::SettingKey::BurnRate => SettingKey::BurnRate,
+            settings::SettingKey::ShowCost => SettingKey::ShowCost,
+            settings::SettingKey::WaitingEnabled => SettingKey::WaitingEnabled,
+            settings::SettingKey::WaitingAfterMinutes => SettingKey::WaitingAfterMinutes,
+            settings::SettingKey::IncludeBackground => SettingKey::IncludeBackground,
+            settings::SettingKey::Sound => SettingKey::Sound,
+        }
+    }
+}
+
+impl From<SettingKey> for settings::SettingKey {
+    fn from(k: SettingKey) -> Self {
+        match k {
+            SettingKey::LaunchAtLogin => settings::SettingKey::LaunchAtLogin,
+            SettingKey::ClaudeConfigDir => settings::SettingKey::ClaudeConfigDir,
+            SettingKey::MenuBarDisplay => settings::SettingKey::MenuBarDisplay,
+            SettingKey::MenuBarIcon => settings::SettingKey::MenuBarIcon,
+            SettingKey::DimWhenStale => settings::SettingKey::DimWhenStale,
+            SettingKey::StaleAfterMinutes => settings::SettingKey::StaleAfterMinutes,
+            SettingKey::PollSeconds => settings::SettingKey::PollSeconds,
+            SettingKey::PreferredTerminal => settings::SettingKey::PreferredTerminal,
+            SettingKey::ShowWaiting => settings::SettingKey::ShowWaiting,
+            SettingKey::ShowWorking => settings::SettingKey::ShowWorking,
+            SettingKey::ShowRecent => settings::SettingKey::ShowRecent,
+            SettingKey::RecentLimit => settings::SettingKey::RecentLimit,
+            SettingKey::RowDensity => settings::SettingKey::RowDensity,
+            SettingKey::ShowRowFolder => settings::SettingKey::ShowRowFolder,
+            SettingKey::ShowRowUsage => settings::SettingKey::ShowRowUsage,
+            SettingKey::ActiveWithinDays => settings::SettingKey::ActiveWithinDays,
+            SettingKey::ShowArchived => settings::SettingKey::ShowArchived,
+            SettingKey::ChartDays => settings::SettingKey::ChartDays,
+            SettingKey::TopProjectsCount => settings::SettingKey::TopProjectsCount,
+            SettingKey::TopProjectsDays => settings::SettingKey::TopProjectsDays,
+            SettingKey::BurnRate => settings::SettingKey::BurnRate,
+            SettingKey::ShowCost => settings::SettingKey::ShowCost,
+            SettingKey::WaitingEnabled => settings::SettingKey::WaitingEnabled,
+            SettingKey::WaitingAfterMinutes => settings::SettingKey::WaitingAfterMinutes,
+            SettingKey::IncludeBackground => settings::SettingKey::IncludeBackground,
+            SettingKey::Sound => settings::SettingKey::Sound,
+        }
+    }
+}
+
+/// The four shapes a setting's value takes at this boundary.
+///
+/// Which one a row wants is decided by its *key*, not by the control drawn
+/// for it: [`SettingKey::PreferredTerminal`] renders as a
+/// [`Control::Choice`] but stores `Text`, because its option ids are the
+/// names of applications Perch found rather than the wire values of an enum
+/// Perch defines. Every other choice row sends `Choice`, and a string outside
+/// that enum's own values is refused rather than degraded.
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum SettingValue {
+    Bool { value: bool },
+    Int { value: i64 },
+    Text { value: String },
+    Choice { value: String },
+}
+
+impl From<settings::SettingValue> for SettingValue {
+    fn from(v: settings::SettingValue) -> Self {
+        match v {
+            settings::SettingValue::Bool(value) => SettingValue::Bool { value },
+            settings::SettingValue::Int(value) => SettingValue::Int { value },
+            settings::SettingValue::Text(value) => SettingValue::Text { value },
+            settings::SettingValue::Choice(value) => SettingValue::Choice { value },
+        }
+    }
+}
+
+impl From<SettingValue> for settings::SettingValue {
+    fn from(v: SettingValue) -> Self {
+        match v {
+            SettingValue::Bool { value } => settings::SettingValue::Bool(value),
+            SettingValue::Int { value } => settings::SettingValue::Int(value),
+            SettingValue::Text { value } => settings::SettingValue::Text(value),
+            SettingValue::Choice { value } => settings::SettingValue::Choice(value),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ChoiceOption {
+    pub id: String,
+    pub label: String,
+}
+
+impl From<settings::ChoiceOption> for ChoiceOption {
+    fn from(o: settings::ChoiceOption) -> Self {
+        let settings::ChoiceOption { id, label } = o;
+        ChoiceOption { id, label }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct IntOption {
+    pub value: i64,
+    pub label: String,
+}
+
+impl From<settings::IntOption> for IntOption {
+    fn from(o: settings::IntOption) -> Self {
+        let settings::IntOption { value, label } = o;
+        IntOption { value, label }
+    }
+}
+
+/// Which control edits a row, with every caption already finished. A shell
+/// picks a widget per variant and renders the strings verbatim — it composes
+/// none of them, which is what keeps "Check every 1 seconds" from reaching a
+/// build for a third time.
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum Control {
+    Toggle {
+        on: bool,
+    },
+    Stepper {
+        value: i64,
+        min: i64,
+        max: i64,
+        step: i64,
+        value_label: String,
+    },
+    Choice {
+        selected: String,
+        options: Vec<ChoiceOption>,
+    },
+    /// A picker over *numbers* — `chart_days` is the only one. A shell sends
+    /// the chosen `value` back as [`SettingValue::Int`], never as a `Choice`
+    /// spelled `"30"`.
+    IntChoice {
+        selected: i64,
+        options: Vec<IntOption>,
+    },
+    Text {
+        value: String,
+        placeholder: String,
+    },
+    Folder {
+        value: String,
+        resolved_label: String,
+    },
+    Action {
+        button_label: String,
+        destructive: bool,
+    },
+    Info {
+        value_label: String,
+    },
+}
+
+impl From<settings::Control> for Control {
+    fn from(c: settings::Control) -> Self {
+        match c {
+            settings::Control::Toggle { on } => Control::Toggle { on },
+            settings::Control::Stepper {
+                value,
+                min,
+                max,
+                step,
+                value_label,
+            } => Control::Stepper {
+                value,
+                min,
+                max,
+                step,
+                value_label,
+            },
+            settings::Control::Choice { selected, options } => Control::Choice {
+                selected,
+                options: options.into_iter().map(Into::into).collect(),
+            },
+            settings::Control::IntChoice { selected, options } => Control::IntChoice {
+                selected,
+                options: options.into_iter().map(Into::into).collect(),
+            },
+            settings::Control::Text { value, placeholder } => Control::Text { value, placeholder },
+            settings::Control::Folder {
+                value,
+                resolved_label,
+            } => Control::Folder {
+                value,
+                resolved_label,
+            },
+            settings::Control::Action {
+                button_label,
+                destructive,
+            } => Control::Action {
+                button_label,
+                destructive,
+            },
+            settings::Control::Info { value_label } => Control::Info { value_label },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct SettingRow {
+    /// `None` for a row that shows rather than stores — an `Info` line or an
+    /// `Action` button.
+    pub key: Option<SettingKey>,
+    pub label: String,
+    pub help: Option<String>,
+    pub control: Control,
+    pub enabled: bool,
+    pub is_default: bool,
+    pub indent: bool,
+    pub search_terms: Vec<String>,
+}
+
+impl From<settings::SettingRow> for SettingRow {
+    fn from(r: settings::SettingRow) -> Self {
+        let settings::SettingRow {
+            key,
+            label,
+            help,
+            control,
+            enabled,
+            is_default,
+            indent,
+            search_terms,
+        } = r;
+        SettingRow {
+            key: key.map(Into::into),
+            label,
+            help,
+            control: control.into(),
+            enabled,
+            is_default,
+            indent,
+            search_terms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct SettingGroup {
+    pub heading: Option<String>,
+    pub rows: Vec<SettingRow>,
+}
+
+impl From<settings::SettingGroup> for SettingGroup {
+    fn from(g: settings::SettingGroup) -> Self {
+        let settings::SettingGroup { heading, rows } = g;
+        SettingGroup {
+            heading,
+            rows: rows.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// What a pane's settings currently produce, in the user's own data.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct PanePreview {
+    pub summary: String,
+    pub detail: Vec<String>,
+}
+
+impl From<settings::PanePreview> for PanePreview {
+    fn from(p: settings::PanePreview) -> Self {
+        let settings::PanePreview { summary, detail } = p;
+        PanePreview { summary, detail }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct SettingsPane {
+    pub id: PaneId,
+    pub title: String,
+    pub icon: IconId,
+    /// A short finished phrase for the sidebar when this pane's current
+    /// configuration is costing the user something — "off · 2 waiting".
+    /// `None` is the common case, and a shell must draw nothing then.
+    pub attention: Option<String>,
+    pub preview: Option<PanePreview>,
+    /// Empty for `Prices`, `Diagnostics` and `Advanced`, which are drawn
+    /// bespoke — they are still panes so the sidebar, search and selection
+    /// know they exist without a second list in the shell.
+    pub groups: Vec<SettingGroup>,
+}
+
+impl From<settings::SettingsPane> for SettingsPane {
+    fn from(p: settings::SettingsPane) -> Self {
+        let settings::SettingsPane {
+            id,
+            title,
+            icon,
+            attention,
+            preview,
+            groups,
+        } = p;
+        SettingsPane {
+            id: id.into(),
+            title,
+            icon: icon.into(),
+            attention,
+            preview: preview.map(Into::into),
+            groups: groups.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// What every mutating settings call returns: the schema that resulted from
+/// the write, and whatever `Settings::validated` had to change on the way to
+/// disk. Both, always — a shell must never re-read to see its own write, and
+/// must never have to discover a clamp for itself.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct SettingsResult {
+    pub panes: Vec<SettingsPane>,
+    pub notes: Vec<String>,
+}
+
+/// Mirrors `perch_core::pricing::ModelPrice`. Crosses both ways — the price
+/// table is editable — so it destructures in each direction.
+#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
+pub struct ModelPrice {
+    pub input_per_mtok: f64,
+    pub output_per_mtok: f64,
+    pub cache_read_per_mtok: f64,
+    pub cache_write_per_mtok: f64,
+}
+
+impl From<pricing::ModelPrice> for ModelPrice {
+    fn from(p: pricing::ModelPrice) -> Self {
+        let pricing::ModelPrice {
+            input_per_mtok,
+            output_per_mtok,
+            cache_read_per_mtok,
+            cache_write_per_mtok,
+        } = p;
+        ModelPrice {
+            input_per_mtok,
+            output_per_mtok,
+            cache_read_per_mtok,
+            cache_write_per_mtok,
+        }
+    }
+}
+
+impl From<ModelPrice> for pricing::ModelPrice {
+    fn from(p: ModelPrice) -> Self {
+        let ModelPrice {
+            input_per_mtok,
+            output_per_mtok,
+            cache_read_per_mtok,
+            cache_write_per_mtok,
+        } = p;
+        pricing::ModelPrice {
+            input_per_mtok,
+            output_per_mtok,
+            cache_read_per_mtok,
+            cache_write_per_mtok,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct ModelPriceRow {
+    pub model: String,
+    pub price: ModelPrice,
+    /// True only for a model Perch ships that still holds the rate Perch
+    /// shipped — so a reset is offered exactly where something drifted.
+    pub is_default: bool,
+}
+
+impl From<pricing::ModelPriceRow> for ModelPriceRow {
+    fn from(r: pricing::ModelPriceRow) -> Self {
+        let pricing::ModelPriceRow {
+            model,
+            price,
+            is_default,
+        } = r;
+        ModelPriceRow {
+            model,
+            price: price.into(),
+            is_default,
+        }
+    }
+}
+
+/// Mirrors `perch_core::terminals::TerminalChoice`. The schema's Preferred
+/// terminal row already carries these as plain `ChoiceOption`s; this is the
+/// fuller shape, for a shell that wants to launch by bundle identifier rather
+/// than by name.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TerminalChoice {
+    pub id: String,
+    pub label: String,
+    pub bundle_id: Option<String>,
+    pub installed: bool,
+}
+
+impl From<terminals::TerminalChoice> for TerminalChoice {
+    fn from(t: terminals::TerminalChoice) -> Self {
+        let terminals::TerminalChoice {
+            id,
+            label,
+            bundle_id,
+            installed,
+        } = t;
+        TerminalChoice {
+            id,
+            label,
+            bundle_id,
+            installed,
+        }
+    }
+}
+
 /// Implemented by the shell. Called on the watcher thread; the shell hops to its UI thread.
 #[uniffi::export(with_foreign)]
 pub trait PerchListener: Send + Sync {
@@ -1541,6 +2104,116 @@ impl Perch {
             .map_err(db_err)?;
         self.detail(&database, project_id)
     }
+
+    // --- The settings window ---------------------------------------------
+
+    /// The whole settings window, described in Rust: every pane, its rows,
+    /// each row's finished caption, and the previews composed from this
+    /// machine's own index.
+    ///
+    /// `query` is matched **here**, by `settings::filter_panes`. The shell
+    /// sends keystrokes and draws what comes back; a filter written in a
+    /// shell is a second copy of every label and every help string, and the
+    /// copy is what goes stale when a row is renamed.
+    pub fn settings_schema(&self, query: Option<String>) -> Vec<SettingsPane> {
+        let loaded = settings::store::load(&self.config_path).settings;
+        self.panes(&loaded, query.as_deref())
+    }
+
+    /// Store one value under one key, and report the schema that resulted.
+    ///
+    /// A key and a value, never a whole struct: the eighteen settings this
+    /// boundary's flat `Settings` record cannot carry must survive a write
+    /// that never mentioned them, and a whole-struct conversion is exactly
+    /// how they would not.
+    ///
+    /// Which shape a key wants is the key's business, not the control's —
+    /// `PreferredTerminal` draws as a `Control::Choice` and stores
+    /// `SettingValue::Text`, because its options are applications Perch
+    /// found rather than variants Perch defines. A value of the wrong shape
+    /// is refused with `PerchError::Setting` rather than quietly dropped.
+    pub fn set_setting(
+        &self,
+        key: SettingKey,
+        value: SettingValue,
+    ) -> Result<SettingsResult, PerchError> {
+        let mut current = settings::store::load(&self.config_path).settings;
+        current
+            .set(key.into(), value.into())
+            .map_err(|e| PerchError::Setting {
+                message: e.to_string(),
+            })?;
+        self.save_and_report(&current)
+    }
+
+    /// Restore every setting `pane` shows to its factory value, leaving every
+    /// other pane exactly as it is, and report the schema that resulted.
+    pub fn reset_pane(&self, pane: PaneId) -> Result<SettingsResult, PerchError> {
+        let mut current = settings::store::load(&self.config_path).settings;
+        // Infallible in core, and it builds its own schema against
+        // `SchemaContext::empty()` — the context decides captions, counts and
+        // enablement, never *which rows exist*, so there is no context to
+        // thread in and nothing this call can fail at.
+        settings::reset_pane(&mut current, pane.into());
+        self.save_and_report(&current)
+    }
+
+    // --- The price table --------------------------------------------------
+
+    /// Every model price Perch holds, shipped or user-added.
+    pub fn prices(&self) -> Result<Vec<ModelPriceRow>, PerchError> {
+        let database = self.open_db()?;
+        // Seed before reading: the settings window can be opened before the
+        // first index has run, and an empty price table would read as "Perch
+        // knows no rates" rather than "Perch has not indexed yet". Seeding
+        // never overwrites a row that already exists, so this is idempotent
+        // and never undoes an edit.
+        pricing::seed_default_prices(&database).map_err(db_err)?;
+        self.price_rows(&database)
+    }
+
+    /// Store a rate, for a built-in model or one the user added, returning
+    /// the table that resulted so the shell never re-reads to see its own
+    /// write.
+    pub fn set_price(
+        &self,
+        model: String,
+        price: ModelPrice,
+    ) -> Result<Vec<ModelPriceRow>, PerchError> {
+        let database = self.open_db()?;
+        pricing::set_price(&database, &model, price.into()).map_err(db_err)?;
+        self.price_rows(&database)
+    }
+
+    /// Forget a model's rate — "I do not know what this costs", which is a
+    /// different claim from "it costs nothing". Its turns keep counting their
+    /// tokens and contribute no cost.
+    pub fn remove_price(&self, model: String) -> Result<Vec<ModelPriceRow>, PerchError> {
+        let database = self.open_db()?;
+        pricing::remove_price(&database, &model).map_err(db_err)?;
+        self.price_rows(&database)
+    }
+
+    /// Restore the shipped table exactly: every edit undone and every model
+    /// the user added gone.
+    pub fn reset_prices(&self) -> Result<Vec<ModelPriceRow>, PerchError> {
+        let database = self.open_db()?;
+        pricing::reset_prices_to_defaults(&database).map_err(db_err)?;
+        self.price_rows(&database)
+    }
+
+    /// The terminals this machine has, plus whatever the settings file names
+    /// even when it was not detected — the same union the Preferred terminal
+    /// picker offers, with the bundle identifiers a launcher may prefer.
+    pub fn terminals(&self) -> Vec<TerminalChoice> {
+        let configured = settings::store::load(&self.config_path)
+            .settings
+            .preferred_terminal;
+        terminals::terminal_picker(&configured)
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
 }
 
 impl Perch {
@@ -1723,6 +2396,263 @@ impl Perch {
         .map(Into::into)
         .map_err(db_err)
     }
+
+    /// Build the schema against `s` and this machine's real data, optionally
+    /// narrowed by `query`, and mirror it across the boundary.
+    fn panes(&self, s: &settings::Settings, query: Option<&str>) -> Vec<SettingsPane> {
+        let built = settings::build_schema(s, &self.schema_context(s));
+        let shown = match query {
+            Some(q) => settings::filter_panes(&built, q),
+            None => built,
+        };
+        shown.into_iter().map(Into::into).collect()
+    }
+
+    /// Write `s`, read it straight back, and report the schema that resulted
+    /// together with whatever `Settings::validated` had to change.
+    ///
+    /// The value is written **as it arrived** and clamped by `load` on the
+    /// way back, exactly as a hand-edited file is: bounds are decided in one
+    /// place, and that one place is the only one that can say what it
+    /// changed. A save that cannot land is an error here and nothing else —
+    /// this seam swallowing a failed write is a defect this project has
+    /// shipped twice, and a write that did not happen must never come back
+    /// looking like one that did.
+    fn save_and_report(&self, s: &settings::Settings) -> Result<SettingsResult, PerchError> {
+        settings::store::save(&self.config_path, s).map_err(|e| PerchError::Io {
+            message: e.to_string(),
+        })?;
+        let loaded = settings::store::load(&self.config_path);
+        if let Some(error) = loaded.error {
+            return Err(PerchError::Io { message: error });
+        }
+        Ok(SettingsResult {
+            panes: self.panes(&loaded.settings, None),
+            notes: loaded.notes,
+        })
+    }
+
+    /// Every price row, mirrored. Shared by all four price methods so each
+    /// returns the table that resulted rather than making the shell re-read.
+    fn price_rows(&self, database: &Db) -> Result<Vec<ModelPriceRow>, PerchError> {
+        Ok(pricing::all_prices(database)
+            .map_err(db_err)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// The facts `build_schema` needs but does not own, taken from this
+    /// machine's index, its live sessions, its records and its applications
+    /// folder.
+    ///
+    /// **Every field is populated.** A half-filled context is not a smaller
+    /// feature but a silently missing one: every pane preview and every
+    /// sidebar attention phrase is computed from these and from nothing else,
+    /// so a field left at its `empty()` value makes that pane's own data
+    /// disappear with nothing failing anywhere. `SchemaContext::empty()` is
+    /// for the genuine first run, not for a caller in a hurry.
+    fn schema_context(&self, s: &settings::Settings) -> settings::SchemaContext {
+        let dir = self.config_dir();
+        let sessions = live::live_sessions(&config::sessions_dir(&dir), &RealProcessProbe);
+        let db = db::open(&self.db_path).ok();
+        let now = now_ms();
+        let model = self.core_model_for(sessions.clone());
+
+        // Which folder Perch is reading, and why it picked that one. The
+        // "why" mirrors `ui::diagnostics::config_dir_source`'s precedence:
+        // a non-empty setting beats every environment-derived source, and
+        // `Settings::validated` has already dropped a setting that named
+        // something unusable, so a non-empty one here really is in force.
+        let claude_dir = {
+            let label = dir.display().to_string();
+            if dir.is_dir() {
+                settings::DirStatus::Reading {
+                    label,
+                    how: if s.claude_config_dir.trim().is_empty() {
+                        "found automatically".to_string()
+                    } else {
+                        "set in settings".to_string()
+                    },
+                }
+            } else {
+                settings::DirStatus::NotFound { label }
+            }
+        };
+
+        let (project_last_used_days, archived_projects) = db
+            .as_ref()
+            .map(|d| project_ages(d, now))
+            .unwrap_or_default();
+
+        let indexed_sessions = db
+            .as_ref()
+            .and_then(|d| d.session_count().ok())
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(0);
+
+        // Waiting and working are counted off the popover's own rows, so the
+        // Popover pane's preview can never disagree with the popover itself.
+        // `live` carries every session regardless of which sections the user
+        // has hidden — hiding a section must not make its count vanish from
+        // the setting that hides it.
+        let waiting_sessions = count_status(&model.live, core_model::Status::Waiting);
+        let working_sessions = count_status(&model.live, core_model::Status::Working);
+
+        // Counted from the index rather than from `model.recent`, which is
+        // empty when the Recent section is switched off — the row that
+        // switches it off is the one place that must still say how much is
+        // there.
+        let live_ids: Vec<String> = sessions.iter().map(|l| l.session_id.clone()).collect();
+        let recent_sessions = db
+            .as_ref()
+            .and_then(|d| query::recent_sessions(d, &live_ids, s.recent_limit as usize).ok())
+            .and_then(|r| u32::try_from(r.len()).ok())
+            .unwrap_or(0);
+
+        let priced = db
+            .as_ref()
+            .and_then(|d| pricing::all_prices(d).ok())
+            .unwrap_or_default();
+        let priced_models = u32::try_from(priced.len()).unwrap_or(u32::MAX);
+        let priced_names: HashSet<&str> = priced.iter().map(|r| r.model.as_str()).collect();
+        let unpriced_models_in_use = db
+            .as_ref()
+            .and_then(|d| query::usage_by_model(d).ok())
+            .map(|used| {
+                let n = used
+                    .iter()
+                    .filter(|(model, _, _)| !priced_names.contains(model.as_str()))
+                    .count();
+                u32::try_from(n).unwrap_or(u32::MAX)
+            })
+            .unwrap_or(0);
+
+        // The Diagnostics pane already reads every session record and states
+        // a verdict for each; the sidebar's "3 ignored" is that same work
+        // counted, so it goes through the same function rather than a second
+        // reading of the same files that could reach a different answer.
+        let rejected_records = u32::try_from(
+            core_diagnostics::build_diagnostics(
+                db.as_ref(),
+                &dir,
+                &self.config_path,
+                &RealProcessProbe,
+                now,
+            )
+            .records
+            .iter()
+            .filter(|r| !matches!(r.verdict, core_diagnostics::RecordVerdict::Accepted))
+            .count(),
+        )
+        .unwrap_or(u32::MAX);
+
+        // `TerminalChoice` becomes a plain `ChoiceOption` here: the schema
+        // deliberately does not know the terminal-detection type, which is
+        // what keeps `build_schema` pure and independent of it. Destructured
+        // rather than field-accessed for the usual reason — a fifth field on
+        // `TerminalChoice` must be a compile error here.
+        let terminal_choices: Vec<settings::ChoiceOption> =
+            terminals::terminal_picker(&s.preferred_terminal)
+                .into_iter()
+                .map(|t| {
+                    let terminals::TerminalChoice {
+                        id,
+                        label,
+                        bundle_id: _,
+                        installed: _,
+                    } = t;
+                    settings::ChoiceOption { id, label }
+                })
+                .collect();
+
+        // What Resume would actually run, against a real session where there
+        // is one — this window shows the user their own data, so a live or
+        // recently-seen session beats a placeholder. `None` only when there
+        // is no terminal to run it in at all, which is what the schema's own
+        // fallback sentence says.
+        let resume_command = (!terminal_choices.is_empty()).then(|| {
+            let newest = sessions
+                .first()
+                .map(|l| (l.session_id.clone(), l.cwd.clone()))
+                .or_else(|| {
+                    db.as_ref()
+                        .and_then(|d| query::recent_sessions(d, &[], 1).ok())
+                        .and_then(|rows| rows.into_iter().next())
+                        .and_then(|r| r.cwd.map(|cwd| (r.id, cwd)))
+                });
+            match newest {
+                Some((id, cwd)) => {
+                    perch_core::actions::TerminalCommand::resume(&id, &cwd).shell_line()
+                }
+                None => "claude --resume <session>".to_string(),
+            }
+        });
+
+        settings::SchemaContext {
+            claude_dir,
+            project_last_used_days,
+            archived_projects,
+            indexed_sessions,
+            waiting_sessions,
+            working_sessions,
+            recent_sessions,
+            priced_models,
+            unpriced_models_in_use,
+            rejected_records,
+            terminal_choices,
+            resume_command,
+            // The status item's real title, so every icon variant in the Menu
+            // Bar pane's mock is judged against the text that will sit beside
+            // it rather than against an invented one.
+            menu_bar_title: Some(model.tray_title.clone()).filter(|t| !t.is_empty()),
+            // Whatever the chosen mode actually produces, `None` included:
+            // "not enough data in this window to project a rate" is a thing
+            // the Usage pane must be able to say.
+            burn_rate_line: db
+                .as_ref()
+                .and_then(|d| core_usage::build_usage(d, now, s).ok())
+                .and_then(|u| u.burn_rate),
+        }
+    }
+}
+
+/// Each unarchived project's age in whole days, plus how many are archived.
+///
+/// Ages rather than a bucketed count, because the Active/Recent boundary
+/// moves with `active_within_days`: a count taken at some other threshold
+/// would make the Projects preview disagree with the slider sitting directly
+/// above it. A project with no recorded turn has no age at all, so it takes
+/// the largest one there is — never Active, whatever the threshold, which is
+/// the honest answer rather than a fabricated "touched today".
+fn project_ages(database: &Db, now_ms: i64) -> (Vec<u32>, u32) {
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+    let Ok(summaries) = query::project_summaries(database) else {
+        return (Vec::new(), 0);
+    };
+    let mut days = Vec::new();
+    let mut archived = 0u32;
+    for p in summaries {
+        if database
+            .project_meta(p.id)
+            .map(|m| m.archived)
+            .unwrap_or(false)
+        {
+            archived += 1;
+            continue;
+        }
+        days.push(match p.last_activity_at {
+            Some(ts) => u32::try_from((now_ms - ts).max(0) / DAY_MS).unwrap_or(u32::MAX),
+            None => u32::MAX,
+        });
+    }
+    (days, archived)
+}
+
+/// How many of `rows` are in `status`. Saturating rather than wrapping, for
+/// the same reason every other count here is.
+fn count_status(rows: &[core_model::SessionRow], status: core_model::Status) -> u32 {
+    u32::try_from(rows.iter().filter(|r| r.status == status).count()).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -2492,5 +3422,267 @@ mod tests {
         );
 
         perch.stop();
+    }
+    // --- The settings schema across the boundary -------------------------
+    //
+    // These four are about the *seam*, not about the schema: `perch-core`
+    // already tests what `build_schema` composes. What is only testable here
+    // is that a write reaches disk, comes back as the schema that resulted
+    // from it, reports whatever `validated` had to change, and — the one
+    // this project has got wrong twice — fails loudly when it cannot land.
+
+    /// A `Perch` whose config file and index both live in throwaway
+    /// directories, with the `PERCH_DATA_DIR` guard that makes that true
+    /// returned alongside so the caller keeps it alive.
+    fn perch_in_temp() -> (
+        Arc<Perch>,
+        DataDirGuard<'static>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let data = tempfile::tempdir().unwrap();
+        let guard = DataDirGuard::set(data.path());
+        let claude = tempfile::tempdir().unwrap();
+        let perch = Perch::new(Some(claude.path().to_string_lossy().into_owned())).unwrap();
+        (perch, guard, data, claude)
+    }
+
+    /// A `Perch` whose `config.toml` path is occupied by a *directory*, so
+    /// every write to it fails at the filesystem — the cheapest honest way
+    /// to make a save that cannot land.
+    fn perch_with_unwritable_config() -> (
+        Arc<Perch>,
+        DataDirGuard<'static>,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let data = tempfile::tempdir().unwrap();
+        let guard = DataDirGuard::set(data.path());
+        std::fs::create_dir(data.path().join("config.toml")).unwrap();
+        let claude = tempfile::tempdir().unwrap();
+        let perch = Perch::new(Some(claude.path().to_string_lossy().into_owned())).unwrap();
+        (perch, guard, data, claude)
+    }
+
+    fn control_for(panes: &[SettingsPane], key: SettingKey) -> Control {
+        panes
+            .iter()
+            .flat_map(|p| p.groups.iter())
+            .flat_map(|g| g.rows.iter())
+            .find(|r| r.key == Some(key))
+            .unwrap_or_else(|| panic!("no row carries {key:?}"))
+            .control
+            .clone()
+    }
+
+    fn stepper_value(panes: &[SettingsPane], key: SettingKey) -> i64 {
+        match control_for(panes, key) {
+            Control::Stepper { value, .. } => value,
+            other => panic!("{key:?} is drawn by {other:?}, not a stepper"),
+        }
+    }
+
+    #[test]
+    fn setting_a_value_returns_the_schema_that_results_from_it() {
+        let (p, _guard, _data, _claude) = perch_in_temp();
+        let out = p
+            .set_setting(SettingKey::PollSeconds, SettingValue::Int { value: 30 })
+            .unwrap();
+        assert_eq!(
+            stepper_value(&out.panes, SettingKey::PollSeconds),
+            30,
+            "the caller must not have to re-read to see its own write"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_write_is_clamped_and_reported_not_rejected() {
+        let (p, _guard, _data, _claude) = perch_in_temp();
+        let out = p
+            .set_setting(SettingKey::PollSeconds, SettingValue::Int { value: 9999 })
+            .unwrap();
+        assert_eq!(stepper_value(&out.panes, SettingKey::PollSeconds), 60);
+        assert!(
+            out.notes.iter().any(|n| n.contains("clamped")),
+            "a silently clamped value is a lie about what was stored: {:?}",
+            out.notes
+        );
+    }
+
+    #[test]
+    fn a_failed_save_surfaces_as_an_error_not_an_empty_result() {
+        // The FFI seam swallowing failures is a defect this project has
+        // shipped twice. A write that cannot land must not look like one
+        // that did.
+        let (p, _guard, _data, _claude) = perch_with_unwritable_config();
+        let outcome = p.set_setting(
+            SettingKey::LaunchAtLogin,
+            SettingValue::Bool { value: true },
+        );
+        assert!(outcome.is_err());
+        // And specifically because the *write* failed, not because the value
+        // was refused before it was ever attempted — a test that passed on
+        // the wrong error would not be watching this seam at all.
+        assert!(
+            matches!(outcome, Err(PerchError::Io { .. })),
+            "expected the failed write to surface as Io, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn the_preferred_terminal_round_trips_as_text_even_though_it_draws_as_a_choice() {
+        // Its option ids are application names Perch *found*, not the wire
+        // values of an enum Perch defines — so `Settings::set` takes it as
+        // `Text` and refuses a `Choice`. A shell that guessed from the
+        // control's shape would write nothing and report success.
+        let (p, _guard, _data, _claude) = perch_in_temp();
+
+        let out = p
+            .set_setting(
+                SettingKey::PreferredTerminal,
+                SettingValue::Text {
+                    value: "Ghostty".to_string(),
+                },
+            )
+            .unwrap();
+        match control_for(&out.panes, SettingKey::PreferredTerminal) {
+            Control::Choice { selected, options } => {
+                assert_eq!(selected, "Ghostty", "the picker must show what was stored");
+                assert!(
+                    options.iter().any(|o| o.id == "Ghostty"),
+                    "and must offer it, installed or not: {options:?}"
+                );
+            }
+            other => panic!("the preferred terminal is drawn by {other:?}, not a choice"),
+        }
+
+        // And it survives the trip to disk, not just this one call's schema.
+        let reread = p.settings_schema(None);
+        match control_for(&reread, SettingKey::PreferredTerminal) {
+            Control::Choice { selected, .. } => assert_eq!(selected, "Ghostty"),
+            other => panic!("the preferred terminal is drawn by {other:?}, not a choice"),
+        }
+
+        assert!(
+            p.set_setting(
+                SettingKey::PreferredTerminal,
+                SettingValue::Choice {
+                    value: "Ghostty".to_string()
+                },
+            )
+            .is_err(),
+            "a Choice-shaped write must be refused, not silently accepted"
+        );
+    }
+
+    #[test]
+    fn a_query_is_matched_in_rust_so_the_shell_never_does_its_own_filtering() {
+        let (p, _guard, _data, _claude) = perch_in_temp();
+        let all = p.settings_schema(None);
+        let hits = p.settings_schema(Some("terminal".to_string()));
+        assert!(
+            hits.len() < all.len(),
+            "a query must narrow the schema: {} of {}",
+            hits.len(),
+            all.len()
+        );
+        assert!(
+            p.settings_schema(Some("zzzznothing".to_string()))
+                .is_empty(),
+            "a query that matches nothing returns nothing, never everything"
+        );
+    }
+
+    #[test]
+    fn resetting_one_pane_restores_only_that_panes_settings() {
+        let (p, _guard, _data, _claude) = perch_in_temp();
+        p.set_setting(SettingKey::PollSeconds, SettingValue::Int { value: 30 })
+            .unwrap();
+        p.set_setting(SettingKey::RecentLimit, SettingValue::Int { value: 3 })
+            .unwrap();
+
+        let out = p.reset_pane(PaneId::General).unwrap();
+        assert_eq!(
+            stepper_value(&out.panes, SettingKey::PollSeconds),
+            5,
+            "General's own setting is back at its factory value"
+        );
+        assert_eq!(
+            stepper_value(&out.panes, SettingKey::RecentLimit),
+            3,
+            "and the Popover pane's is untouched"
+        );
+    }
+
+    #[test]
+    fn the_schema_context_is_filled_from_the_real_index_not_left_empty() {
+        // An empty context makes every preview and every attention phrase
+        // invisible, which is a silently missing feature rather than a
+        // smaller one — so at least one preview must be populated from data
+        // this engine actually has.
+        let (p, _guard, _data, _claude) = perch_in_temp();
+        let panes = p.settings_schema(None);
+
+        let general = panes
+            .iter()
+            .find(|pane| pane.id == PaneId::General)
+            .expect("the General pane exists");
+        match control_for(&panes, SettingKey::ClaudeConfigDir) {
+            Control::Folder { resolved_label, .. } => assert_ne!(
+                resolved_label, "Chosen automatically",
+                "the folder row must name the directory Perch actually resolved"
+            ),
+            other => panic!("the Claude Code folder is drawn by {other:?}"),
+        }
+        assert!(
+            general.groups.iter().flat_map(|g| g.rows.iter()).any(
+                |r| matches!(&r.control, Control::Info { value_label } if !value_label.is_empty())
+            ),
+            "the General pane reports what it resolved"
+        );
+
+        assert!(
+            !p.terminals().is_empty(),
+            "this machine has at least Terminal.app"
+        );
+        assert!(
+            !p.prices().unwrap().is_empty(),
+            "the price table is seeded before it is shown"
+        );
+    }
+
+    #[test]
+    fn a_price_edit_and_its_reset_both_report_the_table_that_resulted() {
+        let (p, _guard, _data, _claude) = perch_in_temp();
+        let before = p.prices().unwrap();
+        let model = before[0].model.clone();
+
+        let after = p
+            .set_price(
+                model.clone(),
+                ModelPrice {
+                    input_per_mtok: 1.5,
+                    output_per_mtok: 2.5,
+                    cache_read_per_mtok: 0.5,
+                    cache_write_per_mtok: 3.5,
+                },
+            )
+            .unwrap();
+        let edited = after.iter().find(|r| r.model == model).unwrap();
+        assert_eq!(edited.price.input_per_mtok, 1.5);
+        assert!(!edited.is_default, "an edited row has drifted from default");
+
+        let removed = p.remove_price(model.clone()).unwrap();
+        assert!(!removed.iter().any(|r| r.model == model));
+
+        let reset = p.reset_prices().unwrap();
+        assert_eq!(
+            reset
+                .iter()
+                .find(|r| r.model == model)
+                .map(|r| r.is_default),
+            Some(true),
+            "reset restores the shipped table exactly"
+        );
     }
 }
