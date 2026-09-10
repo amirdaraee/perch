@@ -2,7 +2,7 @@
 
 use crate::db::Db;
 use crate::live::{LiveSession, SessionStatus};
-use crate::settings::{MenuBarDisplay, Settings};
+use crate::settings::{MenuBarDisplay, RowDensity, Settings};
 use crate::ui::format::{elapsed_or_dash, human_cost, human_elapsed, human_tokens};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -35,14 +35,24 @@ pub struct SessionRow {
     pub status: Status,
     pub status_label: String,
     pub elapsed: String,
+    /// Empty when `show_row_usage` is off — the user asked not to see this,
+    /// which is a different thing from the dash that means "not known".
     pub tokens: String,
+    /// Empty when either `show_row_usage` or `show_cost` is off, for the same
+    /// reason `tokens` is.
     pub cost: String,
+    /// The session's working directory, or empty when `show_row_folder` is
+    /// off. `project` is only its last component, which two checkouts can
+    /// share; this is the whole path, for the shell to draw under the name.
+    pub folder: String,
     /// The composed "project · kind · vVERSION · TOKENS · COST" line, omitting
-    /// whichever parts are absent — a shell renders this verbatim rather than
-    /// assembling it (and rather than comparing `tokens`/`version` against a
-    /// sentinel to decide what to omit; that comparison is Rust's to make).
-    /// `project`, `kind`, `version`, `tokens`, and `cost` stay on the row too,
-    /// for a shell that wants the parts separately.
+    /// whichever parts are absent or hidden — a shell renders this verbatim
+    /// rather than assembling it (and rather than comparing `tokens`/`version`
+    /// against a sentinel, or reading settings, to decide what to omit; those
+    /// are Rust's decisions to make). `project`, `kind`, `version`, `tokens`,
+    /// and `cost` stay on the row too, for a shell that wants the parts
+    /// separately — and are blanked the same way, so the two can never
+    /// disagree about what is on show.
     pub detail_line: String,
 }
 
@@ -58,6 +68,15 @@ pub struct RecentRow {
     pub ended_line: String,
 }
 
+/// What a shell needs in order to dim honestly: a value whose presence is the
+/// flag it acts on, carrying a finished sentence saying how old the data is.
+/// Composed here, like every other string, so no shell has to decide what
+/// "9m" means — or re-derive the threshold it was measured against.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct Staleness {
+    pub label: String,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct PopoverModel {
     pub stats: Stats,
@@ -69,6 +88,21 @@ pub struct PopoverModel {
     /// nothing is waiting. A shell renders this verbatim — it must not count
     /// or pluralise itself (spec: Rust owns everything except drawing).
     pub waiting_banner: Option<String>,
+    /// `Some` once the index has not been read successfully for longer than
+    /// `stale_after_minutes`, and never when `dim_when_stale` is off.
+    pub staleness: Option<Staleness>,
+    /// Which popover sections the user wants drawn. These are fields rather
+    /// than something a shell reads out of `Settings` for itself: two readers
+    /// of the same preference is exactly how a window and a model come to
+    /// disagree about what is on screen.
+    pub show_waiting: bool,
+    pub show_working: bool,
+    /// When false, `recent` is empty as well — a hidden section is not
+    /// queried, let alone drawn.
+    pub show_recent: bool,
+    /// How much breathing room each row gets. Drawing is the shell's; the
+    /// choice is not.
+    pub row_density: RowDensity,
 }
 
 const DASH: &str = "—";
@@ -99,6 +133,30 @@ fn status_of(s: &LiveSession) -> (Status, String, i64) {
         SessionStatus::Ended => (Status::Idle, "ended".into(), s.status_updated_at),
         SessionStatus::Working => (Status::Working, "working".into(), s.status_updated_at),
     }
+}
+
+/// How old the data on screen is, as a finished sentence, or `None` when
+/// there is nothing to say: the user switched dimming off, nothing has ever
+/// been read (in which case `PopoverModel::error` carries the more specific
+/// story), or the last read is still inside the user's threshold.
+///
+/// `last_read_ms` is passed in rather than read from a clock here so this
+/// stays a pure function of its inputs — the whole model is testable at a
+/// fixed instant, and the one place that knows when a read last succeeded is
+/// the one place that performs reads.
+fn staleness(settings: &Settings, last_read_ms: Option<i64>, now_ms: i64) -> Option<Staleness> {
+    if !settings.dim_when_stale {
+        return None;
+    }
+    let gap = now_ms - last_read_ms?;
+    if gap <= i64::from(settings.stale_after_minutes) * 60_000 {
+        return None;
+    }
+    // `human_elapsed` caps at hours on purpose: an index Perch has not managed
+    // to read for two days should read as 48h, which is more alarming than 2d.
+    Some(Staleness {
+        label: format!("Last updated {} ago", human_elapsed(gap)),
+    })
 }
 
 /// The waiting-sessions banner sentence, or `None` when nothing is waiting.
@@ -154,6 +212,10 @@ impl PopoverModel {
     /// A model with nothing in it — the "before the first tick" state, and what
     /// the window shows for `Now` when there is no engine data yet.
     pub fn empty() -> Self {
+        // Nothing has been read yet, so nothing has aged; the visibility and
+        // density fields take the shipped defaults rather than inventing a
+        // second set of them here.
+        let defaults = Settings::default();
         PopoverModel {
             stats: dashed_stats(),
             live: Vec::new(),
@@ -161,13 +223,18 @@ impl PopoverModel {
             tray_title: String::new(),
             error: None,
             waiting_banner: None,
+            staleness: None,
+            show_waiting: defaults.show_waiting,
+            show_working: defaults.show_working,
+            show_recent: defaults.show_recent,
+            row_density: defaults.row_density,
         }
     }
 }
 
 /// `db.rs` uses `anyhow::Result` throughout (no local `Result` alias), so this
 /// does too — the caller in `build_model` collapses any error to a dash.
-fn stats_from(db: &Db, now_ms: i64) -> anyhow::Result<Stats> {
+fn stats_from(db: &Db, now_ms: i64, show_cost: bool) -> anyhow::Result<Stats> {
     use crate::query::usage_since;
     if db.turn_count()? == 0 {
         return Ok(dashed_stats());
@@ -179,7 +246,13 @@ fn stats_from(db: &Db, now_ms: i64) -> anyhow::Result<Stats> {
         window_tokens: human_tokens(w.total_tokens()),
         week_tokens: human_tokens(k.total_tokens()),
         day_tokens: human_tokens(d.total_tokens()),
-        day_cost: human_cost(d_cost),
+        // Hidden means absent, not "$0.00" — a fabricated zero is the one
+        // thing this model never emits.
+        day_cost: if show_cost {
+            human_cost(d_cost)
+        } else {
+            String::new()
+        },
         estimated: true,
         has_data: true,
     })
@@ -188,21 +261,31 @@ fn stats_from(db: &Db, now_ms: i64) -> anyhow::Result<Stats> {
 /// Build the whole view-model. `db: None` (or a failing db) degrades to sessions-only:
 /// the sessions list needs no index, and an honest dash beats a fabricated zero.
 ///
-/// `settings` replaces the bare `MenuBarDisplay` this took before: two of the
-/// user's choices reach this model now — `menu_bar_display`, which shapes
-/// `tray_title` alone (see its own doc comment), and `recent_limit`, which is
-/// how many ended sessions the Recent section lists. Passing the whole
-/// `Settings` rather than the two values keeps one source of truth for both,
-/// and is what `build_project_detail` already does.
+/// `settings` replaces the bare `MenuBarDisplay` this took before: most of the
+/// user's display choices reach this model now — `menu_bar_display`, which
+/// shapes `tray_title` alone (see its own doc comment); `recent_limit`, which
+/// is how many ended sessions the Recent section lists; the three section
+/// toggles and `row_density`, which the model reports so no shell reads them
+/// for itself; `show_row_folder`, `show_row_usage` and `show_cost`, which
+/// decide what a row says; and `dim_when_stale`/`stale_after_minutes`, which
+/// decide whether `staleness` is `Some`. Passing the whole `Settings` rather
+/// than the individual values keeps one source of truth for all of them, and
+/// is what `build_project_detail` already does.
+///
+/// `last_read_ms` is when the index was last read successfully — `None`
+/// before that has ever happened. It is a parameter rather than a clock
+/// reading so this function stays pure and its tests stay deterministic; the
+/// caller that performs the reads is the only thing that knows the answer.
 pub fn build_model(
     db: Option<&Db>,
     live: &[LiveSession],
     now_ms: i64,
+    last_read_ms: Option<i64>,
     settings: &Settings,
 ) -> PopoverModel {
     let mut error = None;
 
-    let stats = match db.map(|d| stats_from(d, now_ms)) {
+    let stats = match db.map(|d| stats_from(d, now_ms, settings.show_cost)) {
         Some(Ok(s)) => s,
         Some(Err(e)) => {
             error = Some(format!("index unavailable: {e}"));
@@ -221,25 +304,41 @@ pub fn build_model(
         .iter()
         .map(|s| {
             let (status, status_label, since) = status_of(s);
-            let (tokens, cost) = match db.map(|d| crate::query::session_usage(d, &s.session_id)) {
-                Some(Ok((u, c))) if u.total_tokens() > 0 => {
-                    (human_tokens(u.total_tokens()), human_cost(c))
-                }
-                Some(Ok(_)) => (DASH.into(), DASH.into()),
-                Some(Err(_)) => {
-                    data_error = true;
-                    (DASH.into(), DASH.into())
-                }
-                None => (DASH.into(), DASH.into()),
-            };
+            let (mut tokens, mut cost) =
+                match db.map(|d| crate::query::session_usage(d, &s.session_id)) {
+                    Some(Ok((u, c))) if u.total_tokens() > 0 => {
+                        (human_tokens(u.total_tokens()), human_cost(c))
+                    }
+                    Some(Ok(_)) => (DASH.into(), DASH.into()),
+                    Some(Err(_)) => {
+                        data_error = true;
+                        (DASH.into(), DASH.into())
+                    }
+                    None => (DASH.into(), DASH.into()),
+                };
+            // Two separate preferences, applied in order: hiding usage takes
+            // the whole segment, hiding cost takes only the dollars. Both are
+            // blanked rather than dashed — an empty string says "you asked
+            // not to see this", where a dash says "Perch does not know".
+            if !settings.show_row_usage {
+                tokens = String::new();
+                cost = String::new();
+            } else if !settings.show_cost {
+                cost = String::new();
+            }
             let project = project_of(&s.cwd);
             let kind = s.kind.clone();
             let version = s.cc_version.clone().unwrap_or_default();
+            let usage_part = match (tokens.as_str(), cost.as_str()) {
+                ("", _) | (DASH, _) => None,
+                (t, "") => Some(t.to_string()),
+                (t, c) => Some(format!("{t} · {c}")),
+            };
             let detail_line = [
                 Some(project.clone()),
                 Some(kind.clone()),
                 (!version.is_empty()).then(|| format!("v{version}")),
-                (tokens != DASH).then(|| format!("{tokens} · {cost}")),
+                usage_part,
             ]
             .into_iter()
             .flatten()
@@ -261,6 +360,11 @@ pub fn build_model(
                 elapsed: elapsed_or_dash(now_ms, since),
                 tokens,
                 cost,
+                folder: if settings.show_row_folder {
+                    s.cwd.clone()
+                } else {
+                    String::new()
+                },
                 detail_line,
             }
         })
@@ -271,7 +375,10 @@ pub fn build_model(
         // `recent_sessions` returns nothing for a limit of zero (its own explicit
         // guard, kept deliberately); `recent_limit` is bounded 1–20 by
         // `Settings::validated`, so zero cannot arrive from a settings file.
-        match db.map(|d| {
+        //
+        // `show_recent` short-circuits the query entirely: a section the user
+        // has hidden costs nothing to not draw.
+        match db.filter(|_| settings.show_recent).map(|d| {
             crate::query::recent_sessions(d, &live_ids, settings.recent_limit as usize)
         }) {
             Some(Ok(found)) => found
@@ -323,6 +430,11 @@ pub fn build_model(
         tray_title: tray_title(live, settings.menu_bar_display),
         error,
         waiting_banner: waiting_banner(waiting),
+        staleness: staleness(settings, last_read_ms, now_ms),
+        show_waiting: settings.show_waiting,
+        show_working: settings.show_working,
+        show_recent: settings.show_recent,
+        row_density: settings.row_density,
     }
 }
 
@@ -376,7 +488,7 @@ mod tests {
             SessionStatus::Working,
             "interactive",
         );
-        let m = build_model(None, &[s], 10_000, &count_and_waiting());
+        let m = build_model(None, &[s], 10_000, None, &count_and_waiting());
         assert!(!m.stats.has_data);
         assert_eq!(m.stats.window_tokens, "—");
         assert_eq!(m.live.len(), 1);
@@ -397,7 +509,7 @@ mod tests {
             SessionStatus::Idle,
             "interactive",
         );
-        let m = build_model(None, &[s], 10_000, &count_and_waiting());
+        let m = build_model(None, &[s], 10_000, None, &count_and_waiting());
         let r = &m.live[0];
         assert_eq!(r.project, "proj", "last path component of cwd");
         assert_eq!(r.kind, "interactive");
@@ -414,7 +526,7 @@ mod tests {
             reason: Some("dialog open".into()),
             since_ms: 2_000,
         };
-        let m = build_model(None, &[s], 10_000, &count_and_waiting());
+        let m = build_model(None, &[s], 10_000, None, &count_and_waiting());
         assert_eq!(m.live[0].status_label, "waiting · dialog open");
         assert_eq!(m.live[0].elapsed, "8s");
         assert_eq!(m.live[0].status, Status::Waiting);
@@ -424,7 +536,7 @@ mod tests {
     fn absent_status_timestamp_is_a_dash() {
         let mut s = live(7, "a", "alpha", "/x", SessionStatus::Working, "interactive");
         s.status_updated_at = 0;
-        let m = build_model(None, &[s], 10_000, &count_and_waiting());
+        let m = build_model(None, &[s], 10_000, None, &count_and_waiting());
         assert_eq!(m.live[0].elapsed, "—");
     }
 
@@ -436,7 +548,7 @@ mod tests {
             reason: None,
             since_ms: 1,
         };
-        let m = build_model(None, &[bg, bg_wait], 10_000, &count_and_waiting());
+        let m = build_model(None, &[bg, bg_wait], 10_000, None, &count_and_waiting());
         let by_id = |id: &str| m.live.iter().find(|r| r.id == id).unwrap();
         assert_eq!(by_id("a").status, Status::Background);
         assert_eq!(
@@ -540,16 +652,22 @@ mod tests {
         let b = live(2, "b", "b", "/x", SessionStatus::Working, "interactive");
 
         assert_eq!(
-            build_model(None, &[], 10_000, &count_and_waiting()).waiting_banner,
+            build_model(None, &[], 10_000, None, &count_and_waiting()).waiting_banner,
             None
         );
         assert_eq!(
-            build_model(None, std::slice::from_ref(&b), 10_000, &count_and_waiting())
-                .waiting_banner,
+            build_model(
+                None,
+                std::slice::from_ref(&b),
+                10_000,
+                None,
+                &count_and_waiting()
+            )
+            .waiting_banner,
             None
         );
         assert_eq!(
-            build_model(None, &[w], 10_000, &count_and_waiting()).waiting_banner,
+            build_model(None, &[w], 10_000, None, &count_and_waiting()).waiting_banner,
             Some("1 session is waiting on you".to_string())
         );
     }
@@ -597,7 +715,7 @@ mod tests {
             SessionStatus::Working,
             "interactive",
         );
-        let m = build_model(Some(&db), &[s], 10_000, &count_and_waiting());
+        let m = build_model(Some(&db), &[s], 10_000, None, &count_and_waiting());
         assert!(m.stats.has_data);
         assert!(m.stats.estimated);
         assert_eq!(m.stats.window_tokens, "2.0M");
@@ -639,7 +757,7 @@ mod tests {
             SessionStatus::Working,
             "interactive",
         );
-        let m = build_model(Some(&db), &[s], 10_000, &count_and_waiting());
+        let m = build_model(Some(&db), &[s], 10_000, None, &count_and_waiting());
         assert_eq!(m.recent.len(), 1);
         assert_eq!(m.recent[0].id, "gone");
         assert_eq!(m.recent[0].project, "proj");
@@ -712,7 +830,7 @@ mod tests {
                 "interactive",
             );
             s.cc_version = version.map(str::to_string);
-            let m = build_model(db.as_ref(), &[s], 10_000, &count_and_waiting());
+            let m = build_model(db.as_ref(), &[s], 10_000, None, &count_and_waiting());
             assert_eq!(
                 m.live[0].detail_line, expected,
                 "version={version:?} has_usage={has_usage}"
@@ -762,7 +880,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            let m = build_model(Some(&db), &[], 10_000, &count_and_waiting());
+            let m = build_model(Some(&db), &[], 10_000, None, &count_and_waiting());
             assert_eq!(m.recent.len(), 1);
             assert_eq!(m.recent[0].ended_line, expected, "session_id={session_id}");
         }
@@ -800,9 +918,12 @@ mod tests {
             recent_limit: 2,
             ..Settings::default()
         };
-        assert_eq!(build_model(Some(&db), &[], 10_000, &two).recent.len(), 2);
         assert_eq!(
-            build_model(Some(&db), &[], 10_000, &Settings::default())
+            build_model(Some(&db), &[], 10_000, None, &two).recent.len(),
+            2
+        );
+        assert_eq!(
+            build_model(Some(&db), &[], 10_000, None, &Settings::default())
                 .recent
                 .len(),
             3,
@@ -863,7 +984,7 @@ mod tests {
             SessionStatus::Working,
             "interactive",
         );
-        let m = build_model(Some(&db), &[s], 10_000, &count_and_waiting());
+        let m = build_model(Some(&db), &[s], 10_000, None, &count_and_waiting());
         assert_eq!(
             m.error.as_deref(),
             Some("some session data unavailable"),
@@ -920,7 +1041,7 @@ mod tests {
             SessionStatus::Working,
             "interactive",
         );
-        let m = build_model(Some(&db), &[s], 10_000, &count_and_waiting());
+        let m = build_model(Some(&db), &[s], 10_000, None, &count_and_waiting());
         let msg = m.error.expect("a broken index must report an error");
         assert!(
             msg.starts_with("index unavailable"),
@@ -930,5 +1051,199 @@ mod tests {
         assert_eq!(m.stats.window_tokens, "—");
         assert_eq!(m.live[0].tokens, "—");
         assert!(m.recent.is_empty());
+    }
+
+    const MIN: i64 = 60_000;
+
+    /// One priced session with real usage, so every cost-bearing surface of
+    /// the popover model has something on it to hide.
+    fn priced_db() -> Db {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let pid = db
+            .upsert_project("-Users-a-proj", "/Users/a/proj", false)
+            .unwrap();
+        db.upsert_session(&SessionRecord {
+            id: "a".into(),
+            project_id: pid,
+            file_path: "/tmp/a.jsonl".into(),
+            file_size: 0,
+            indexed_offset: 0,
+            started_at: Some(1_000),
+            last_activity_at: Some(9_000),
+            cwd: Some("/Users/a/proj".into()),
+            git_branch: None,
+            cc_version: None,
+            title: None,
+            message_count: 1,
+        })
+        .unwrap();
+        db.insert_turns(
+            "a",
+            &[Turn {
+                ts: 9_000,
+                model: "claude-fable-5".into(),
+                usage: TurnUsage {
+                    input: 2_000_000,
+                    ..Default::default()
+                },
+            }],
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn data_is_not_stale_before_the_threshold() {
+        let s = Settings::default(); // dim_when_stale, 5 minutes
+        let now = 100 * MIN;
+        let m = build_model(None, &[], now, Some(now - 2 * MIN), &s);
+        assert!(m.staleness.is_none());
+    }
+
+    #[test]
+    fn stale_data_says_how_old_it_is_in_finished_words() {
+        let s = Settings::default();
+        let now = 100 * MIN;
+        let m = build_model(None, &[], now, Some(now - 9 * MIN), &s);
+        let stale = m
+            .staleness
+            .expect("nine minutes is past a five minute threshold");
+        assert_eq!(stale.label, "Last updated 9m ago");
+    }
+
+    #[test]
+    fn the_threshold_itself_is_not_yet_stale() {
+        let s = Settings::default();
+        let now = 100 * MIN;
+        assert!(
+            build_model(None, &[], now, Some(now - 5 * MIN), &s)
+                .staleness
+                .is_none(),
+            "stale once the gap *exceeds* the threshold, not on reaching it"
+        );
+    }
+
+    #[test]
+    fn staleness_is_never_reported_when_dimming_is_off() {
+        let s = Settings {
+            dim_when_stale: false,
+            ..Settings::default()
+        };
+        let now = 1_000 * MIN;
+        let m = build_model(None, &[], now, Some(now - 99 * MIN), &s);
+        assert!(
+            m.staleness.is_none(),
+            "the setting is off; there is nothing to draw"
+        );
+    }
+
+    #[test]
+    fn a_never_read_index_is_not_reported_as_stale() {
+        let s = Settings::default();
+        assert!(
+            build_model(None, &[], 100 * MIN, None, &s)
+                .staleness
+                .is_none(),
+            "nothing has been read, so no reading has aged; `error` tells that story"
+        );
+    }
+
+    #[test]
+    fn section_visibility_and_density_are_decided_here_not_in_the_shell() {
+        let s = Settings {
+            show_waiting: false,
+            show_working: true,
+            show_recent: false,
+            row_density: RowDensity::Compact,
+            ..Settings::default()
+        };
+        let m = build_model(Some(&priced_db()), &[], 10_000, None, &s);
+        assert!(!m.show_waiting);
+        assert!(m.show_working);
+        assert!(!m.show_recent);
+        assert_eq!(m.row_density, RowDensity::Compact);
+        assert!(
+            m.recent.is_empty(),
+            "a hidden section is not queried, let alone drawn"
+        );
+    }
+
+    #[test]
+    fn the_row_folder_appears_only_when_asked_for() {
+        let sess = live(
+            7,
+            "a",
+            "alpha",
+            "/Users/a/proj",
+            SessionStatus::Working,
+            "interactive",
+        );
+        let off = build_model(
+            None,
+            std::slice::from_ref(&sess),
+            10_000,
+            None,
+            &count_and_waiting(),
+        );
+        assert_eq!(off.live[0].folder, "");
+        let s = Settings {
+            show_row_folder: true,
+            ..count_and_waiting()
+        };
+        let on = build_model(None, &[sess], 10_000, None, &s);
+        assert_eq!(on.live[0].folder, "/Users/a/proj");
+    }
+
+    #[test]
+    fn hiding_row_usage_takes_the_tokens_and_the_cost_off_the_row() {
+        let sess = live(
+            7,
+            "a",
+            "alpha",
+            "/Users/a/proj",
+            SessionStatus::Working,
+            "interactive",
+        );
+        let s = Settings {
+            show_row_usage: false,
+            ..count_and_waiting()
+        };
+        let m = build_model(Some(&priced_db()), &[sess], 10_000, None, &s);
+        assert_eq!(m.live[0].tokens, "");
+        assert_eq!(m.live[0].cost, "");
+        assert_eq!(
+            m.live[0].detail_line, "proj · interactive · v2.1.251",
+            "and the composed line drops the segment too"
+        );
+    }
+
+    #[test]
+    fn hiding_cost_hides_it_everywhere_the_popover_would_show_it() {
+        let sess = live(
+            7,
+            "a",
+            "alpha",
+            "/Users/a/proj",
+            SessionStatus::Working,
+            "interactive",
+        );
+        let s = Settings {
+            show_cost: false,
+            ..count_and_waiting()
+        };
+        let m = build_model(Some(&priced_db()), &[sess], 10_000, None, &s);
+        assert!(!m.stats.day_cost.contains('$'), "{:?}", m.stats.day_cost);
+        assert!(m.live.iter().all(|r| !r.cost.contains('$')));
+        assert!(m.live.iter().all(|r| !r.detail_line.contains('$')));
+        assert!(m.recent.iter().all(|r| !r.ended_line.contains('$')));
+        assert_eq!(
+            m.live[0].tokens, "2.0M",
+            "tokens are counted, not inferred; only the dollars go"
+        );
+        assert_eq!(
+            m.live[0].detail_line,
+            "proj · interactive · v2.1.251 · 2.0M"
+        );
     }
 }

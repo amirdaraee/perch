@@ -46,6 +46,7 @@ pub struct SessionRow {
     pub elapsed: String,
     pub tokens: String,
     pub cost: String,
+    pub folder: String,
     pub detail_line: String,
 }
 
@@ -59,6 +60,32 @@ pub struct RecentRow {
     pub ended_line: String,
 }
 
+/// Mirrors `perch_core::ui::model::Staleness`. A finished sentence, not a
+/// duration for a shell to phrase: the shell dims and draws, nothing more.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct Staleness {
+    pub label: String,
+}
+
+/// Mirrors `perch_core::settings::RowDensity`. Crosses on the *model* rather
+/// than on the `Settings` record below, because it is the model that tells a
+/// shell how to draw — a shell reading the preference for itself is the
+/// divergence this mirror exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum RowDensity {
+    Comfortable,
+    Compact,
+}
+
+impl From<settings::RowDensity> for RowDensity {
+    fn from(d: settings::RowDensity) -> Self {
+        match d {
+            settings::RowDensity::Comfortable => RowDensity::Comfortable,
+            settings::RowDensity::Compact => RowDensity::Compact,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct PopoverModel {
     pub stats: Stats,
@@ -67,6 +94,11 @@ pub struct PopoverModel {
     pub tray_title: String,
     pub error: Option<String>,
     pub waiting_banner: Option<String>,
+    pub staleness: Option<Staleness>,
+    pub show_waiting: bool,
+    pub show_working: bool,
+    pub show_recent: bool,
+    pub row_density: RowDensity,
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -130,6 +162,7 @@ impl From<core_model::SessionRow> for SessionRow {
             elapsed,
             tokens,
             cost,
+            folder,
             detail_line,
         } = r;
         SessionRow {
@@ -144,6 +177,7 @@ impl From<core_model::SessionRow> for SessionRow {
             elapsed,
             tokens,
             cost,
+            folder,
             detail_line,
         }
     }
@@ -179,6 +213,11 @@ impl From<core_model::PopoverModel> for PopoverModel {
             tray_title,
             error,
             waiting_banner,
+            staleness,
+            show_waiting,
+            show_working,
+            show_recent,
+            row_density,
         } = m;
         PopoverModel {
             stats: stats.into(),
@@ -187,6 +226,11 @@ impl From<core_model::PopoverModel> for PopoverModel {
             tray_title,
             error,
             waiting_banner,
+            staleness: staleness.map(|s| Staleness { label: s.label }),
+            show_waiting,
+            show_working,
+            show_recent,
+            row_density: row_density.into(),
         }
     }
 }
@@ -916,6 +960,9 @@ pub struct Perch {
     db_path: PathBuf,
     config_path: PathBuf,
     reindex_error: Arc<Mutex<Option<String>>>,
+    /// Shared with every `ThisPerch` this engine hands out — see that
+    /// struct's own field for what it holds and why it lives here.
+    last_read_ms: Arc<Mutex<Option<i64>>>,
     handle: Mutex<Option<watcher::WatcherHandle>>,
     /// The live watch on `config.toml` itself, started by `start()`. `None`
     /// before `start()` runs (or after `stop()`).
@@ -1006,6 +1053,11 @@ struct ThisPerch {
     config_path: PathBuf,
     reindex_error: Arc<Mutex<Option<String>>>,
     notified: Arc<Mutex<HashSet<notify::Episode>>>,
+    /// When the index was last opened and read successfully — `None` until
+    /// that has happened once. This is the *only* place that knows, because
+    /// this is the only place that reads, which is why `build_model` takes it
+    /// as an argument instead of reaching for a clock of its own.
+    last_read_ms: Arc<Mutex<Option<i64>>>,
 }
 
 impl ThisPerch {
@@ -1036,10 +1088,23 @@ impl ThisPerch {
         // now — must be reflected the moment the *next* tick's model goes
         // out, not only after some separate settings-watch machinery reacts.
         let loaded_settings = settings::store::load(&self.config_path).settings;
+        // This tick's read is the newest successful one when the index
+        // opened; when it did not, the last one that did still stands, and
+        // the gap between it and now is exactly the staleness the user asked
+        // to be dimmed for.
+        let now = now_ms();
+        let last_read = {
+            let mut last = self.last_read_ms.lock().unwrap();
+            if db_result.is_ok() {
+                *last = Some(now);
+            }
+            *last
+        };
         let mut model = core_model::build_model(
             db_result.as_ref().ok(),
             &sessions,
-            now_ms(),
+            now,
+            last_read,
             &loaded_settings,
         );
         // Neither fold may clobber a more specific error `build_model` itself
@@ -1248,6 +1313,7 @@ impl Perch {
             db_path,
             config_path,
             reindex_error: Arc::new(Mutex::new(None)),
+            last_read_ms: Arc::new(Mutex::new(None)),
             handle: Mutex::new(None),
             settings_watch: Mutex::new(None),
             listener: Mutex::new(None),
@@ -1489,6 +1555,7 @@ impl Perch {
             config_path: self.config_path.clone(),
             reindex_error: self.reindex_error.clone(),
             notified: self.notified.clone(),
+            last_read_ms: self.last_read_ms.clone(),
         }
     }
 
