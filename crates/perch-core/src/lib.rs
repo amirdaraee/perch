@@ -13,6 +13,7 @@ pub mod pricing;
 pub mod query;
 pub mod scan;
 pub mod settings;
+pub mod terminals;
 pub mod transcript;
 pub mod ui;
 
