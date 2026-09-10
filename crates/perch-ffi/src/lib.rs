@@ -612,17 +612,44 @@ pub struct Settings {
     pub preferred_terminal: String,
 }
 
+/// `perch_core`'s `Settings` now carries eighteen keys this record does not
+/// yet mirror — the settings window that reaches them is built on the schema
+/// surface, not on this flat record, so growing it here would be a second
+/// spelling of the same twenty-six values.
+///
+/// Every one of those eighteen is still destructured below, bound to `_`
+/// rather than swept up by `..`, so the house guarantee holds unchanged: a
+/// *new* field added to `perch_core::settings::Settings` is a compile error
+/// here, not a silent omission.
 impl From<settings::Settings> for Settings {
     fn from(s: settings::Settings) -> Self {
         let settings::Settings {
             launch_at_login,
             claude_config_dir,
             menu_bar_display,
+            menu_bar_icon: _,
+            dim_when_stale: _,
+            stale_after_minutes: _,
             poll_seconds,
+            preferred_terminal,
+            show_waiting: _,
+            show_working: _,
+            show_recent: _,
+            recent_limit: _,
+            row_density: _,
+            show_row_folder: _,
+            show_row_usage: _,
+            active_within_days: _,
+            show_archived: _,
+            chart_days: _,
+            top_projects_count: _,
+            top_projects_days: _,
+            burn_rate: _,
+            show_cost: _,
             waiting_enabled,
             waiting_after_minutes,
             include_background,
-            preferred_terminal,
+            sound: _,
         } = s;
         Settings {
             launch_at_login,
@@ -637,8 +664,17 @@ impl From<settings::Settings> for Settings {
     }
 }
 
-impl From<Settings> for settings::Settings {
-    fn from(s: Settings) -> Self {
+impl Settings {
+    /// Lay this record's eight values over `base`, leaving every key it does
+    /// not mirror as `base` has it.
+    ///
+    /// Deliberately not `From<Settings> for settings::Settings`: a `From`
+    /// could only fill the other eighteen from `Settings::default()`, which
+    /// would make saving one toggle in the settings window silently reset
+    /// every hand-edited value in `config.toml` that this record cannot see.
+    /// Merging onto what is already on disk is the only honest conversion
+    /// while the two shapes differ.
+    fn merged_onto(self, base: settings::Settings) -> settings::Settings {
         let Settings {
             launch_at_login,
             claude_config_dir,
@@ -648,7 +684,7 @@ impl From<Settings> for settings::Settings {
             waiting_after_minutes,
             include_background,
             preferred_terminal,
-        } = s;
+        } = self;
         settings::Settings {
             launch_at_login,
             claude_config_dir,
@@ -658,6 +694,7 @@ impl From<Settings> for settings::Settings {
             waiting_after_minutes,
             include_background,
             preferred_terminal,
+            ..base
         }
     }
 }
@@ -1388,8 +1425,14 @@ impl Perch {
     /// so the returned model is exactly what a fresh `settings()` call
     /// would see, including any clamp `load` applies and the note it earns.
     pub fn save_settings(&self, s: Settings) -> Result<SettingsModel, PerchError> {
-        settings::store::save(&self.config_path, &s.into()).map_err(|e| PerchError::Io {
-            message: e.to_string(),
+        // Merge over what is on disk rather than over defaults: this record
+        // mirrors eight of the file's twenty-six keys, and the other
+        // eighteen must survive a save that never mentioned them.
+        let on_disk = settings::store::load(&self.config_path).settings;
+        settings::store::save(&self.config_path, &s.merged_onto(on_disk)).map_err(|e| {
+            PerchError::Io {
+                message: e.to_string(),
+            }
         })?;
         Ok(self.settings())
     }
