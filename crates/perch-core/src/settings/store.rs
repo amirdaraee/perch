@@ -158,11 +158,11 @@ pub fn load(path: &Path) -> Loaded {
 /// run whichever one-shot upgrade(s) bring the document current, never
 /// destroying a value the user owns.
 ///
-/// `SETTINGS_VERSION` is still 1 -- this is the first on-disk shape Perch's
-/// settings file has ever had, so there is nothing yet to upgrade from. This
-/// function exists anyway so the day a second version is introduced, adding
-/// its one-shot upgrade is not a special case needing its own plumbing: it
-/// goes here, exactly as `db::migrate`'s v1 -> v2 step does for the database.
+/// Runs on the `DocumentMut` rather than on a deserialized `Settings`,
+/// which is the whole point: a key that has moved section is, to the
+/// deserializer, simply absent, and would be replaced by its default before
+/// anything got the chance to notice it was ever there. Only the document
+/// still knows where the value actually is.
 ///
 /// Ordering assumption a future upgrade step must preserve: this runs on
 /// `doc` *before* `load` deserializes it into `Settings` via
@@ -172,10 +172,69 @@ pub fn load(path: &Path) -> Loaded {
 /// otherwise a migrated file fails the *next* line down as if it were
 /// simply malformed, which is indistinguishable to the user from the
 /// migration never having run at all.
-fn migrate(_doc: &mut DocumentMut, existing_version: i64) {
-    if existing_version < SETTINGS_VERSION {
-        // No upgrade steps yet.
+///
+/// `save` runs this too, on the document it read back from disk. `load`
+/// only ever migrates the copy in memory, so without that the *file* would
+/// keep its v1 shape forever: the moved key's dead original would sit there
+/// looking editable, and a later hand-edit of it would appear to work while
+/// doing nothing at all.
+fn migrate(doc: &mut DocumentMut, existing_version: i64) {
+    // v1 -> v2: `include_background` moves from `[sessions]` to
+    // `[notifications]`. It has only ever been read by the notification
+    // engine; filing it under sessions was a mistake. Every other key this
+    // version of Perch added is *new*, and a new key needs no step here --
+    // it is simply missing from an older file and `#[serde(default)]`
+    // supplies it. A key that moves is the case that would otherwise lose a
+    // value the user chose, in silence.
+    if existing_version < 2 {
+        move_key(doc, "sessions", "notifications", "include_background");
     }
+}
+
+/// Move one key from one top-level section to another, carrying whatever
+/// comment sits above it, and leaving nothing behind. Silently does nothing
+/// if the source section or the key is absent -- a migration step that has
+/// already run, or a file that never held the key, is not an error.
+///
+/// Removing the source key is the half that is easy to skip and expensive to
+/// omit: a dead `[sessions].include_background` left in the file reads as a
+/// live setting, so editing it looks like it works and changes nothing.
+fn move_key(doc: &mut DocumentMut, from: &str, to: &str, key: &str) {
+    // A section may be spelled inline (`sessions = { ... }`) -- the file's
+    // header invites hand-editing and both `load` and `ensure_table` already
+    // accept that spelling, so the migration has to read one too. What it
+    // must not do is carry an inline entry's formatting into a real
+    // `[table]`: inline decor is whitespace around a comma, which would come
+    // out as a stray indent, and an inline table cannot hold a comment in
+    // the first place, so there is nothing there worth preserving.
+    let from_was_a_real_table = doc.get(from).is_some_and(Item::is_table);
+
+    let Some(section) = doc.get_mut(from).and_then(Item::as_table_like_mut) else {
+        return;
+    };
+    // Cloned before the removal, because `TableLike::remove` hands back only
+    // the value -- the key, and with it the comment written above it, would
+    // otherwise be dropped on the floor.
+    let formatted_key = from_was_a_real_table
+        .then(|| section.get_key_value(key).map(|(k, _)| k.clone()))
+        .flatten();
+    let Some(mut item) = section.remove(key) else {
+        return;
+    };
+
+    if !from_was_a_real_table {
+        // Let the encoder apply a real table's own spacing rather than the
+        // inline one this value was written with.
+        if let Some(v) = item.as_value_mut() {
+            v.decor_mut().clear();
+        }
+    }
+
+    let dest = ensure_table(doc, to);
+    match formatted_key {
+        Some(k) => dest.insert_formatted(&k, item),
+        None => dest.insert(key, item),
+    };
 }
 
 /// A fresh config file: every key at its default, with a header comment so
@@ -189,7 +248,7 @@ const TEMPLATE: &str = r#"# Perch's own settings. Perch reads this file on start
 # recognize (for instance one written by a newer version of Perch) all
 # survive Perch saving over this file.
 
-version = 1
+version = 2
 
 [general]
 # Start Perch when you log in.
@@ -210,8 +269,6 @@ stale_after_minutes = 5
 [sessions]
 # How often Perch re-reads Claude Code's directory, in seconds. 1-60.
 poll_seconds = 5
-# Count sessions Claude Code is running in the background as waiting on you.
-include_background = false
 # Which terminal "Resume" opens.
 preferred_terminal = "Terminal"
 
@@ -251,6 +308,8 @@ show_cost = true
 waiting_enabled = false
 # How long it must have waited first, in minutes. 1-240.
 waiting_after_minutes = 10
+# Count sessions Claude Code is running in the background as waiting on you.
+include_background = false
 # Play the default alert sound with the notification.
 sound = true
 "#;
@@ -302,6 +361,12 @@ pub fn save(path: &Path, s: &Settings) -> Result<()> {
             .expect("TEMPLATE is valid TOML"),
     };
 
+    // Bring the document current before writing over it. `load` migrates
+    // only the copy it deserializes from, so this is the one place a moved
+    // key's dead original is actually removed from the file.
+    let existing_version = doc.get("version").and_then(Item::as_integer).unwrap_or(0);
+    migrate(&mut doc, existing_version);
+
     doc["version"] = value(SETTINGS_VERSION);
 
     let general = ensure_table(&mut doc, "general");
@@ -316,7 +381,6 @@ pub fn save(path: &Path, s: &Settings) -> Result<()> {
 
     let sessions = ensure_table(&mut doc, "sessions");
     sessions["poll_seconds"] = value(i64::from(s.poll_seconds));
-    sessions["include_background"] = value(s.include_background);
     sessions["preferred_terminal"] = value(s.preferred_terminal.clone());
 
     let popover = ensure_table(&mut doc, "popover");
@@ -342,6 +406,7 @@ pub fn save(path: &Path, s: &Settings) -> Result<()> {
     let notifications = ensure_table(&mut doc, "notifications");
     notifications["waiting_enabled"] = value(s.waiting_enabled);
     notifications["waiting_after_minutes"] = value(i64::from(s.waiting_after_minutes));
+    notifications["include_background"] = value(s.include_background);
     notifications["sound"] = value(s.sound);
 
     if let Some(parent) = path.parent() {
@@ -872,6 +937,167 @@ mod tests {
         let got = load(&path);
         assert!(got.error.is_none(), "reload reported: {:?}", got.error);
         assert_eq!(got.settings, want, "a field did not survive the round trip");
+    }
+
+    /// Reads a top-level section's key out of saved text, whichever way the
+    /// section is spelled. Structural, rather than a substring match, so this
+    /// says what it means: the key is *gone*, not merely re-ordered.
+    fn key_of(text: &str, section: &str, key: &str) -> Option<toml_edit::Item> {
+        let doc: DocumentMut = text.parse().expect("saved text parses");
+        doc.get(section)
+            .and_then(Item::as_table_like)
+            .and_then(|t| t.get(key))
+            .cloned()
+    }
+
+    /// `include_background` is the one key this milestone *moves* rather than
+    /// adds. Every other new key is absent from a v1 file and picks up its
+    /// default; this one already holds a value the user chose, and a section
+    /// change that lost it would be silent.
+    #[test]
+    fn v1_carries_include_background_into_the_notifications_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            concat!(
+                "# my own note\n",
+                "version = 1\n",
+                "\n",
+                "[sessions]\n",
+                "poll_seconds = 9\n",
+                "include_background = true\n",
+                "something_a_newer_perch_added = true\n",
+            ),
+        )
+        .unwrap();
+
+        let loaded = load(&path);
+        assert!(
+            loaded.settings.include_background,
+            "the value must survive the move"
+        );
+        assert_eq!(
+            loaded.settings.poll_seconds, 9,
+            "its neighbours are untouched"
+        );
+
+        save(&path, &loaded.settings).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("# my own note"),
+            "comments survive a migrating save"
+        );
+        assert!(
+            text.contains("something_a_newer_perch_added = true"),
+            "a key this binary does not own survives a migrating save"
+        );
+        assert!(
+            !text.contains("[sessions]\npoll_seconds = 9\ninclude_background"),
+            "the key no longer lives under [sessions]"
+        );
+        assert!(
+            key_of(&text, "sessions", "include_background").is_none(),
+            "the dead key is removed, so a later hand-edit of it cannot appear to work"
+        );
+        assert_eq!(
+            key_of(&text, "notifications", "include_background")
+                .as_ref()
+                .and_then(|i| i.as_bool()),
+            Some(true),
+            "it lands under the section that reads it, at the value the user chose"
+        );
+
+        let again = load(&path);
+        assert!(
+            again.settings.include_background,
+            "and it is still there on the next read"
+        );
+        assert_eq!(again.settings.poll_seconds, 9, "as is everything beside it");
+    }
+
+    /// TOML lets a section be spelled inline, and the file's own header
+    /// invites hand-editing -- `a_section_written_inline_can_still_be_saved`
+    /// already proves `save` copes. The migration reads and writes the same
+    /// document, so it has to cope with the same spelling.
+    #[test]
+    fn a_v1_file_whose_sessions_section_is_inline_still_migrates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "version = 1\nsessions = { poll_seconds = 9, include_background = true }\n",
+        )
+        .unwrap();
+
+        let loaded = load(&path);
+        assert!(
+            loaded.error.is_none(),
+            "reload reported: {:?}",
+            loaded.error
+        );
+        assert!(
+            loaded.settings.include_background,
+            "an inline [sessions] holds the value just as a real table does"
+        );
+        assert_eq!(loaded.settings.poll_seconds, 9);
+
+        save(&path, &loaded.settings).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            key_of(&text, "sessions", "include_background").is_none(),
+            "the dead key is removed from an inline section too"
+        );
+        assert_eq!(
+            key_of(&text, "notifications", "include_background")
+                .as_ref()
+                .and_then(|i| i.as_bool()),
+            Some(true),
+        );
+    }
+
+    /// A file already at version 2 is current: the migration must not run
+    /// again. The case that would hurt is a leftover `[sessions]` copy -- a
+    /// re-run would move it over the real value and silently undo whatever
+    /// the user last set.
+    #[test]
+    fn a_v2_file_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            concat!(
+                "version = 2\n",
+                "\n",
+                "[sessions]\n",
+                "poll_seconds = 9\n",
+                "include_background = true\n",
+                "\n",
+                "[notifications]\n",
+                "include_background = false\n",
+            ),
+        )
+        .unwrap();
+
+        let loaded = load(&path);
+        assert!(
+            !loaded.settings.include_background,
+            "the [notifications] value is the live one; a stale [sessions] copy must not overwrite it"
+        );
+
+        save(&path, &loaded.settings).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            key_of(&text, "notifications", "include_background")
+                .as_ref()
+                .and_then(|i| i.as_bool()),
+            Some(false),
+            "and saving does not re-migrate it either"
+        );
+        assert!(
+            !load(&path).settings.include_background,
+            "still false after a round trip"
+        );
     }
 }
 

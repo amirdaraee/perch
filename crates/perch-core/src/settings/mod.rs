@@ -8,6 +8,10 @@
 //! settings-window pane: `poll_seconds` and `preferred_terminal` live under
 //! `[sessions]` while being shown under General, and moving a key between
 //! sections costs a migration, so they stay where they were first written.
+//! Exactly one key has ever been worth that cost — `include_background`,
+//! which only the notification engine has ever read, and which
+//! `store::migrate` carries from `[sessions]` to `[notifications]` on the
+//! v1 -> v2 step.
 //! In Rust it is
 //! one flat [`Settings`] struct: the section tables are an artifact of the
 //! wire format, not something callers should have to know about, so the
@@ -25,9 +29,17 @@ pub use keys::*;
 pub use schema::*;
 
 /// Bumped whenever the on-disk shape changes in a way a migration needs to
-/// know about. Not itself a field of [`Settings`] — later tasks write it
-/// alongside the settings tables.
-pub const SETTINGS_VERSION: i64 = 1;
+/// know about. Not itself a field of [`Settings`] — [`store::save`] writes
+/// it alongside the settings tables, and [`store::load`] reads it to decide
+/// which upgrade steps a file still needs.
+///
+/// `2` since `include_background` moved from `[sessions]` to
+/// `[notifications]`. A version bump is owed only for a change a reader
+/// cannot absorb on its own: a *new* key is absent from an older file and
+/// picks up its default through `#[serde(default)]`, which needs no
+/// migration and no bump. A key that *moves* is different — the value is
+/// there, under a name the reader no longer looks up — so it needs both.
+pub const SETTINGS_VERSION: i64 = 2;
 
 /// What the menu-bar extra shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
@@ -495,7 +507,6 @@ impl Default for MenuBarSection {
 #[serde(default)]
 struct SessionsSection {
     poll_seconds: u32,
-    include_background: bool,
     preferred_terminal: String,
 }
 
@@ -504,7 +515,6 @@ impl Default for SessionsSection {
         let d = Settings::default();
         SessionsSection {
             poll_seconds: d.poll_seconds,
-            include_background: d.include_background,
             preferred_terminal: d.preferred_terminal,
         }
     }
@@ -582,6 +592,7 @@ impl Default for UsageSection {
 struct NotificationsSection {
     waiting_enabled: bool,
     waiting_after_minutes: u32,
+    include_background: bool,
     sound: bool,
 }
 
@@ -591,6 +602,7 @@ impl Default for NotificationsSection {
         NotificationsSection {
             waiting_enabled: d.waiting_enabled,
             waiting_after_minutes: d.waiting_after_minutes,
+            include_background: d.include_background,
             sound: d.sound,
         }
     }
@@ -627,7 +639,6 @@ impl From<Settings> for SettingsFile {
             },
             sessions: SessionsSection {
                 poll_seconds: s.poll_seconds,
-                include_background: s.include_background,
                 preferred_terminal: s.preferred_terminal,
             },
             popover: PopoverSection {
@@ -653,6 +664,7 @@ impl From<Settings> for SettingsFile {
             notifications: NotificationsSection {
                 waiting_enabled: s.waiting_enabled,
                 waiting_after_minutes: s.waiting_after_minutes,
+                include_background: s.include_background,
                 sound: s.sound,
             },
         }
@@ -686,7 +698,7 @@ impl From<SettingsFile> for Settings {
             show_cost: f.usage.show_cost,
             waiting_enabled: f.notifications.waiting_enabled,
             waiting_after_minutes: f.notifications.waiting_after_minutes,
-            include_background: f.sessions.include_background,
+            include_background: f.notifications.include_background,
             sound: f.notifications.sound,
         }
     }
