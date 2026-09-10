@@ -1390,3 +1390,100 @@ The SwiftPM package has no test target, so these are the milestone's acceptance 
 - [ ] Hiding cost removes every dollar figure, including from the burn-rate line
 - [ ] A `claude_config_dir` pointing at a regular file still opens the app and says what is wrong
 - [ ] Editing `config.toml` by hand updates the window live
+
+---
+
+## Appendix A: The copy
+
+**This is the content of Task 4, not a suggestion.** The first settings window was rejected as
+blank, and a row's explanatory sentence is what fixes that. Use these strings. Where one reads
+oddly against the real UI, change it and say so — but do not replace them with shorter, blander
+ones, which is how the window ends up blank again.
+
+The voice: plain, honest, and willing to say *why* rather than only *what*. Perch already talks
+this way — "Tokens are truth; dollars are an estimate" is in `pricing.rs`.
+
+### General — icon `General`
+
+| Group | Row | Label | Help |
+|---|---|---|---|
+| Startup | `LaunchAtLogin` | Open at login | Start Perch when you log in, so it is already watching before you open a session. |
+| Claude Code | `ClaudeConfigDir` | Claude Code folder | Where Claude Code keeps its sessions. Leave this blank to find it automatically, and set it only if Perch cannot see your work. |
+| Claude Code | — (Info) | Currently reading | *(value: the resolved path and how it was resolved, e.g. `~/.claude — found automatically`)* |
+| Refreshing | `PollSeconds` | Check for changes | How often Perch re-reads Claude Code's session files. Lower is more responsive; higher is quieter on a busy machine. |
+| Terminal | `PreferredTerminal` | Open sessions in | Which terminal Resume and Open launch. Only terminals Perch can find installed are offered. |
+| Terminal | — (Info) | Resume runs | *(value: the composed command, e.g. `claude --resume <session>` in the project folder)* |
+
+### Menu Bar — icon `MenuBar`
+
+| Group | Row | Label | Help |
+|---|---|---|---|
+| Icon | `MenuBarIcon` | Icon | The glyph Perch draws in the menu bar. |
+| Icon | `MenuBarDisplay` | Show alongside | What sits next to the icon. The hourglass appears only while something is actually waiting on you. |
+| Stale data | `DimWhenStale` | Fade when out of date | Fade the menu bar item when Perch has not managed to re-read your sessions recently, so an old number never looks like a current one. |
+| Stale data | `StaleAfterMinutes` | Count as out of date after | How long without a successful read before what you are looking at counts as old. |
+
+### Popover — icon `Popover`
+
+| Group | Row | Label | Help |
+|---|---|---|---|
+| Sections | `ShowWaiting` | Waiting on you | Show sessions that are blocked waiting for you to answer. |
+| Sections | `ShowWorking` | Working | Show sessions that are running right now. |
+| Sections | `ShowRecent` | Recent | Show sessions that finished recently. |
+| Sections | `RecentLimit` | Recent sessions shown | How many finished sessions to list. *(indented under `ShowRecent`, enabled by it)* |
+| Rows | `RowDensity` | Row height | How much breathing room each row gets. |
+| Rows | `ShowRowFolder` | Show project folder | Show each session's folder underneath its name, which helps when two projects share a name. |
+| Rows | `ShowRowUsage` | Show tokens and cost | Show each session's token count and estimated cost on its row. |
+
+### Projects — icon `Projects`
+
+| Group | Row | Label | Help |
+|---|---|---|---|
+| Grouping | `ActiveWithinDays` | Active means touched within | How recently you must have worked on a project for it to count as Active rather than Recent. |
+| Grouping | `ShowArchived` | Show archived projects | Show the Archived group in the sidebar. Archiving a project only hides it; nothing is ever deleted. |
+| Charts | `ChartDays` | Days of history | How many days the usage chart and each project's sparkline cover. Both read this one setting, so they can never disagree about their own date range. |
+
+### Usage — icon `Usage`
+
+| Group | Row | Label | Help |
+|---|---|---|---|
+| Top projects | `TopProjectsCount` | Projects ranked | How many projects the Top Projects list shows. |
+| Top projects | `TopProjectsDays` | Ranked over | How far back the Top Projects ranking looks. |
+| Burn rate | `BurnRate` | Show burn rate as | How to express your current rate of spend. Perch shows nothing at all until the window holds enough data to project honestly, whichever unit you pick. |
+| Cost | `ShowCost` | Show cost estimates | Show dollar figures. Tokens are counted from your transcripts; dollars are inferred from a price table you can edit. |
+
+### Notifications — icon `Notifications`
+
+| Group | Row | Label | Help |
+|---|---|---|---|
+| Waiting on you | `WaitingEnabled` | Tell me when a session is waiting | Notify you when a session has been sitting blocked on your answer. macOS will ask permission the first time you turn this on. |
+| Waiting on you | `WaitingAfterMinutes` | After | How long a session must sit blocked before Perch says anything. *(indented, enabled by `WaitingEnabled`)* |
+| Waiting on you | `IncludeBackground` | Include background sessions | Also alert for background sessions. They are usually not waiting on *you*, which is why they are left out by default. *(indented, enabled by `WaitingEnabled`)* |
+| Waiting on you | `Sound` | Play a sound | Play the system notification sound with the alert. *(indented, enabled by `WaitingEnabled`)* |
+
+### Pane previews
+
+Each is a `PanePreview` composed in Rust from the user's real index. Where there is no data yet,
+say so plainly rather than showing a zero — the existing rule.
+
+| Pane | `summary` |
+|---|---|
+| General | `Reading 31 projects and 190 sessions from ~/.claude.` |
+| Menu Bar | *(the current tray title, so every icon variant can be seen against the real text)* |
+| Popover | `3 waiting · 2 working · 3 recent` |
+| Projects | `12 Active · 19 Recent · 4 Archived` |
+| Usage | *(the actual burn-rate line the selected mode produces, or `Not enough data in this window to project a rate.`)* |
+| Prices | `4 models priced · 1 model in use has no price.` |
+| Notifications | `2 sessions are waiting on you right now.` or `Nothing is waiting on you.` |
+
+### Attention phrases
+
+`None` unless the stated condition holds. These are the whole point of the sidebar — a badge that
+is always present is decoration and stops being read.
+
+| Pane | Condition | Phrase |
+|---|---|---|
+| General | the configured folder could not be used | `not found` |
+| Notifications | `!waiting_enabled` and at least one session is waiting | `off · 2 waiting` |
+| Prices | a model with recorded turns has no price row | `1 unpriced` |
+| Diagnostics | at least one session record was rejected | `3 ignored` |
