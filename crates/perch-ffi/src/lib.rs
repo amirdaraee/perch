@@ -1032,14 +1032,16 @@ impl ThisPerch {
         // Loaded fresh, independently of `notifications_for`'s own load
         // (same duplication that method already carries, and cheap for the
         // same reason: parsing one small file): a hand-edited
-        // `menu_bar_display` must be reflected the moment the *next* tick's
-        // model goes out, not only after some separate settings-watch
-        // machinery reacts.
-        let display = settings::store::load(&self.config_path)
-            .settings
-            .menu_bar_display;
-        let mut model =
-            core_model::build_model(db_result.as_ref().ok(), &sessions, now_ms(), display);
+        // `menu_bar_display` — or `recent_limit`, which this model also reads
+        // now — must be reflected the moment the *next* tick's model goes
+        // out, not only after some separate settings-watch machinery reacts.
+        let loaded_settings = settings::store::load(&self.config_path).settings;
+        let mut model = core_model::build_model(
+            db_result.as_ref().ok(),
+            &sessions,
+            now_ms(),
+            &loaded_settings,
+        );
         // Neither fold may clobber a more specific error `build_model` itself
         // already produced (e.g. a broken index schema): this tick's open
         // failure is more specific than a possibly-stale re-index failure
@@ -1347,7 +1349,11 @@ impl Perch {
             live::live_sessions(&config::sessions_dir(&self.config_dir()), &RealProcessProbe);
         let now = self.core_model_for(sessions.clone());
         let db = db::open(&self.db_path).ok();
-        main_window::build_main_window(db.as_ref(), now, &sessions, now_ms()).into()
+        // The Active/Recent boundary is `active_within_days`; loaded here for
+        // the same reason `core_model_for` loads its own copy.
+        let loaded_settings = settings::store::load(&self.config_path).settings;
+        main_window::build_main_window(db.as_ref(), now, &sessions, now_ms(), &loaded_settings)
+            .into()
     }
 
     /// One project in full: note, totals, sparkline, and every session.
@@ -1359,7 +1365,8 @@ impl Perch {
     /// The Usage tab's view-model.
     pub fn usage(&self) -> Result<UsageModel, PerchError> {
         let database = self.open_db()?;
-        core_usage::build_usage(&database, now_ms())
+        let loaded_settings = settings::store::load(&self.config_path).settings;
+        core_usage::build_usage(&database, now_ms(), &loaded_settings)
             .map(Into::into)
             .map_err(db_err)
     }
