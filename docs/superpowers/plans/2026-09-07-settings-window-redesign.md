@@ -497,6 +497,36 @@ fn a_row_knows_whether_it_still_holds_its_default() {
 }
 
 #[test]
+fn every_stored_setting_explains_itself() {
+    // The first settings window was rejected as "very blank". The single
+    // biggest reason a pane reads as substantial is that each row says what
+    // it does underneath its label -- a sentence, not a fragment. A row that
+    // stores something and explains nothing is the defect this catches.
+    let panes = build_schema(&Settings::default(), &SchemaContext::empty());
+    for row in all_rows(&panes) {
+        let Some(key) = row.key else { continue };
+        let help = row.help.as_deref().unwrap_or("");
+        assert!(!help.is_empty(), "{key:?} has no help text");
+        assert!(
+            help.len() >= 20 && help.ends_with('.'),
+            "{key:?}'s help is not a sentence: {help:?}"
+        );
+    }
+}
+
+#[test]
+fn every_group_is_titled() {
+    // Grouping is what turns a list into a form. A group with no heading is
+    // an ungrouped list wearing a card.
+    let panes = build_schema(&Settings::default(), &SchemaContext::empty());
+    for pane in &panes {
+        for group in &pane.groups {
+            assert!(group.heading.is_some(), "{:?} has an untitled group", pane.id);
+        }
+    }
+}
+
+#[test]
 fn every_stepper_carries_a_finished_caption() {
     let panes = build_schema(&Settings::default(), &SchemaContext::empty());
     for row in all_rows(&panes) {
@@ -1044,22 +1074,30 @@ The SwiftPM package has **no test target**, so Swift behaviour is verified by ha
 
 - [ ] **Step 1: Replace the `TabView` with a `NavigationSplitView`**
 
-Sidebar lists the panes from the schema — never a hardcoded Swift list, or the sidebar and the schema drift. Each row shows the pane title and maps `IconId` to an SF Symbol:
+**The visual target is macOS System Settings**, which is also what the app we studied matches. Concretely, and these are acceptance criteria rather than suggestions:
+
+- The sidebar row is a **coloured rounded-square tile** containing a white glyph, then the pane title — not a bare monochrome symbol. Each pane gets its own accent colour, so the sidebar is scannable by colour before it is readable by text.
+- The window's title bar shows the **selected pane's name**, centred.
+- The detail side is a `Form` of **titled groups**: a bold section heading, then a card of rows with hairline separators between them.
+- Every row is **label, then a grey explanatory sentence beneath it**, with the control right-aligned on the label's line. The sentence is `row.help`, composed in Rust. This is the single thing that most separates a comprehensive settings window from a blank one — a column of bare toggles reads as unfinished no matter how many there are.
+- A destructive `Action` sits alone at the bottom right of its pane, not inline among the settings.
+
+Sidebar lists the panes from the schema — never a hardcoded Swift list, or the sidebar and the schema drift. Each row maps `IconId` to a symbol **and a colour**; both are drawing concerns, so both live here and no Rust change is needed for either:
 
 ```swift
 /// The single place a semantic icon becomes a macOS glyph. Rust names the
 /// concept; only this function knows what SF Symbols calls it.
-private func symbolName(_ icon: IconId) -> String {
+private func tile(_ icon: IconId) -> (symbol: String, color: Color) {
     switch icon {
-    case .general:       return "gearshape"
-    case .menuBar:       return "menubar.rectangle"
-    case .popover:       return "rectangle.on.rectangle"
-    case .projects:      return "folder"
-    case .usage:         return "chart.bar"
-    case .prices:        return "dollarsign.circle"
-    case .notifications: return "bell"
-    case .diagnostics:   return "stethoscope"
-    case .advanced:      return "slider.horizontal.3"
+    case .general:       return ("gearshape", .gray)
+    case .menuBar:       return ("menubar.rectangle", .blue)
+    case .popover:       return ("rectangle.on.rectangle", .teal)
+    case .projects:      return ("folder", .orange)
+    case .usage:         return ("chart.bar", .green)
+    case .prices:        return ("dollarsign.circle", .mint)
+    case .notifications: return ("bell", .red)
+    case .diagnostics:   return ("stethoscope", .pink)
+    case .advanced:      return ("slider.horizontal.3", .purple)
     }
 }
 ```
