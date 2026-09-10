@@ -8,9 +8,6 @@ use crate::settings::Settings;
 use crate::ui::format::{elapsed_or_dash, human_cost, human_elapsed, human_tokens};
 use crate::ui::model::PopoverModel;
 
-const SPARK_DAYS: usize = 14;
-const ACTIVE_WINDOW_MS: i64 = 7 * 86_400_000;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ProjectGroup {
     Pinned,
@@ -144,11 +141,15 @@ fn since(now_ms: i64, ts: Option<i64>) -> String {
 /// Every project the index knows, grouped for the sidebar. `db: None` (or a
 /// failing read) yields an empty list with the reason attached — never a silently
 /// empty window.
+///
+/// `settings.active_within_days` is the Active/Recent boundary — the user's
+/// window, not a frozen seven days.
 pub fn build_main_window(
     db: Option<&Db>,
     now: PopoverModel,
     live: &[LiveSession],
     now_ms: i64,
+    settings: &Settings,
 ) -> MainWindowModel {
     let Some(db) = db else {
         return MainWindowModel {
@@ -157,6 +158,7 @@ pub fn build_main_window(
             error: Some("index unavailable".into()),
         };
     };
+    let active_window_ms = i64::from(settings.active_within_days) * query::DAY_MS;
     let summaries = match query::project_summaries(db) {
         Ok(s) => s,
         Err(e) => {
@@ -184,7 +186,7 @@ pub fn build_main_window(
                 ProjectGroup::Pinned
             } else if s
                 .last_activity_at
-                .is_some_and(|t| now_ms - t <= ACTIVE_WINDOW_MS)
+                .is_some_and(|t| now_ms - t <= active_window_ms)
             {
                 ProjectGroup::Active
             } else {
@@ -251,8 +253,11 @@ fn recency_key(ts: Option<i64>) -> (u8, i64) {
     }
 }
 
-/// One project in full: its note, totals, a fourteen-day sparkline scoped to
-/// this project alone, and every session ever recorded for it.
+/// One project in full: its note, totals, a `settings.chart_days`-long
+/// sparkline scoped to this project alone, and every session ever recorded for
+/// it. That is the same setting `ui::usage`'s daily chart spans: the two were
+/// separate constants that both happened to be 14, and a user who widened one
+/// would have been left comparing two different date ranges.
 pub fn build_project_detail(
     db: &Db,
     project_id: i64,
@@ -271,18 +276,19 @@ pub fn build_project_detail(
         .clone()
         .unwrap_or_else(|| dir_name(&summary.real_path));
 
-    let days = query::daily_usage_for_project(db, project_id, SPARK_DAYS, now_ms)?;
+    let chart_days = settings.chart_days as usize;
+    let days = query::daily_usage_for_project(db, project_id, chart_days, now_ms)?;
     let sparkline = days
         .iter()
         .enumerate()
         .map(|(i, d)| {
-            let days_ago = SPARK_DAYS - 1 - i;
+            let days_ago = chart_days - 1 - i;
             SparkPoint {
                 day_index: i as i32,
                 tokens: d.usage.total_tokens(),
                 // Same scheme as `ui::usage`'s daily chart over the identical
-                // 14-day window — "Today", "1d" … "13d" — not `human_elapsed`,
-                // which caps at hours and would read "313h ago" for day 0.
+                // window — "Today", "1d" … — not `human_elapsed`, which caps
+                // at hours and would read "313h ago" for day 0.
                 label: if days_ago == 0 {
                     "Today".to_string()
                 } else {
@@ -410,7 +416,13 @@ mod tests {
         db.set_pinned(arch, true).unwrap();
         db.set_archived(arch, true).unwrap();
 
-        let m = build_main_window(Some(&db), PopoverModel::empty(), &[], now);
+        let m = build_main_window(
+            Some(&db),
+            PopoverModel::empty(),
+            &[],
+            now,
+            &Settings::default(),
+        );
         let group_of = |id: i64| m.projects.iter().find(|p| p.id == id).unwrap().group;
         assert_eq!(group_of(pinned), ProjectGroup::Pinned);
         assert_eq!(
@@ -424,6 +436,76 @@ mod tests {
             ProjectGroup::Archived,
             "archived beats pinned"
         );
+    }
+
+    /// A project's Active/Recent boundary is the user's `active_within_days`,
+    /// not a frozen seven-day window: the same project falls on either side of
+    /// it depending only on the setting.
+    #[test]
+    fn a_project_is_active_within_its_configured_window() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let now = 100 * DAY;
+        let pid = project_with_session(&db, "-a-p", "/a/proj", "s1", now - 10 * DAY, 1_000);
+        let group_of = |days: u32| {
+            let s = Settings {
+                active_within_days: days,
+                ..Settings::default()
+            };
+            build_main_window(Some(&db), PopoverModel::empty(), &[], now, &s)
+                .projects
+                .iter()
+                .find(|p| p.id == pid)
+                .unwrap()
+                .group
+        };
+
+        assert_eq!(
+            group_of(7),
+            ProjectGroup::Recent,
+            "ten days is outside seven"
+        );
+        assert_eq!(
+            group_of(14),
+            ProjectGroup::Active,
+            "the very same project is inside fourteen"
+        );
+    }
+
+    /// The defect this prevents: `CHART_DAYS` and `SPARK_DAYS` were two
+    /// independent declarations that both happened to be 14, so exposing
+    /// either alone would let the usage chart and a project's sparkline
+    /// silently disagree about their own date range.
+    #[test]
+    fn one_setting_drives_both_the_chart_and_the_sparkline() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let now = 100 * DAY + 3_600_000;
+        let pid = project_with_session(&db, "-a-p", "/a/proj", "s1", now - 1000, 1_000_000);
+
+        for days in [7u32, 30, 90] {
+            let s = Settings {
+                chart_days: days,
+                ..Settings::default()
+            };
+            let want = days as usize;
+            assert_eq!(
+                crate::ui::usage::build_usage(&db, now, &s)
+                    .unwrap()
+                    .daily
+                    .len(),
+                want,
+                "the usage chart must span chart_days"
+            );
+            assert_eq!(
+                build_project_detail(&db, pid, &[], now, &s)
+                    .unwrap()
+                    .sparkline
+                    .len(),
+                want,
+                "the sparkline must span the very same setting"
+            );
+        }
     }
 
     #[test]
@@ -459,7 +541,13 @@ mod tests {
         })
         .unwrap();
 
-        let m = build_main_window(Some(&db), PopoverModel::empty(), &[], now);
+        let m = build_main_window(
+            Some(&db),
+            PopoverModel::empty(),
+            &[],
+            now,
+            &Settings::default(),
+        );
         let ids: Vec<i64> = m.projects.iter().map(|p| p.id).collect();
         assert_eq!(
             ids,
@@ -476,7 +564,13 @@ mod tests {
         let now = 100 * DAY;
         project_with_session(&db, "-a-p", "/a/proj", "s1", now - 3_600_000, 2_000_000);
 
-        let m = build_main_window(Some(&db), PopoverModel::empty(), &[], now);
+        let m = build_main_window(
+            Some(&db),
+            PopoverModel::empty(),
+            &[],
+            now,
+            &Settings::default(),
+        );
         let row = &m.projects[0];
         assert_eq!(row.name, "proj", "directory name, not the slug");
         assert_eq!(row.tokens, "2.0M");
@@ -510,13 +604,25 @@ mod tests {
             message_count: 1,
         })
         .unwrap();
-        let m = build_main_window(Some(&db), PopoverModel::empty(), &[], now);
+        let m = build_main_window(
+            Some(&db),
+            PopoverModel::empty(),
+            &[],
+            now,
+            &Settings::default(),
+        );
         assert_eq!(m.projects[0].session_count, "2 sessions");
     }
 
     #[test]
     fn no_database_yields_an_empty_list_and_no_panic() {
-        let m = build_main_window(None, PopoverModel::empty(), &[], 100 * DAY);
+        let m = build_main_window(
+            None,
+            PopoverModel::empty(),
+            &[],
+            100 * DAY,
+            &Settings::default(),
+        );
         assert!(m.projects.is_empty());
         assert!(m.error.is_some(), "the user is told why the list is empty");
     }

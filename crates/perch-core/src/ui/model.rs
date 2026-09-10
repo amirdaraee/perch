@@ -2,7 +2,7 @@
 
 use crate::db::Db;
 use crate::live::{LiveSession, SessionStatus};
-use crate::settings::MenuBarDisplay;
+use crate::settings::{MenuBarDisplay, Settings};
 use crate::ui::format::{elapsed_or_dash, human_cost, human_elapsed, human_tokens};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -72,7 +72,6 @@ pub struct PopoverModel {
 }
 
 const DASH: &str = "—";
-const RECENT_LIMIT: usize = 3;
 const FIVE_HOURS_MS: i64 = 5 * 60 * 60 * 1000;
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 const WEEK_MS: i64 = 7 * DAY_MS;
@@ -188,13 +187,18 @@ fn stats_from(db: &Db, now_ms: i64) -> anyhow::Result<Stats> {
 
 /// Build the whole view-model. `db: None` (or a failing db) degrades to sessions-only:
 /// the sessions list needs no index, and an honest dash beats a fabricated zero.
-/// `display` shapes `tray_title` alone (see its own doc comment) — nothing else
-/// in this model depends on it.
+///
+/// `settings` replaces the bare `MenuBarDisplay` this took before: two of the
+/// user's choices reach this model now — `menu_bar_display`, which shapes
+/// `tray_title` alone (see its own doc comment), and `recent_limit`, which is
+/// how many ended sessions the Recent section lists. Passing the whole
+/// `Settings` rather than the two values keeps one source of truth for both,
+/// and is what `build_project_detail` already does.
 pub fn build_model(
     db: Option<&Db>,
     live: &[LiveSession],
     now_ms: i64,
-    display: MenuBarDisplay,
+    settings: &Settings,
 ) -> PopoverModel {
     let mut error = None;
 
@@ -264,7 +268,12 @@ pub fn build_model(
 
     let live_ids: Vec<String> = live.iter().map(|s| s.session_id.clone()).collect();
     let recent: Vec<RecentRow> =
-        match db.map(|d| crate::query::recent_sessions(d, &live_ids, RECENT_LIMIT)) {
+        // `recent_sessions` returns nothing for a limit of zero (its own explicit
+        // guard, kept deliberately); `recent_limit` is bounded 1–20 by
+        // `Settings::validated`, so zero cannot arrive from a settings file.
+        match db.map(|d| {
+            crate::query::recent_sessions(d, &live_ids, settings.recent_limit as usize)
+        }) {
             Some(Ok(found)) => found
                 .into_iter()
                 .map(|r| {
@@ -311,7 +320,7 @@ pub fn build_model(
         stats,
         live: rows,
         recent,
-        tray_title: tray_title(live, display),
+        tray_title: tray_title(live, settings.menu_bar_display),
         error,
         waiting_banner: waiting_banner(waiting),
     }
@@ -323,6 +332,17 @@ mod tests {
     use crate::db::open_in_memory;
     use crate::model::{SessionRecord, Turn, TurnUsage};
     use crate::pricing::seed_default_prices;
+
+    /// The settings these tests ran against before `build_model` took a
+    /// `&Settings`: defaults everywhere except `menu_bar_display`, which each
+    /// call used to pass explicitly. Every other assertion here is therefore
+    /// unchanged by the switch.
+    fn count_and_waiting() -> Settings {
+        Settings {
+            menu_bar_display: MenuBarDisplay::CountAndWaiting,
+            ..Settings::default()
+        }
+    }
 
     fn live(
         pid: i32,
@@ -356,7 +376,7 @@ mod tests {
             SessionStatus::Working,
             "interactive",
         );
-        let m = build_model(None, &[s], 10_000, MenuBarDisplay::CountAndWaiting);
+        let m = build_model(None, &[s], 10_000, &count_and_waiting());
         assert!(!m.stats.has_data);
         assert_eq!(m.stats.window_tokens, "—");
         assert_eq!(m.live.len(), 1);
@@ -377,7 +397,7 @@ mod tests {
             SessionStatus::Idle,
             "interactive",
         );
-        let m = build_model(None, &[s], 10_000, MenuBarDisplay::CountAndWaiting);
+        let m = build_model(None, &[s], 10_000, &count_and_waiting());
         let r = &m.live[0];
         assert_eq!(r.project, "proj", "last path component of cwd");
         assert_eq!(r.kind, "interactive");
@@ -394,7 +414,7 @@ mod tests {
             reason: Some("dialog open".into()),
             since_ms: 2_000,
         };
-        let m = build_model(None, &[s], 10_000, MenuBarDisplay::CountAndWaiting);
+        let m = build_model(None, &[s], 10_000, &count_and_waiting());
         assert_eq!(m.live[0].status_label, "waiting · dialog open");
         assert_eq!(m.live[0].elapsed, "8s");
         assert_eq!(m.live[0].status, Status::Waiting);
@@ -404,7 +424,7 @@ mod tests {
     fn absent_status_timestamp_is_a_dash() {
         let mut s = live(7, "a", "alpha", "/x", SessionStatus::Working, "interactive");
         s.status_updated_at = 0;
-        let m = build_model(None, &[s], 10_000, MenuBarDisplay::CountAndWaiting);
+        let m = build_model(None, &[s], 10_000, &count_and_waiting());
         assert_eq!(m.live[0].elapsed, "—");
     }
 
@@ -416,12 +436,7 @@ mod tests {
             reason: None,
             since_ms: 1,
         };
-        let m = build_model(
-            None,
-            &[bg, bg_wait],
-            10_000,
-            MenuBarDisplay::CountAndWaiting,
-        );
+        let m = build_model(None, &[bg, bg_wait], 10_000, &count_and_waiting());
         let by_id = |id: &str| m.live.iter().find(|r| r.id == id).unwrap();
         assert_eq!(by_id("a").status, Status::Background);
         assert_eq!(
@@ -525,21 +540,16 @@ mod tests {
         let b = live(2, "b", "b", "/x", SessionStatus::Working, "interactive");
 
         assert_eq!(
-            build_model(None, &[], 10_000, MenuBarDisplay::CountAndWaiting).waiting_banner,
+            build_model(None, &[], 10_000, &count_and_waiting()).waiting_banner,
             None
         );
         assert_eq!(
-            build_model(
-                None,
-                std::slice::from_ref(&b),
-                10_000,
-                MenuBarDisplay::CountAndWaiting
-            )
-            .waiting_banner,
+            build_model(None, std::slice::from_ref(&b), 10_000, &count_and_waiting())
+                .waiting_banner,
             None
         );
         assert_eq!(
-            build_model(None, &[w], 10_000, MenuBarDisplay::CountAndWaiting).waiting_banner,
+            build_model(None, &[w], 10_000, &count_and_waiting()).waiting_banner,
             Some("1 session is waiting on you".to_string())
         );
     }
@@ -587,7 +597,7 @@ mod tests {
             SessionStatus::Working,
             "interactive",
         );
-        let m = build_model(Some(&db), &[s], 10_000, MenuBarDisplay::CountAndWaiting);
+        let m = build_model(Some(&db), &[s], 10_000, &count_and_waiting());
         assert!(m.stats.has_data);
         assert!(m.stats.estimated);
         assert_eq!(m.stats.window_tokens, "2.0M");
@@ -629,7 +639,7 @@ mod tests {
             SessionStatus::Working,
             "interactive",
         );
-        let m = build_model(Some(&db), &[s], 10_000, MenuBarDisplay::CountAndWaiting);
+        let m = build_model(Some(&db), &[s], 10_000, &count_and_waiting());
         assert_eq!(m.recent.len(), 1);
         assert_eq!(m.recent[0].id, "gone");
         assert_eq!(m.recent[0].project, "proj");
@@ -702,7 +712,7 @@ mod tests {
                 "interactive",
             );
             s.cc_version = version.map(str::to_string);
-            let m = build_model(db.as_ref(), &[s], 10_000, MenuBarDisplay::CountAndWaiting);
+            let m = build_model(db.as_ref(), &[s], 10_000, &count_and_waiting());
             assert_eq!(
                 m.live[0].detail_line, expected,
                 "version={version:?} has_usage={has_usage}"
@@ -752,10 +762,52 @@ mod tests {
                 )
                 .unwrap();
             }
-            let m = build_model(Some(&db), &[], 10_000, MenuBarDisplay::CountAndWaiting);
+            let m = build_model(Some(&db), &[], 10_000, &count_and_waiting());
             assert_eq!(m.recent.len(), 1);
             assert_eq!(m.recent[0].ended_line, expected, "session_id={session_id}");
         }
+    }
+
+    /// How many ended sessions the popover's Recent section lists is the
+    /// user's `recent_limit`, not a constant — and the default still lists
+    /// three, so unfreezing the constant changed nothing a user sees.
+    #[test]
+    fn the_recent_section_honours_its_setting() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let pid = db
+            .upsert_project("-Users-a-proj", "/Users/a/proj", false)
+            .unwrap();
+        for i in 0..10i64 {
+            db.upsert_session(&SessionRecord {
+                id: format!("ended-{i}"),
+                project_id: pid,
+                file_path: format!("/tmp/ended-{i}.jsonl"),
+                file_size: 0,
+                indexed_offset: 0,
+                started_at: Some(1_000 + i),
+                last_activity_at: Some(1_000 + i),
+                cwd: Some("/Users/a/proj".into()),
+                git_branch: None,
+                cc_version: None,
+                title: None,
+                message_count: 1,
+            })
+            .unwrap();
+        }
+
+        let two = Settings {
+            recent_limit: 2,
+            ..Settings::default()
+        };
+        assert_eq!(build_model(Some(&db), &[], 10_000, &two).recent.len(), 2);
+        assert_eq!(
+            build_model(Some(&db), &[], 10_000, &Settings::default())
+                .recent
+                .len(),
+            3,
+            "the default still lists three, as RECENT_LIMIT did"
+        );
     }
 
     /// Break only `recent_sessions` (it selects `sessions.cwd`, renamed away
@@ -811,7 +863,7 @@ mod tests {
             SessionStatus::Working,
             "interactive",
         );
-        let m = build_model(Some(&db), &[s], 10_000, MenuBarDisplay::CountAndWaiting);
+        let m = build_model(Some(&db), &[s], 10_000, &count_and_waiting());
         assert_eq!(
             m.error.as_deref(),
             Some("some session data unavailable"),
@@ -868,7 +920,7 @@ mod tests {
             SessionStatus::Working,
             "interactive",
         );
-        let m = build_model(Some(&db), &[s], 10_000, MenuBarDisplay::CountAndWaiting);
+        let m = build_model(Some(&db), &[s], 10_000, &count_and_waiting());
         let msg = m.error.expect("a broken index must report an error");
         assert!(
             msg.starts_with("index unavailable"),
