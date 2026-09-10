@@ -515,6 +515,42 @@ fn every_stored_setting_explains_itself() {
 }
 
 #[test]
+fn attention_is_absent_when_nothing_is_wrong() {
+    // A badge that is always there is decoration, and stops being read.
+    let db = healthy_db();
+    let panes = build_schema(&Settings::default(), &SchemaContext::from(&db));
+    assert!(panes.iter().all(|p| p.attention.is_none()));
+}
+
+#[test]
+fn notifications_says_so_when_it_is_off_while_sessions_wait() {
+    let db = db_with_waiting_sessions(2);
+    let mut s = Settings::default();
+    s.waiting_enabled = false;
+    let panes = build_schema(&s, &SchemaContext::from(&db));
+    let note = pane(&panes, PaneId::Notifications).attention.as_deref().unwrap_or("");
+    assert!(note.contains('2'), "it must say how many, not merely that something is off");
+
+    s.waiting_enabled = true;
+    let panes = build_schema(&s, &SchemaContext::from(&db));
+    assert!(pane(&panes, PaneId::Notifications).attention.is_none());
+}
+
+#[test]
+fn the_projects_pane_counts_the_users_own_projects_at_the_current_threshold() {
+    let db = db_with_projects_last_used_days_ago(&[1, 3, 20, 40]);
+    let mut s = Settings::default();
+
+    s.active_within_days = 7;
+    let summary = preview(&build_schema(&s, &SchemaContext::from(&db)), PaneId::Projects).summary;
+    assert!(summary.contains("2 Active"), "got {summary:?}");
+
+    s.active_within_days = 30;
+    let summary = preview(&build_schema(&s, &SchemaContext::from(&db)), PaneId::Projects).summary;
+    assert!(summary.contains("3 Active"), "the preview must follow the setting");
+}
+
+#[test]
 fn every_group_is_titled() {
     // Grouping is what turns a list into a form. A group with no heading is
     // an ungrouped list wearing a card.
@@ -560,6 +596,31 @@ pub enum PaneId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IconId {
     General, MenuBar, Popover, Projects, Usage, Prices, Notifications, Diagnostics, Advanced,
+}
+
+pub struct SettingsPane {
+    pub id: PaneId,
+    pub title: String,
+    pub icon: IconId,
+    /// A short finished phrase shown beside the pane in the sidebar when the
+    /// current configuration is costing the user something -- "off · 2
+    /// waiting", "3 ignored", "1 unpriced". `None` when there is nothing to
+    /// say, which must be the common case: a badge that is always present is
+    /// decoration and stops being read.
+    pub attention: Option<String>,
+    /// What this pane's settings currently produce, in the user's own data.
+    pub preview: Option<PanePreview>,
+    pub groups: Vec<SettingGroup>,
+}
+
+/// Finished strings, like every other model in this codebase. A shell lays
+/// these out; it never computes them. The Menu Bar pane's mock status item is
+/// the one exception, and it is drawn from values the model already carries.
+pub struct PanePreview {
+    /// The headline: "12 Active · 19 Recent · 4 Archived".
+    pub summary: String,
+    /// Optional supporting lines beneath it.
+    pub detail: Vec<String>,
 }
 
 pub struct SettingRow {
@@ -1074,30 +1135,33 @@ The SwiftPM package has **no test target**, so Swift behaviour is verified by ha
 
 - [ ] **Step 1: Replace the `TabView` with a `NavigationSplitView`**
 
-**The visual target is macOS System Settings**, which is also what the app we studied matches. Concretely, and these are acceptance criteria rather than suggestions:
+**Perch's settings window shows the user their own data.** That is the whole differentiator, and it comes from something the app we studied structurally cannot do: it manages remote services and knows nothing about your work, while Perch has already indexed every project and session on the machine. A setting here can therefore be shown *taking effect* instead of merely described.
 
-- The sidebar row is a **coloured rounded-square tile** containing a white glyph, then the pane title — not a bare monochrome symbol. Each pane gets its own accent colour, so the sidebar is scannable by colour before it is readable by text.
-- The window's title bar shows the **selected pane's name**, centred.
-- The detail side is a `Form` of **titled groups**: a bold section heading, then a card of rows with hairline separators between them.
-- Every row is **label, then a grey explanatory sentence beneath it**, with the control right-aligned on the label's line. The sentence is `row.help`, composed in Rust. This is the single thing that most separates a comprehensive settings window from a blank one — a column of bare toggles reads as unfinished no matter how many there are.
-- A destructive `Action` sits alone at the bottom right of its pane, not inline among the settings.
+Three consequences, all acceptance criteria:
 
-Sidebar lists the panes from the schema — never a hardcoded Swift list, or the sidebar and the schema drift. Each row maps `IconId` to a symbol **and a colour**; both are drawing concerns, so both live here and no Rust change is needed for either:
+- **A pane previews its own effect, with real numbers.** The Projects pane's "Active within N days" is a slider whose panel reads `12 Active · 19 Recent · 4 Archived` and re-counts as it moves. The Menu Bar pane draws an actual status-item mock in every icon variant. The Usage pane shows the real burn-rate line the selected mode produces. Nobody has to imagine the outcome.
+- **The sidebar flags settings that are currently costing the user something.** A pane carries an optional short phrase — Notifications reads `off · 2 waiting` when alerts are disabled while sessions sit blocked; Diagnostics reads `3 ignored` when records are being skipped; Prices reads `1 unpriced` when a model in use has no rate. This is Perch's existing honesty rule — never show a fabricated zero, always say what is actually known — applied to its own configuration. It is also genuinely useful rather than decorative: it turns the settings window into something that tells you when a default is hurting you.
+- **Restraint everywhere else.** Monochrome glyphs in the sidebar, one accent colour used only for selection and for the attention phrases. No coloured icon tiles — that is a borrowed solution to a problem Perch does not have.
+
+Keep the help sentence under every label and the titled groups. Those are not anyone's signature; they are what a settings form is, and the schema tests already enforce them.
+
+Sidebar lists the panes from the schema — never a hardcoded Swift list, or the sidebar and the schema drift. Each row maps `IconId` to a symbol, which is a drawing concern and so lives here:
 
 ```swift
 /// The single place a semantic icon becomes a macOS glyph. Rust names the
-/// concept; only this function knows what SF Symbols calls it.
-private func tile(_ icon: IconId) -> (symbol: String, color: Color) {
+/// concept; only this function knows what SF Symbols calls it. Monochrome
+/// by choice: nine panes of one app do not need colour to be told apart.
+private func symbolName(_ icon: IconId) -> String {
     switch icon {
-    case .general:       return ("gearshape", .gray)
-    case .menuBar:       return ("menubar.rectangle", .blue)
-    case .popover:       return ("rectangle.on.rectangle", .teal)
-    case .projects:      return ("folder", .orange)
-    case .usage:         return ("chart.bar", .green)
-    case .prices:        return ("dollarsign.circle", .mint)
-    case .notifications: return ("bell", .red)
-    case .diagnostics:   return ("stethoscope", .pink)
-    case .advanced:      return ("slider.horizontal.3", .purple)
+    case .general:       return "gearshape"
+    case .menuBar:       return "menubar.rectangle"
+    case .popover:       return "rectangle.on.rectangle"
+    case .projects:      return "folder"
+    case .usage:         return "chart.bar"
+    case .prices:        return "dollarsign.circle"
+    case .notifications: return "bell"
+    case .diagnostics:   return "stethoscope"
+    case .advanced:      return "slider.horizontal.3"
     }
 }
 ```
