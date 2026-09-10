@@ -5,7 +5,7 @@ use crate::db::{Db, NotifyOverride};
 use crate::live::LiveSession;
 use crate::query;
 use crate::settings::Settings;
-use crate::ui::format::{elapsed_or_dash, human_cost, human_elapsed, human_tokens};
+use crate::ui::format::{elapsed_or_dash, human_cost, human_elapsed, human_tokens, plural};
 use crate::ui::model::PopoverModel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -98,17 +98,6 @@ fn dir_name(path: &str) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string())
-}
-
-/// `pub(crate)` so the settings window's own view-model can pluralize its
-/// two stepper captions through the same helper, rather than growing a
-/// second one that could disagree with this about what "1 minute" reads like.
-pub(crate) fn plural(n: i64, one: &str, many: &str) -> String {
-    if n == 1 {
-        format!("1 {one}")
-    } else {
-        format!("{n} {many}")
-    }
 }
 
 /// What `NotifyOverride::Default` currently means: the global
