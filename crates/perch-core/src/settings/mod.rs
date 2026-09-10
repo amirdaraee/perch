@@ -23,10 +23,12 @@ use std::path::Path;
 
 pub mod keys;
 pub mod schema;
+pub mod search;
 pub mod store;
 
 pub use keys::*;
 pub use schema::*;
+pub use search::*;
 
 /// Bumped whenever the on-disk shape changes in a way a migration needs to
 /// know about. Not itself a field of [`Settings`] — [`store::save`] writes
