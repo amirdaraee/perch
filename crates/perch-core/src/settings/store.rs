@@ -192,20 +192,67 @@ const TEMPLATE: &str = r#"# Perch's own settings. Perch reads this file on start
 version = 1
 
 [general]
+# Start Perch when you log in.
 launch_at_login = false
+# "" auto-detects Claude Code's directory; set a path to override it.
 claude_config_dir = ""
 
 [menu_bar]
+# "icon" | "count" | "count-and-waiting"
 display = "count"
+# "bird" | "binoculars" | "dot" | "bars"
+icon = "bird"
+# Dim the menu-bar item when the index has not refreshed recently.
+dim_when_stale = true
+# Minutes without a refresh before the item counts as stale. 1-120.
+stale_after_minutes = 5
 
 [sessions]
+# How often Perch re-reads Claude Code's directory, in seconds. 1-60.
 poll_seconds = 5
+# Count sessions Claude Code is running in the background as waiting on you.
 include_background = false
+# Which terminal "Resume" opens.
 preferred_terminal = "Terminal"
 
+[popover]
+# Which sections the menu-bar popover shows.
+show_waiting = true
+show_working = true
+show_recent = true
+# How many ended sessions the Recent section lists. 1-20.
+recent_limit = 3
+# "comfortable" | "compact"
+row_density = "comfortable"
+# What each session row shows beneath its name.
+show_row_folder = false
+show_row_usage = true
+
+[projects]
+# A project is Active if it was used within this many days. 1-90.
+active_within_days = 7
+# Show the Archived group.
+show_archived = true
+# Days covered by the usage chart and every project sparkline. 7, 14, 30 or 90.
+chart_days = 14
+
+[usage]
+# How many projects the Top Projects list shows. 3-20.
+top_projects_count = 8
+# Days the Top Projects list covers. 7-180.
+top_projects_days = 30
+# "off" | "tokens-per-hour" | "cost-per-hour" | "cost-per-day" | "projected-window"
+burn_rate = "cost-per-hour"
+# Show dollar estimates alongside token counts.
+show_cost = true
+
 [notifications]
+# Notify when a session has been waiting on you.
 waiting_enabled = false
+# How long it must have waited first, in minutes. 1-240.
 waiting_after_minutes = 10
+# Play the default alert sound with the notification.
+sound = true
 "#;
 
 /// Get (creating if absent) the named top-level section as a real `[name]`
@@ -263,15 +310,39 @@ pub fn save(path: &Path, s: &Settings) -> Result<()> {
 
     let menu_bar = ensure_table(&mut doc, "menu_bar");
     menu_bar["display"] = value(s.menu_bar_display.as_wire_str().to_string());
+    menu_bar["icon"] = value(s.menu_bar_icon.as_wire_str().to_string());
+    menu_bar["dim_when_stale"] = value(s.dim_when_stale);
+    menu_bar["stale_after_minutes"] = value(i64::from(s.stale_after_minutes));
 
     let sessions = ensure_table(&mut doc, "sessions");
     sessions["poll_seconds"] = value(i64::from(s.poll_seconds));
     sessions["include_background"] = value(s.include_background);
     sessions["preferred_terminal"] = value(s.preferred_terminal.clone());
 
+    let popover = ensure_table(&mut doc, "popover");
+    popover["show_waiting"] = value(s.show_waiting);
+    popover["show_working"] = value(s.show_working);
+    popover["show_recent"] = value(s.show_recent);
+    popover["recent_limit"] = value(i64::from(s.recent_limit));
+    popover["row_density"] = value(s.row_density.as_wire_str().to_string());
+    popover["show_row_folder"] = value(s.show_row_folder);
+    popover["show_row_usage"] = value(s.show_row_usage);
+
+    let projects = ensure_table(&mut doc, "projects");
+    projects["active_within_days"] = value(i64::from(s.active_within_days));
+    projects["show_archived"] = value(s.show_archived);
+    projects["chart_days"] = value(i64::from(s.chart_days));
+
+    let usage = ensure_table(&mut doc, "usage");
+    usage["top_projects_count"] = value(i64::from(s.top_projects_count));
+    usage["top_projects_days"] = value(i64::from(s.top_projects_days));
+    usage["burn_rate"] = value(s.burn_rate.as_wire_str().to_string());
+    usage["show_cost"] = value(s.show_cost);
+
     let notifications = ensure_table(&mut doc, "notifications");
     notifications["waiting_enabled"] = value(s.waiting_enabled);
     notifications["waiting_after_minutes"] = value(i64::from(s.waiting_after_minutes));
+    notifications["sound"] = value(s.sound);
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -492,6 +563,7 @@ pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::{BurnRate, MenuBarIcon, RowDensity};
 
     #[test]
     fn a_missing_file_loads_defaults_without_an_error() {
@@ -754,6 +826,52 @@ mod tests {
             "watch must never create the directory it watches"
         );
         h.stop();
+    }
+
+    /// The compiler already catches an *omitted* field -- both `From` impls
+    /// in `settings::mod` build struct literals, so a field with no wire
+    /// mapping fails the build. What it cannot catch is a field wired to
+    /// the *wrong* key, because so many of these fields share a type. Hence
+    /// a distinct value per field: a test that reused one value would pass
+    /// with two same-typed fields swapped.
+    #[test]
+    fn every_field_survives_a_save_and_load_at_a_distinct_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let want = Settings {
+            launch_at_login: true,
+            claude_config_dir: dir.path().to_string_lossy().into_owned(),
+            menu_bar_display: MenuBarDisplay::CountAndWaiting,
+            menu_bar_icon: MenuBarIcon::Binoculars,
+            dim_when_stale: false,
+            stale_after_minutes: 11,
+            poll_seconds: 12,
+            preferred_terminal: "iTerm2".to_string(),
+            show_waiting: false,
+            show_working: false,
+            show_recent: false,
+            recent_limit: 13,
+            row_density: RowDensity::Compact,
+            show_row_folder: true,
+            show_row_usage: false,
+            active_within_days: 14,
+            show_archived: false,
+            chart_days: 30,
+            top_projects_count: 15,
+            top_projects_days: 16,
+            burn_rate: BurnRate::TokensPerHour,
+            show_cost: false,
+            waiting_enabled: true,
+            waiting_after_minutes: 17,
+            include_background: true,
+            sound: false,
+        };
+
+        save(&path, &want).expect("save");
+        let got = load(&path);
+        assert!(got.error.is_none(), "reload reported: {:?}", got.error);
+        assert_eq!(got.settings, want, "a field did not survive the round trip");
     }
 }
 
