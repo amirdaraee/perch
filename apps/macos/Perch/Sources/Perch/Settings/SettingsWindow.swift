@@ -63,6 +63,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             defer: false
         )
         w.title = "Settings"
+        w.titlebarAppearsTransparent = false
         w.setFrameAutosaveName("PerchSettingsWindow")
         w.center()
         w.minSize = NSSize(width: 720, height: 480)
@@ -191,35 +192,49 @@ struct SettingsRootView: View {
 
     // MARK: - Sidebar
 
-    @ViewBuilder
+    /// A bare `List` — not a `List` wrapped in a `VStack` alongside a
+    /// hand-rolled field. `NavigationSplitView`'s sidebar column expects to
+    /// own its content, and wrapping it rendered nothing at all: no rows, no
+    /// field, an empty column beside a detail side that was drawing fine.
+    /// `.searchable` puts the field where macOS puts it, and costs less code.
     private var sidebar: some View {
-        VStack(spacing: 0) {
-            searchField
-            if panes.isEmpty && !query.isEmpty {
-                // Never an empty sidebar: an empty list and a broken window
-                // look exactly alike, and the user has no way to tell which
-                // one they are looking at.
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("No setting matches “\(query)”.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Button("Clear search") { query = "" }
-                        .buttonStyle(.link)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 14)
-                Spacer()
+        List(selection: selection) {
+            if panes.isEmpty {
+                emptySidebarNotice
             } else {
-                List(selection: selection) {
-                    ForEach(panes, id: \.id.key) { pane in
-                        sidebarRow(pane).tag(pane.id.key)
-                    }
+                ForEach(panes, id: \.id.key) { pane in
+                    sidebarRow(pane).tag(pane.id.key)
                 }
-                .listStyle(.sidebar)
             }
         }
+        .listStyle(.sidebar)
+        .searchable(text: $query, placement: .sidebar, prompt: "Search settings")
         .background(SidebarWidthReporter(width: $sidebarWidth))
+    }
+
+    /// Never an empty sidebar. An empty list and a broken window look exactly
+    /// alike, and the user has no way to tell which one they are looking at —
+    /// which is precisely what happened here. This covers *both* reasons the
+    /// list can be empty, not just the search one: a schema that failed to
+    /// load is the case that actually shipped.
+    @ViewBuilder
+    private var emptySidebarNotice: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if query.isEmpty {
+                Text("Settings could not be loaded.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("No setting matches \u{201C}\(query)\u{201D}.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Clear search") { query = "" }
+                    .buttonStyle(.link)
+            }
+        }
+        .padding(.vertical, 6)
     }
 
     private func sidebarRow(_ pane: SettingsPane) -> some View {
@@ -248,39 +263,6 @@ struct SettingsRootView: View {
             }
         }
         .padding(.vertical, 2)
-    }
-
-    private var searchField: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
-                .font(.system(size: 12))
-            TextField("Search", text: $query)
-                .textFieldStyle(.plain)
-            if !query.isEmpty {
-                Button {
-                    query = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Clear search")
-            }
-        }
-        .padding(.horizontal, 7)
-        .padding(.vertical, 5)
-        .background(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(Color(nsColor: .textBackgroundColor))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.10))
-        )
-        .padding(.horizontal, 10)
-        .padding(.top, 10)
-        .padding(.bottom, 8)
     }
 
     // MARK: - Detail
@@ -358,9 +340,27 @@ struct SettingsRootView: View {
     private func paneBody(_ pane: SettingsPane) -> some View {
         switch pane.id {
         case .prices:
-            placeholder("The editable price table arrives in the next commit.")
+            // Bespoke because an editable table of four rates per model is
+            // not a list of scalar options — and because the thing this pane
+            // most needs to show, the models in use with no rate at all, is
+            // not in the table it would render.
+            PricesPane(
+                engine: engine,
+                refreshToken: refreshToken,
+                // A price edit changes this pane's own preview and the
+                // sidebar's "3 unpriced" badge, both of which live in the
+                // schema — so the schema is re-read once the write lands.
+                schemaChanged: { refreshSchema() }
+            )
         case .advanced:
-            placeholder("Paths, index statistics, reindex, reset and About arrive in the next commit.")
+            AdvancedPane(
+                engine: engine,
+                refreshToken: refreshToken,
+                // The global reset returns the whole schema, so it is
+                // applied by the view that owns it rather than by the pane
+                // that asked for it.
+                resetAllSettings: { resetAll() }
+            )
         case .diagnostics:
             // Already written, already correct — moved from the old tab bar
             // into the split view rather than left dark for a commit.
@@ -368,14 +368,6 @@ struct SettingsRootView: View {
         default:
             SchemaPane(pane: pane, actions: actions)
         }
-    }
-
-    private func placeholder(_ text: String) -> some View {
-        Text(text)
-            .font(.callout)
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-            .padding(20)
     }
 
     private var emptyDetail: some View {
@@ -574,7 +566,11 @@ struct SettingsRootView: View {
             loadError = EngineUnavailable().localizedDescription
             return
         }
-        panes = fetched
+        panes = fetched.panes
+        // The read carries notes too, not only the writes: a `poll_seconds =
+        // 9999` hand-edited into `config.toml` is clamped the moment the file
+        // is read, and this window is where the user finds that out.
+        notes = fetched.notes
         loadError = nil
         // Never prompts — just reads whatever the OS currently says, so a
         // permission granted or denied from System Settings since this window
@@ -593,12 +589,40 @@ struct SettingsRootView: View {
                 loadError = EngineUnavailable().localizedDescription
                 return
             }
-            panes = fetched
+            panes = fetched.panes
             loadError = nil
         }
     }
 
     private var queryOrNil: String? { query.isEmpty ? nil : query }
+
+    /// Re-read the schema after something *other* than a setting changed it
+    /// — a model price, today. The Prices pane's preview and the sidebar's
+    /// "3 unpriced" badge are both computed in Rust from the index, so they
+    /// go stale the instant a rate is added and nothing else would notice.
+    /// Deliberately leaves `notes` alone: they belong to whatever write last
+    /// produced them, and a price edit is not that write.
+    private func refreshSchema() {
+        Task {
+            guard let fetched = await engine.settingsSchema(query: queryOrNil) else { return }
+            panes = fetched.panes
+        }
+    }
+
+    /// Every setting back to its factory value, in one write. Queued behind
+    /// any pending edit like every other write here, and adopting the schema
+    /// that came back — a reset that failed reports and changes nothing,
+    /// which is what makes it safe to offer at all.
+    private func resetAll() {
+        enqueue {
+            switch await engine.resetAllSettings() {
+            case .success(let result):
+                await adopt(result)
+            case .failure(let error):
+                actionError = error.localizedDescription
+            }
+        }
+    }
 
     private func write(_ key: SettingKey, _ value: SettingValue) {
         enqueue {
@@ -654,7 +678,7 @@ struct SettingsRootView: View {
             panes = result.panes
             return
         }
-        panes = await engine.settingsSchema(query: q) ?? result.panes
+        panes = await engine.settingsSchema(query: q)?.panes ?? result.panes
     }
 }
 
