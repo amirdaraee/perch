@@ -4,8 +4,8 @@
 use perch_core::db::Db;
 use perch_core::platform::RealProcessProbe;
 use perch_core::ui::{
-    diagnostics as core_diagnostics, main_window, model as core_model,
-    settings as core_ui_settings, usage as core_usage, watcher,
+    advanced as core_advanced, diagnostics as core_diagnostics, main_window, model as core_model,
+    prices as core_prices, settings as core_ui_settings, usage as core_usage, watcher,
 };
 use perch_core::{config, db, index, live, notify, pricing, query, settings, terminals};
 use std::collections::{HashMap, HashSet};
@@ -615,171 +615,26 @@ impl From<perch_core::actions::TerminalCommand> for TerminalCommand {
     }
 }
 
-// --- Settings, diagnostics, the per-project override, and notifications ---
-// Everything below mirrors `perch_core::settings`, `perch_core::ui::settings`,
-// `perch_core::ui::diagnostics`, `perch_core::db::NotifyOverride` and
-// `perch_core::notify::Notification`. `Settings` and `NotifyOverride` cross
-// the boundary in *both* directions (a shell both reads and writes them), so
-// each gets a `From` impl each way; both directions destructure their source
-// for the same reason every other mirror in this file does — so a field
-// added on either side becomes a compile error here, not a silent gap.
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
-pub enum MenuBarDisplay {
-    Icon,
-    Count,
-    CountAndWaiting,
-}
-
-impl From<settings::MenuBarDisplay> for MenuBarDisplay {
-    fn from(d: settings::MenuBarDisplay) -> Self {
-        match d {
-            settings::MenuBarDisplay::Icon => MenuBarDisplay::Icon,
-            settings::MenuBarDisplay::Count => MenuBarDisplay::Count,
-            settings::MenuBarDisplay::CountAndWaiting => MenuBarDisplay::CountAndWaiting,
-        }
-    }
-}
-
-impl From<MenuBarDisplay> for settings::MenuBarDisplay {
-    fn from(d: MenuBarDisplay) -> Self {
-        match d {
-            MenuBarDisplay::Icon => settings::MenuBarDisplay::Icon,
-            MenuBarDisplay::Count => settings::MenuBarDisplay::Count,
-            MenuBarDisplay::CountAndWaiting => settings::MenuBarDisplay::CountAndWaiting,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, uniffi::Record)]
-pub struct Settings {
-    pub launch_at_login: bool,
-    pub claude_config_dir: String,
-    pub menu_bar_display: MenuBarDisplay,
-    pub poll_seconds: u32,
-    pub waiting_enabled: bool,
-    pub waiting_after_minutes: u32,
-    pub include_background: bool,
-    pub preferred_terminal: String,
-}
-
-/// `perch_core`'s `Settings` now carries eighteen keys this record does not
-/// yet mirror — the settings window that reaches them is built on the schema
-/// surface, not on this flat record, so growing it here would be a second
-/// spelling of the same twenty-six values.
-///
-/// Every one of those eighteen is still destructured below, bound to `_`
-/// rather than swept up by `..`, so the house guarantee holds unchanged: a
-/// *new* field added to `perch_core::settings::Settings` is a compile error
-/// here, not a silent omission.
-impl From<settings::Settings> for Settings {
-    fn from(s: settings::Settings) -> Self {
-        let settings::Settings {
-            launch_at_login,
-            claude_config_dir,
-            menu_bar_display,
-            menu_bar_icon: _,
-            dim_when_stale: _,
-            stale_after_minutes: _,
-            poll_seconds,
-            preferred_terminal,
-            show_waiting: _,
-            show_working: _,
-            show_recent: _,
-            recent_limit: _,
-            row_density: _,
-            show_row_folder: _,
-            show_row_usage: _,
-            active_within_days: _,
-            show_archived: _,
-            chart_days: _,
-            top_projects_count: _,
-            top_projects_days: _,
-            burn_rate: _,
-            show_cost: _,
-            waiting_enabled,
-            waiting_after_minutes,
-            include_background,
-            sound: _,
-        } = s;
-        Settings {
-            launch_at_login,
-            claude_config_dir,
-            menu_bar_display: menu_bar_display.into(),
-            poll_seconds,
-            waiting_enabled,
-            waiting_after_minutes,
-            include_background,
-            preferred_terminal,
-        }
-    }
-}
-
-impl Settings {
-    /// Lay this record's eight values over `base`, leaving every key it does
-    /// not mirror as `base` has it.
-    ///
-    /// Deliberately not `From<Settings> for settings::Settings`: a `From`
-    /// could only fill the other eighteen from `Settings::default()`, which
-    /// would make saving one toggle in the settings window silently reset
-    /// every hand-edited value in `config.toml` that this record cannot see.
-    /// Merging onto what is already on disk is the only honest conversion
-    /// while the two shapes differ.
-    fn merged_onto(self, base: settings::Settings) -> settings::Settings {
-        let Settings {
-            launch_at_login,
-            claude_config_dir,
-            menu_bar_display,
-            poll_seconds,
-            waiting_enabled,
-            waiting_after_minutes,
-            include_background,
-            preferred_terminal,
-        } = self;
-        settings::Settings {
-            launch_at_login,
-            claude_config_dir,
-            menu_bar_display: menu_bar_display.into(),
-            poll_seconds,
-            waiting_enabled,
-            waiting_after_minutes,
-            include_background,
-            preferred_terminal,
-            ..base
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, uniffi::Record)]
-pub struct SettingsModel {
-    pub settings: Settings,
-    pub config_path: String,
-    pub notes: Vec<String>,
-    pub error: Option<String>,
-}
-
-impl From<core_ui_settings::SettingsModel> for SettingsModel {
-    fn from(m: core_ui_settings::SettingsModel) -> Self {
-        let core_ui_settings::SettingsModel {
-            settings,
-            config_path,
-            notes,
-            error,
-        } = m;
-        SettingsModel {
-            settings: settings.into(),
-            config_path,
-            notes,
-            error,
-        }
-    }
-}
+// --- Diagnostics, the per-project override, and notifications -------------
+// Everything below mirrors `perch_core::ui::diagnostics`,
+// `perch_core::db::NotifyOverride` and `perch_core::notify::Notification`.
+// `NotifyOverride` crosses the boundary in *both* directions (a shell both
+// reads and writes it), so it gets a `From` impl each way; both directions
+// destructure their source for the same reason every other mirror in this
+// file does — so a field added on either side becomes a compile error here,
+// not a silent gap.
+//
+// There is deliberately no flat `Settings` record here any more. Twenty-six
+// settings reached through one struct meant every write shipping all of them
+// and the eighteen this boundary never mirrored being silently reset; the
+// settings surface is `settings_schema` / `set_setting` / `reset_pane`,
+// which name one key at a time.
 
 /// Per-project override of the global notification setting (see
 /// `db::NotifyOverride`). Crosses the boundary both ways: `set_notify_override`
 /// takes one as input, and `ProjectDetail.notify` reports a project's current
-/// one back — so, like `Settings`, it gets a `From` each way, both
-/// destructuring for the same reason as every other conversion here.
+/// one back — so it gets a `From` each way, both destructuring for the same
+/// reason as every other conversion here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum NotifyOverride {
     Default,
@@ -1396,56 +1251,69 @@ impl From<settings::SettingsPane> for SettingsPane {
     }
 }
 
-/// What every mutating settings call returns: the schema that resulted from
-/// the write, and whatever `Settings::validated` had to change on the way to
-/// disk. Both, always — a shell must never re-read to see its own write, and
-/// must never have to discover a clamp for itself.
+/// What every settings call returns — the read as well as the writes: the
+/// schema, and whatever `Settings::validated` had to change on the way to or
+/// from disk. Both, always.
+///
+/// A shell must never re-read to see its own write, and must never have to
+/// discover a clamp for itself — and the same is true of a *hand* edit: a
+/// `poll_seconds = 9999` typed into `config.toml` is clamped the moment the
+/// file is read, and the window that opens over it has to say so. That note
+/// exists only at load time, so the read carries it too, not just the
+/// writes.
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct SettingsResult {
     pub panes: Vec<SettingsPane>,
     pub notes: Vec<String>,
 }
 
-/// Mirrors `perch_core::pricing::ModelPrice`. Crosses both ways — the price
-/// table is editable — so it destructures in each direction.
-#[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
-pub struct ModelPrice {
-    pub input_per_mtok: f64,
-    pub output_per_mtok: f64,
-    pub cache_read_per_mtok: f64,
-    pub cache_write_per_mtok: f64,
+/// The four rates as editable text, exactly as they appear in four fields
+/// and exactly as they come back from them.
+///
+/// **Text in both directions, deliberately.** A rate is a number the user
+/// types, and the one place it becomes an `f64` is `ui::prices::parse_rates`
+/// — so the sentence explaining a rate that will not parse is written in
+/// Rust beside the parse that rejected it, and no shell ever has to invent
+/// one (or, worse, quietly substitute a zero for something it could not
+/// read).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RateFields {
+    pub input: String,
+    pub output: String,
+    pub cache_read: String,
+    pub cache_write: String,
 }
 
-impl From<pricing::ModelPrice> for ModelPrice {
-    fn from(p: pricing::ModelPrice) -> Self {
-        let pricing::ModelPrice {
-            input_per_mtok,
-            output_per_mtok,
-            cache_read_per_mtok,
-            cache_write_per_mtok,
-        } = p;
-        ModelPrice {
-            input_per_mtok,
-            output_per_mtok,
-            cache_read_per_mtok,
-            cache_write_per_mtok,
+impl From<core_prices::RateFields> for RateFields {
+    fn from(f: core_prices::RateFields) -> Self {
+        let core_prices::RateFields {
+            input,
+            output,
+            cache_read,
+            cache_write,
+        } = f;
+        RateFields {
+            input,
+            output,
+            cache_read,
+            cache_write,
         }
     }
 }
 
-impl From<ModelPrice> for pricing::ModelPrice {
-    fn from(p: ModelPrice) -> Self {
-        let ModelPrice {
-            input_per_mtok,
-            output_per_mtok,
-            cache_read_per_mtok,
-            cache_write_per_mtok,
-        } = p;
-        pricing::ModelPrice {
-            input_per_mtok,
-            output_per_mtok,
-            cache_read_per_mtok,
-            cache_write_per_mtok,
+impl From<RateFields> for core_prices::RateFields {
+    fn from(f: RateFields) -> Self {
+        let RateFields {
+            input,
+            output,
+            cache_read,
+            cache_write,
+        } = f;
+        core_prices::RateFields {
+            input,
+            output,
+            cache_read,
+            cache_write,
         }
     }
 }
@@ -1453,23 +1321,169 @@ impl From<ModelPrice> for pricing::ModelPrice {
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct ModelPriceRow {
     pub model: String,
-    pub price: ModelPrice,
+    pub rates: RateFields,
     /// True only for a model Perch ships that still holds the rate Perch
     /// shipped — so a reset is offered exactly where something drifted.
     pub is_default: bool,
+    /// What this model has actually spent, finished; `None` for one this
+    /// index has never seen a turn from.
+    pub usage_label: Option<String>,
 }
 
-impl From<pricing::ModelPriceRow> for ModelPriceRow {
-    fn from(r: pricing::ModelPriceRow) -> Self {
-        let pricing::ModelPriceRow {
+impl From<core_prices::PriceRow> for ModelPriceRow {
+    fn from(r: core_prices::PriceRow) -> Self {
+        let core_prices::PriceRow {
             model,
-            price,
+            rates,
             is_default,
+            usage_label,
         } = r;
         ModelPriceRow {
             model,
-            price: price.into(),
+            rates: rates.into(),
             is_default,
+            usage_label,
+        }
+    }
+}
+
+/// A model with recorded turns and no price row — the gap that makes real
+/// tokens cost a confident nothing.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct UnpricedModel {
+    pub model: String,
+    pub tokens_label: String,
+}
+
+impl From<core_prices::UnpricedModel> for UnpricedModel {
+    fn from(u: core_prices::UnpricedModel) -> Self {
+        let core_prices::UnpricedModel {
+            model,
+            tokens_label,
+        } = u;
+        UnpricedModel {
+            model,
+            tokens_label,
+        }
+    }
+}
+
+/// The whole prices pane, returned by every one of the four price calls so a
+/// shell adopts one value and never re-reads to see its own write — the
+/// table *and* what the table is still missing, which cannot be allowed to
+/// disagree with each other.
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct PricesModel {
+    pub header: String,
+    pub rows: Vec<ModelPriceRow>,
+    pub unpriced: Vec<UnpricedModel>,
+    pub unpriced_summary: Option<String>,
+    pub notes: Vec<String>,
+    pub reset_warning: String,
+}
+
+impl From<core_prices::PricesModel> for PricesModel {
+    fn from(m: core_prices::PricesModel) -> Self {
+        let core_prices::PricesModel {
+            header,
+            rows,
+            unpriced,
+            unpriced_summary,
+            notes,
+            reset_warning,
+        } = m;
+        PricesModel {
+            header,
+            rows: rows.into_iter().map(Into::into).collect(),
+            unpriced: unpriced.into_iter().map(Into::into).collect(),
+            unpriced_summary,
+            notes,
+            reset_warning,
+        }
+    }
+}
+
+// --- The advanced pane ----------------------------------------------------
+
+/// One read-only fact. `reveal_path` is `Some` only where the value names
+/// something that is actually on disk, so Reveal is offered exactly where it
+/// would land somewhere.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FactRow {
+    pub label: String,
+    pub value: String,
+    pub reveal_path: Option<String>,
+}
+
+impl From<core_advanced::FactRow> for FactRow {
+    fn from(r: core_advanced::FactRow) -> Self {
+        let core_advanced::FactRow {
+            label,
+            value,
+            reveal_path,
+        } = r;
+        FactRow {
+            label,
+            value,
+            reveal_path,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FactGroup {
+    pub heading: String,
+    pub rows: Vec<FactRow>,
+}
+
+impl From<core_advanced::FactGroup> for FactGroup {
+    fn from(g: core_advanced::FactGroup) -> Self {
+        let core_advanced::FactGroup { heading, rows } = g;
+        FactGroup {
+            heading,
+            rows: rows.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// A link the About group offers. The URL is composed in Rust because the
+/// app's Swift may not contain an absolute URL at all — CI forbids one there,
+/// which is exactly how a shell stays unable to talk to anything but this
+/// library.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct LinkRow {
+    pub label: String,
+    pub url: String,
+}
+
+impl From<core_advanced::LinkRow> for LinkRow {
+    fn from(l: core_advanced::LinkRow) -> Self {
+        let core_advanced::LinkRow { label, url } = l;
+        LinkRow { label, url }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct AdvancedModel {
+    pub groups: Vec<FactGroup>,
+    pub links: Vec<LinkRow>,
+    pub reindex_help: String,
+    pub reset_warning: String,
+}
+
+impl From<core_advanced::AdvancedModel> for AdvancedModel {
+    fn from(m: core_advanced::AdvancedModel) -> Self {
+        let core_advanced::AdvancedModel {
+            groups,
+            links,
+            reindex_help,
+            reset_warning,
+        } = m;
+        AdvancedModel {
+            groups: groups.into_iter().map(Into::into).collect(),
+            links: links.into_iter().map(Into::into).collect(),
+            reindex_help,
+            reset_warning,
         }
     }
 }
@@ -1564,6 +1578,13 @@ fn db_err(e: impl std::fmt::Display) -> PerchError {
     PerchError::Database {
         message: e.to_string(),
     }
+}
+
+/// A value the user typed that Perch will not store, carrying the sentence
+/// composed where the refusal happened. Never a generic "invalid input": the
+/// point of refusing is telling the person which box and what about it.
+fn setting_err(message: String) -> PerchError {
+    PerchError::Setting { message }
 }
 
 /// Perch's own database. Never inside the Claude Code config dir.
@@ -1814,15 +1835,6 @@ pub fn waiting_after_minutes_label(minutes: u32) -> String {
     core_ui_settings::waiting_after_minutes_label(minutes)
 }
 
-/// The settings a first run starts from. Exported so a shell showing a
-/// control before its model has loaded can seed it from Rust's own default
-/// instead of re-declaring one of its own — a literal in the shell is a
-/// second source of truth that drifts the moment this one changes.
-#[uniffi::export]
-pub fn default_settings() -> Settings {
-    perch_core::settings::Settings::default().into()
-}
-
 #[uniffi::export]
 impl Perch {
     /// `config_dir: None` resolves per spec §3 (CLAUDE_CONFIG_DIR → XDG →
@@ -2051,26 +2063,18 @@ impl Perch {
         perch_core::actions::TerminalCommand::open(&cwd).into()
     }
 
-    /// Today's settings, the file they came from, and anything wrong with
-    /// that file. Never fails outright — see `settings::store::load`.
-    pub fn settings(&self) -> SettingsModel {
-        core_ui_settings::build_settings(&self.config_path).into()
-    }
-
-    /// Save `s` to disk, format-preserving, then read it straight back —
-    /// so the returned model is exactly what a fresh `settings()` call
-    /// would see, including any clamp `load` applies and the note it earns.
-    pub fn save_settings(&self, s: Settings) -> Result<SettingsModel, PerchError> {
-        // Merge over what is on disk rather than over defaults: this record
-        // mirrors eight of the file's twenty-six keys, and the other
-        // eighteen must survive a save that never mentioned them.
-        let on_disk = settings::store::load(&self.config_path).settings;
-        settings::store::save(&self.config_path, &s.merged_onto(on_disk)).map_err(|e| {
-            PerchError::Io {
-                message: e.to_string(),
-            }
-        })?;
-        Ok(self.settings())
+    /// Which terminal Resume and Open should launch, as the settings file
+    /// has it right now.
+    ///
+    /// Read at the moment of launch rather than cached by the shell, so a
+    /// change made in the settings window — or hand-edited into
+    /// `config.toml` — takes effect on the very next launch. The one
+    /// setting a shell reads on its own, because it is the one setting that
+    /// names something only the shell can do.
+    pub fn preferred_terminal(&self) -> String {
+        settings::store::load(&self.config_path)
+            .settings
+            .preferred_terminal
     }
 
     /// The diagnostics pane's view-model: where Perch thinks the Claude Code
@@ -2115,9 +2119,21 @@ impl Perch {
     /// sends keystrokes and draws what comes back; a filter written in a
     /// shell is a second copy of every label and every help string, and the
     /// copy is what goes stale when a row is renamed.
-    pub fn settings_schema(&self, query: Option<String>) -> Vec<SettingsPane> {
-        let loaded = settings::store::load(&self.config_path).settings;
-        self.panes(&loaded, query.as_deref())
+    pub fn settings_schema(&self, query: Option<String>) -> SettingsResult {
+        let loaded = settings::store::load(&self.config_path);
+        // A file that would not parse at all is reported alongside the
+        // clamps rather than swallowed: Perch is running on defaults, and a
+        // window that shows those defaults without a word looks like it lost
+        // the user's settings.
+        let notes = loaded
+            .error
+            .into_iter()
+            .chain(loaded.notes)
+            .collect::<Vec<String>>();
+        SettingsResult {
+            panes: self.panes(&loaded.settings, query.as_deref()),
+            notes,
+        }
     }
 
     /// Store one value under one key, and report the schema that resulted.
@@ -2160,8 +2176,14 @@ impl Perch {
 
     // --- The price table --------------------------------------------------
 
-    /// Every model price Perch holds, shipped or user-added.
-    pub fn prices(&self) -> Result<Vec<ModelPriceRow>, PerchError> {
+    /// The prices pane in full: every rate Perch holds, and every model in
+    /// use it holds no rate for.
+    ///
+    /// The two travel together on purpose. A price table that shows only
+    /// what it knows is exactly how three of this user's six models came to
+    /// cost a confident $0 — the gap is invisible from inside the table, so
+    /// it is reported beside it.
+    pub fn prices(&self) -> Result<PricesModel, PerchError> {
         let database = self.open_db()?;
         // Seed before reading: the settings window can be opened before the
         // first index has run, and an empty price table would read as "Perch
@@ -2169,37 +2191,89 @@ impl Perch {
         // never overwrites a row that already exists, so this is idempotent
         // and never undoes an edit.
         pricing::seed_default_prices(&database).map_err(db_err)?;
-        self.price_rows(&database)
+        self.prices_model(&database)
     }
 
     /// Store a rate, for a built-in model or one the user added, returning
-    /// the table that resulted so the shell never re-reads to see its own
+    /// the pane that resulted so the shell never re-reads to see its own
     /// write.
-    pub fn set_price(
-        &self,
-        model: String,
-        price: ModelPrice,
-    ) -> Result<Vec<ModelPriceRow>, PerchError> {
+    ///
+    /// The rates arrive as the text the user typed and are parsed here. A
+    /// field that is not a number — or is negative, or is blank — is refused
+    /// with a sentence naming the column, and **nothing is written**: the
+    /// rate already stored stays in force rather than being replaced by
+    /// whatever a shell's own parser made of it. Cost display must never
+    /// quietly become a number nobody entered.
+    pub fn set_price(&self, model: String, rates: RateFields) -> Result<PricesModel, PerchError> {
+        let id = core_prices::parse_model_id(&model).map_err(setting_err)?;
+        let price = core_prices::parse_rates(&rates.into()).map_err(setting_err)?;
         let database = self.open_db()?;
-        pricing::set_price(&database, &model, price.into()).map_err(db_err)?;
-        self.price_rows(&database)
+        pricing::set_price(&database, &id, price).map_err(db_err)?;
+        self.prices_model(&database)
     }
 
     /// Forget a model's rate — "I do not know what this costs", which is a
     /// different claim from "it costs nothing". Its turns keep counting their
-    /// tokens and contribute no cost.
-    pub fn remove_price(&self, model: String) -> Result<Vec<ModelPriceRow>, PerchError> {
+    /// tokens and contribute no cost, and the model reappears in
+    /// `PricesModel::unpriced` if it has any.
+    pub fn remove_price(&self, model: String) -> Result<PricesModel, PerchError> {
         let database = self.open_db()?;
         pricing::remove_price(&database, &model).map_err(db_err)?;
-        self.price_rows(&database)
+        self.prices_model(&database)
     }
 
     /// Restore the shipped table exactly: every edit undone and every model
-    /// the user added gone.
-    pub fn reset_prices(&self) -> Result<Vec<ModelPriceRow>, PerchError> {
+    /// the user added gone. One transaction in core, so a failure leaves the
+    /// table it started with rather than half of it.
+    pub fn reset_prices(&self) -> Result<PricesModel, PerchError> {
         let database = self.open_db()?;
         pricing::reset_prices_to_defaults(&database).map_err(db_err)?;
-        self.price_rows(&database)
+        self.prices_model(&database)
+    }
+
+    // --- The advanced pane ------------------------------------------------
+
+    /// Where Perch keeps its two files, what is in the index, and what this
+    /// build is. An index that will not open still yields the whole pane,
+    /// with dashes for the rows it could not fill — someone whose index is
+    /// broken is precisely who needs the paths and the reindex button.
+    pub fn advanced(&self) -> AdvancedModel {
+        let db = db::open(&self.db_path).ok();
+        core_advanced::build_advanced(
+            db.as_ref(),
+            &self.config_path,
+            &self.db_path,
+            &self.config_dir(),
+            now_ms(),
+        )
+        .into()
+    }
+
+    /// Re-read every session file into the index, now, on this thread — the
+    /// shell calls it off its own main thread, as it does every other read
+    /// here.
+    ///
+    /// Returns the refreshed pane, so the new counts and the new "last
+    /// written" are the ones this run produced. A failure is an error rather
+    /// than a quietly unchanged pane: a reindex that did nothing must never
+    /// look like one that worked.
+    pub fn reindex_now(&self) -> Result<AdvancedModel, PerchError> {
+        self.this().reindex();
+        if let Some(message) = self.reindex_error.lock().unwrap().clone() {
+            return Err(PerchError::Io { message });
+        }
+        Ok(self.advanced())
+    }
+
+    /// Put every setting back to its factory value.
+    ///
+    /// One write of one whole `Settings`, not twenty-six writes: a reset
+    /// that failed halfway would leave a configuration that is neither what
+    /// Perch ships nor what the user chose, which is worse than not
+    /// resetting at all. Reports the schema that resulted, exactly as
+    /// `reset_pane` does.
+    pub fn reset_all_settings(&self) -> Result<SettingsResult, PerchError> {
+        self.save_and_report(&settings::Settings::default())
     }
 
     /// The terminals this machine has, plus whatever the settings file names
@@ -2432,14 +2506,12 @@ impl Perch {
         })
     }
 
-    /// Every price row, mirrored. Shared by all four price methods so each
-    /// returns the table that resulted rather than making the shell re-read.
-    fn price_rows(&self, database: &Db) -> Result<Vec<ModelPriceRow>, PerchError> {
-        Ok(pricing::all_prices(database)
-            .map_err(db_err)?
-            .into_iter()
-            .map(Into::into)
-            .collect())
+    /// The prices pane, mirrored. Shared by all four price methods so each
+    /// returns the pane that resulted rather than making the shell re-read —
+    /// and so the table and its list of unpriced models are always taken in
+    /// the same breath from the same database.
+    fn prices_model(&self, database: &Db) -> Result<PricesModel, PerchError> {
+        Ok(core_prices::build_prices(database).map_err(db_err)?.into())
     }
 
     /// The facts `build_schema` needs but does not own, taken from this
@@ -2510,22 +2582,21 @@ impl Perch {
             .and_then(|r| u32::try_from(r.len()).ok())
             .unwrap_or(0);
 
-        let priced = db
+        let priced_models = db
             .as_ref()
             .and_then(|d| pricing::all_prices(d).ok())
-            .unwrap_or_default();
-        let priced_models = u32::try_from(priced.len()).unwrap_or(u32::MAX);
-        let priced_names: HashSet<&str> = priced.iter().map(|r| r.model.as_str()).collect();
+            .map(|rows| u32::try_from(rows.len()).unwrap_or(u32::MAX))
+            .unwrap_or(0);
+        // Counted by the same function that builds the list the Prices pane
+        // puts in front of the user, so "3 unpriced" in the sidebar, "3
+        // models in use have no price" in the preview and the three rows
+        // offering to fix it can never be three different answers. In
+        // particular it skips zero-token entries like `<synthetic>`, which
+        // cost nothing and cannot be priced.
         let unpriced_models_in_use = db
             .as_ref()
-            .and_then(|d| query::usage_by_model(d).ok())
-            .map(|used| {
-                let n = used
-                    .iter()
-                    .filter(|(model, _, _)| !priced_names.contains(model.as_str()))
-                    .count();
-                u32::try_from(n).unwrap_or(u32::MAX)
-            })
+            .and_then(|d| core_prices::unpriced_count(d).ok())
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
             .unwrap_or(0);
 
         // The Diagnostics pane already reads every session record and states
@@ -2928,63 +2999,6 @@ mod tests {
     }
 
     #[test]
-    fn settings_is_reachable_and_starts_at_the_documented_defaults() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tempfile::tempdir().unwrap();
-        let _guard = DataDirGuard::set(data.path());
-        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
-
-        let model = perch.settings();
-        assert_eq!(
-            model.settings.poll_seconds, 5,
-            "a first run has no file yet"
-        );
-        assert!(model.notes.is_empty());
-        assert!(model.error.is_none());
-        assert!(model.config_path.ends_with("config.toml"));
-    }
-
-    #[test]
-    fn save_settings_round_trips_through_a_fresh_settings_call() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tempfile::tempdir().unwrap();
-        let _guard = DataDirGuard::set(data.path());
-        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
-
-        let mut s = perch.settings().settings;
-        s.poll_seconds = 30;
-        s.waiting_enabled = true;
-        s.waiting_after_minutes = 20;
-        s.menu_bar_display = MenuBarDisplay::CountAndWaiting;
-
-        let saved = perch.save_settings(s.clone()).unwrap();
-        assert_eq!(
-            saved.settings, s,
-            "save_settings returns exactly what a fresh read sees"
-        );
-
-        let reread = perch.settings();
-        assert_eq!(
-            reread.settings, s,
-            "a later, independent settings() call must see what was saved"
-        );
-    }
-
-    #[test]
-    fn save_settings_clamps_out_of_range_values_and_says_so() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tempfile::tempdir().unwrap();
-        let _guard = DataDirGuard::set(data.path());
-        let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
-
-        let mut s = perch.settings().settings;
-        s.poll_seconds = 0;
-        let saved = perch.save_settings(s).unwrap();
-        assert_eq!(saved.settings.poll_seconds, 1, "clamped, not rejected");
-        assert_eq!(saved.notes.len(), 1);
-    }
-
-    #[test]
     fn diagnostics_is_reachable_against_an_empty_config_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
@@ -3054,9 +3068,12 @@ mod tests {
         };
 
         let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
-        let mut s = perch.settings().settings;
-        s.waiting_after_minutes = 25;
-        perch.save_settings(s).unwrap();
+        perch
+            .set_setting(
+                SettingKey::WaitingAfterMinutes,
+                SettingValue::Int { value: 25 },
+            )
+            .unwrap();
 
         let detail = perch.project_detail(project_id).unwrap();
         assert_eq!(
@@ -3084,10 +3101,19 @@ mod tests {
         let _guard = DataDirGuard::set(data.path());
         let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
 
-        let mut s = perch.settings().settings;
-        s.waiting_enabled = true;
-        s.waiting_after_minutes = 1; // the shortest allowed threshold
-        perch.save_settings(s).unwrap();
+        perch
+            .set_setting(
+                SettingKey::WaitingEnabled,
+                SettingValue::Bool { value: true },
+            )
+            .unwrap();
+        // The shortest allowed threshold.
+        perch
+            .set_setting(
+                SettingKey::WaitingAfterMinutes,
+                SettingValue::Int { value: 1 },
+            )
+            .unwrap();
 
         let since_ms = now_ms() - 2 * 60_000; // 2 minutes ago: past the 1-minute threshold
         let session = live::LiveSession {
@@ -3157,10 +3183,18 @@ mod tests {
         assert_ne!(work_api, personal_api);
 
         let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
-        let mut s = perch.settings().settings;
-        s.waiting_enabled = true;
-        s.waiting_after_minutes = 1;
-        perch.save_settings(s).unwrap();
+        perch
+            .set_setting(
+                SettingKey::WaitingEnabled,
+                SettingValue::Bool { value: true },
+            )
+            .unwrap();
+        perch
+            .set_setting(
+                SettingKey::WaitingAfterMinutes,
+                SettingValue::Int { value: 1 },
+            )
+            .unwrap();
 
         let since_ms = now_ms() - 2 * 60_000;
         let waiting = |id: &str, cwd: &str| live::LiveSession {
@@ -3216,10 +3250,18 @@ mod tests {
         let _guard = DataDirGuard::set(data.path());
         let perch = Perch::new(Some(tmp.path().to_string_lossy().into_owned())).unwrap();
 
-        let mut s = perch.settings().settings;
-        s.waiting_enabled = true;
-        s.waiting_after_minutes = 1;
-        perch.save_settings(s).unwrap();
+        perch
+            .set_setting(
+                SettingKey::WaitingEnabled,
+                SettingValue::Bool { value: true },
+            )
+            .unwrap();
+        perch
+            .set_setting(
+                SettingKey::WaitingAfterMinutes,
+                SettingValue::Int { value: 1 },
+            )
+            .unwrap();
 
         let since_ms = now_ms() - 2 * 60_000;
         let session = live::LiveSession {
@@ -3326,7 +3368,9 @@ mod tests {
             "the ordinary resolution order must take over, not the unusable override"
         );
 
-        let notes = perch.settings().notes;
+        // And the settings window must be told why, on the read that opens
+        // it — not only after some later write happens to mention it.
+        let notes = perch.settings_schema(None).notes;
         assert!(
             notes.iter().any(|n| n.contains("claude_config_dir")),
             "and the settings window must be told why: {notes:?}"
@@ -3557,7 +3601,7 @@ mod tests {
         }
 
         // And it survives the trip to disk, not just this one call's schema.
-        let reread = p.settings_schema(None);
+        let reread = p.settings_schema(None).panes;
         match control_for(&reread, SettingKey::PreferredTerminal) {
             Control::Choice { selected, .. } => assert_eq!(selected, "Ghostty"),
             other => panic!("the preferred terminal is drawn by {other:?}, not a choice"),
@@ -3578,8 +3622,8 @@ mod tests {
     #[test]
     fn a_query_is_matched_in_rust_so_the_shell_never_does_its_own_filtering() {
         let (p, _guard, _data, _claude) = perch_in_temp();
-        let all = p.settings_schema(None);
-        let hits = p.settings_schema(Some("terminal".to_string()));
+        let all = p.settings_schema(None).panes;
+        let hits = p.settings_schema(Some("terminal".to_string())).panes;
         assert!(
             hits.len() < all.len(),
             "a query must narrow the schema: {} of {}",
@@ -3588,6 +3632,7 @@ mod tests {
         );
         assert!(
             p.settings_schema(Some("zzzznothing".to_string()))
+                .panes
                 .is_empty(),
             "a query that matches nothing returns nothing, never everything"
         );
@@ -3621,7 +3666,7 @@ mod tests {
         // smaller one — so at least one preview must be populated from data
         // this engine actually has.
         let (p, _guard, _data, _claude) = perch_in_temp();
-        let panes = p.settings_schema(None);
+        let panes = p.settings_schema(None).panes;
 
         let general = panes
             .iter()
@@ -3646,7 +3691,7 @@ mod tests {
             "this machine has at least Terminal.app"
         );
         assert!(
-            !p.prices().unwrap().is_empty(),
+            !p.prices().unwrap().rows.is_empty(),
             "the price table is seeded before it is shown"
         );
     }
@@ -3655,34 +3700,179 @@ mod tests {
     fn a_price_edit_and_its_reset_both_report_the_table_that_resulted() {
         let (p, _guard, _data, _claude) = perch_in_temp();
         let before = p.prices().unwrap();
-        let model = before[0].model.clone();
+        let model = before.rows[0].model.clone();
+        assert!(
+            before.header.contains("per million tokens"),
+            "the one sentence that stops a millionfold error must be on the pane: {}",
+            before.header
+        );
 
         let after = p
             .set_price(
                 model.clone(),
-                ModelPrice {
-                    input_per_mtok: 1.5,
-                    output_per_mtok: 2.5,
-                    cache_read_per_mtok: 0.5,
-                    cache_write_per_mtok: 3.5,
+                RateFields {
+                    input: "1.5".into(),
+                    output: "2.5".into(),
+                    cache_read: "0.5".into(),
+                    cache_write: "3.5".into(),
                 },
             )
             .unwrap();
-        let edited = after.iter().find(|r| r.model == model).unwrap();
-        assert_eq!(edited.price.input_per_mtok, 1.5);
+        let edited = after.rows.iter().find(|r| r.model == model).unwrap();
+        assert_eq!(edited.rates.input, "1.5");
         assert!(!edited.is_default, "an edited row has drifted from default");
 
         let removed = p.remove_price(model.clone()).unwrap();
-        assert!(!removed.iter().any(|r| r.model == model));
+        assert!(!removed.rows.iter().any(|r| r.model == model));
 
         let reset = p.reset_prices().unwrap();
         assert_eq!(
             reset
+                .rows
                 .iter()
                 .find(|r| r.model == model)
                 .map(|r| r.is_default),
             Some(true),
             "reset restores the shipped table exactly"
         );
+    }
+
+    #[test]
+    fn a_rate_that_will_not_parse_changes_nothing_and_says_which_box() {
+        let (p, _guard, _data, _claude) = perch_in_temp();
+        let before = p.prices().unwrap();
+        let model = before.rows[0].model.clone();
+        let stored = before.rows[0].rates.clone();
+
+        let outcome = p.set_price(
+            model.clone(),
+            RateFields {
+                input: "15".into(),
+                output: "seventy five".into(),
+                cache_read: "1.5".into(),
+                cache_write: "18.75".into(),
+            },
+        );
+
+        match outcome {
+            Err(PerchError::Setting { message }) => assert!(
+                message.starts_with("Output is"),
+                "the refusal must name the column: {message}"
+            ),
+            other => panic!("a rate that is not a number must be refused: {other:?}"),
+        }
+        assert_eq!(
+            p.prices().unwrap().rows[0].rates,
+            stored,
+            "a refused edit must leave the stored rate exactly as it was"
+        );
+    }
+
+    #[test]
+    fn a_model_in_use_with_no_price_is_reported_beside_the_table_that_lacks_it() {
+        let (p, _guard, data, _claude) = perch_in_temp();
+        {
+            let database = db::open(&data.path().join("index.db")).unwrap();
+            database
+                .conn()
+                .execute_batch(
+                    "INSERT INTO projects (id, slug, real_path) VALUES (1, 'p', '/p');
+                     INSERT INTO sessions (id, project_id, file_path)
+                         VALUES ('s1', 1, '/p/s1.jsonl');
+                     INSERT INTO turns (session_id, ts, model, input, output)
+                         VALUES ('s1', 1, 'claude-fable-5-1', 775336909, 0),
+                                ('s1', 2, '<synthetic>', 0, 0);",
+                )
+                .unwrap();
+        }
+
+        let m = p.prices().unwrap();
+        assert_eq!(
+            m.unpriced
+                .iter()
+                .map(|u| u.model.as_str())
+                .collect::<Vec<_>>(),
+            ["claude-fable-5-1"],
+            "a zero-token entry is not a model anyone can price"
+        );
+        assert!(m.unpriced_summary.is_some());
+
+        // And the sidebar badge counts the same thing the pane lists.
+        let panes = p.settings_schema(None).panes;
+        let prices_pane = panes.iter().find(|pane| pane.id == PaneId::Prices).unwrap();
+        assert_eq!(prices_pane.attention.as_deref(), Some("1 unpriced"));
+
+        // Pricing it from the pane closes the gap without a re-read.
+        let after = p
+            .set_price(
+                "claude-fable-5-1".into(),
+                RateFields {
+                    input: "15".into(),
+                    output: "75".into(),
+                    cache_read: "1.5".into(),
+                    cache_write: "18.75".into(),
+                },
+            )
+            .unwrap();
+        assert!(after.unpriced.is_empty());
+        assert!(after.rows.iter().any(|r| r.model == "claude-fable-5-1"));
+    }
+
+    #[test]
+    fn the_advanced_pane_reports_this_machines_real_paths_and_counts() {
+        let (p, _guard, data, _claude) = perch_in_temp();
+        let m = p.advanced();
+
+        let rows: Vec<&FactRow> = m.groups.iter().flat_map(|g| g.rows.iter()).collect();
+        let value = |label: &str| {
+            rows.iter()
+                .find(|r| r.label == label)
+                .unwrap_or_else(|| panic!("no {label} row"))
+                .value
+                .clone()
+        };
+        assert!(value("Index file").starts_with(&data.path().display().to_string()));
+        assert_eq!(
+            value("Sessions indexed"),
+            "0",
+            "a fresh index is honestly empty"
+        );
+        assert_eq!(value("Licence"), "MIT");
+        assert!(!m.links.is_empty(), "About carries somewhere to go");
+        assert!(m.reset_warning.contains("config.toml"));
+    }
+
+    #[test]
+    fn resetting_everything_restores_every_pane_at_once() {
+        let (p, _guard, _data, _claude) = perch_in_temp();
+        p.set_setting(SettingKey::PollSeconds, SettingValue::Int { value: 30 })
+            .unwrap();
+        p.set_setting(SettingKey::RecentLimit, SettingValue::Int { value: 9 })
+            .unwrap();
+
+        let out = p.reset_all_settings().unwrap();
+
+        assert_eq!(stepper_value(&out.panes, SettingKey::PollSeconds), 5);
+        assert_eq!(stepper_value(&out.panes, SettingKey::RecentLimit), 3);
+        assert!(
+            out.panes
+                .iter()
+                .flat_map(|pane| pane.groups.iter())
+                .flat_map(|g| g.rows.iter())
+                .all(|r| r.is_default),
+            "a reset that leaves anything drifted is a partial reset"
+        );
+    }
+
+    #[test]
+    fn a_reindex_reports_what_it_produced_rather_than_a_silent_no_op() {
+        let (p, _guard, _data, _claude) = perch_in_temp();
+        let m = p
+            .reindex_now()
+            .expect("an empty but readable index reindexes");
+        assert!(m
+            .groups
+            .iter()
+            .any(|g| g.heading == "Index" && !g.rows.is_empty()));
     }
 }

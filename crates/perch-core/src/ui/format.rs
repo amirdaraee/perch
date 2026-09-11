@@ -40,6 +40,23 @@ pub fn human_elapsed(ms: i64) -> String {
     }
 }
 
+/// A file size as a person reads it. Decimal units, because that is what
+/// Finder shows for the same file and a settings pane that disagrees with
+/// Finder about the size of one file on disk is just wrong twice.
+pub fn human_bytes(n: u64) -> String {
+    const KB: f64 = 1_000.0;
+    let n = n as f64;
+    if n < KB {
+        format!("{n:.0} bytes")
+    } else if n < KB * KB {
+        format!("{:.0} KB", n / KB)
+    } else if n < KB * KB * KB {
+        format!("{:.1} MB", n / (KB * KB))
+    } else {
+        format!("{:.1} GB", n / (KB * KB * KB))
+    }
+}
+
 /// A missing timestamp is `0` on the wire. Formatting `now - 0` renders ~56 years,
 /// so the caller's "absent" must become a dash, never a duration.
 pub fn elapsed_or_dash(now_ms: i64, since_ms: i64) -> String {
@@ -61,6 +78,15 @@ mod tests {
         assert_eq!(human_tokens(1_500), "1.5k");
         assert_eq!(human_tokens(24_221), "24.2k");
         assert_eq!(human_tokens(4_100_000), "4.1M");
+    }
+
+    #[test]
+    fn bytes_read_the_way_finder_reads_them() {
+        assert_eq!(human_bytes(0), "0 bytes");
+        assert_eq!(human_bytes(512), "512 bytes");
+        assert_eq!(human_bytes(2_048), "2 KB");
+        assert_eq!(human_bytes(12_400_000), "12.4 MB");
+        assert_eq!(human_bytes(3_200_000_000), "3.2 GB");
     }
 
     #[test]
