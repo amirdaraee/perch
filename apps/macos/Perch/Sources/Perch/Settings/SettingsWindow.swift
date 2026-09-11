@@ -162,19 +162,30 @@ struct SettingsRootView: View {
 
     /// Per-viewer window state, not settings: neither belongs in
     /// `config.toml`, which is the user's own hand-editable file.
-    @AppStorage("settings.selectedPane") private var selectedPaneKey: String = "general"
-    @AppStorage("settings.sidebarWidth") private var sidebarWidth: Double = 228
-    /// The remembered width, snapshotted once per presentation. Feeding the
-    /// live `sidebarWidth` straight back into `ideal:` would make the column
-    /// argue with the drag that is setting it.
-    @State private var idealSidebarWidth: Double?
+    @AppStorage("settings.selectedPane") private var storedPaneKey: String = "general"
+
+    /// `List(selection:)` needs an optional; `@AppStorage` will not hold one.
+    /// Kept in sync with `storedPaneKey` so the choice survives a reopen.
+    @State private var selectedPaneKey: String?
 
     var body: some View {
         NavigationSplitView {
-            sidebar
-                .navigationSplitViewColumnWidth(
-                    min: 200, ideal: idealSidebarWidth ?? sidebarWidth, max: 320
-                )
+            // Shaped exactly like `MainWindow/Sidebar.swift`, which works: the
+            // `List` *is* the sidebar column's content, and the column width
+            // modifier goes on the list itself. An earlier version wrapped it
+            // and fed `ideal:` a width the sidebar itself reported back; the
+            // column then rendered nothing at all.
+            List(selection: $selectedPaneKey) {
+                if panes.isEmpty {
+                    emptySidebarNotice
+                } else {
+                    ForEach(panes, id: \.id.key) { pane in
+                        sidebarRow(pane).tag(pane.id.key)
+                    }
+                }
+            }
+            .navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 320)
+            .searchable(text: $query, placement: .sidebar, prompt: "Search settings")
         } detail: {
             detail
         }
@@ -184,33 +195,19 @@ struct SettingsRootView: View {
         .onChange(of: currentPane?.title) { _, title in
             setTitle(title ?? "Settings")
         }
+        .onChange(of: selectedPaneKey) { _, key in
+            // Persist only a real choice. A filtered sidebar that drops the
+            // selected row sets this to nil, and remembering *that* would
+            // reopen the window on whatever pane happened to be first.
+            if let key { storedPaneKey = key }
+        }
         .onAppear {
+            if selectedPaneKey == nil { selectedPaneKey = storedPaneKey }
             setTitle(currentPane?.title ?? "Settings")
-            if idealSidebarWidth == nil { idealSidebarWidth = sidebarWidth }
         }
     }
 
     // MARK: - Sidebar
-
-    /// A bare `List` — not a `List` wrapped in a `VStack` alongside a
-    /// hand-rolled field. `NavigationSplitView`'s sidebar column expects to
-    /// own its content, and wrapping it rendered nothing at all: no rows, no
-    /// field, an empty column beside a detail side that was drawing fine.
-    /// `.searchable` puts the field where macOS puts it, and costs less code.
-    private var sidebar: some View {
-        List(selection: selection) {
-            if panes.isEmpty {
-                emptySidebarNotice
-            } else {
-                ForEach(panes, id: \.id.key) { pane in
-                    sidebarRow(pane).tag(pane.id.key)
-                }
-            }
-        }
-        .listStyle(.sidebar)
-        .searchable(text: $query, placement: .sidebar, prompt: "Search settings")
-        .background(SidebarWidthReporter(width: $sidebarWidth))
-    }
 
     /// Never an empty sidebar. An empty list and a broken window look exactly
     /// alike, and the user has no way to tell which one they are looking at —
@@ -453,14 +450,7 @@ struct SettingsRootView: View {
     /// falls back to whatever the search did return, *without* overwriting
     /// what the user last deliberately chose.
     private var currentPane: SettingsPane? {
-        panes.first { $0.id.key == selectedPaneKey } ?? panes.first
-    }
-
-    private var selection: Binding<String?> {
-        Binding(
-            get: { currentPane?.id.key },
-            set: { key in if let key { selectedPaneKey = key } }
-        )
+        panes.first { $0.id.key == (selectedPaneKey ?? storedPaneKey) } ?? panes.first
     }
 
     // MARK: - Actions handed to the renderer
@@ -701,20 +691,3 @@ private extension PaneId {
     }
 }
 
-/// Remembers how wide the user dragged the sidebar. SwiftUI's
-/// `NavigationSplitView` takes an *ideal* width and hands back no binding for
-/// the width that results, so the only honest way to persist a dragged column
-/// is to measure the one being drawn and feed it back as next time's ideal.
-private struct SidebarWidthReporter: View {
-    @Binding var width: Double
-
-    var body: some View {
-        GeometryReader { proxy in
-            Color.clear
-                .onChange(of: proxy.size.width) { _, w in
-                    guard w > 1 else { return }
-                    width = w
-                }
-        }
-    }
-}
