@@ -52,7 +52,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
                 window.deminiaturize(nil)
             }
             window.makeKeyAndOrderFront(nil)
-            (window.contentView as? NSHostingView<SettingsRootView>)?.rootView = rootView()
+            (window.contentViewController as? NSHostingController<SettingsRootView>)?
+                .rootView = rootView()
             return
         }
 
@@ -64,13 +65,33 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         )
         w.title = "Settings"
         w.titlebarAppearsTransparent = false
-        w.setFrameAutosaveName("PerchSettingsWindow")
-        w.center()
-        w.minSize = NSSize(width: 720, height: 480)
         w.isReleasedWhenClosed = false
         w.delegate = self
         window = w
-        w.contentView = NSHostingView(rootView: rootView())
+        // A *controller*, not a bare `NSHostingView` set as `contentView`.
+        // The view sizes itself to fit its content, and AppKit's origin is
+        // bottom-left — so a tree taller than the content area hangs off the
+        // *top* of the window. That is not theoretical: it shipped. The
+        // sidebar's nine rows and the detail's first two groups were all
+        // above the visible frame, leaving an empty column beside a pane
+        // that began halfway down. A hosting controller is constrained to
+        // the window, and the scrollable parts scroll instead.
+        let host = NSHostingController(rootView: rootView())
+        // Measured, not guessed: without this the split view laid out at its
+        // *content* height — 1465pt inside a 640pt window, at y = -386.5 —
+        // so 438pt of it sat above the visible top. The sidebar's rows and
+        // the detail's first groups were all up there, which is why the
+        // column read as empty and every pane opened halfway down.
+        host.sizingOptions = []
+        w.contentViewController = host
+
+        // Sized *after* the controller is installed: assigning one resizes
+        // the window to the controller's preferred size, which would discard
+        // both the intended size and any frame the user had dragged to.
+        w.minSize = NSSize(width: 720, height: 480)
+        w.setContentSize(NSSize(width: 880, height: 640))
+        w.center()
+        w.setFrameAutosaveName("PerchSettingsWindow")
 
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
@@ -184,12 +205,19 @@ struct SettingsRootView: View {
                     }
                 }
             }
-            .navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 320)
+            .frame(minWidth: 280)
+            .navigationSplitViewColumnWidth(min: 280, ideal: 300, max: 420)
             .searchable(text: $query, placement: .sidebar, prompt: "Search settings")
         } detail: {
             detail
         }
-        .frame(minWidth: 720, minHeight: 480)
+        // An ideal *and* an unbounded max. With only a `min`, the split
+        // view reported its content's height as its own ideal — 1465pt —
+        // and the host centred that inside 640pt, hanging 438pt off the top.
+        .frame(
+            minWidth: 720, idealWidth: 880, maxWidth: .infinity,
+            minHeight: 480, idealHeight: 640, maxHeight: .infinity
+        )
         .task(id: refreshToken) { await load() }
         .onChange(of: query) { _, q in search(q) }
         .onChange(of: currentPane?.title) { _, title in
@@ -266,7 +294,14 @@ struct SettingsRootView: View {
 
     @ViewBuilder
     private var detail: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        // A scroll container, because `maxHeight: .infinity` with a top
+        // alignment stretches the *frame* while still handing the child its
+        // ideal height. The Form inside asked for all 1327pt of its rows,
+        // the split view grew to 1465pt to match, and the host centred that
+        // inside 640pt — hanging 438pt of sidebar and detail off the top of
+        // the window. Measured, not guessed.
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
             if let loadError, panes.isEmpty {
                 banner(loadError, color: .red)
             }
@@ -296,7 +331,9 @@ struct SettingsRootView: View {
                 Spacer()
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     /// Perch's differentiator, and so the first thing on the detail side
