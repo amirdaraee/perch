@@ -23,10 +23,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         super.init()
         menu.delegate = self
         statusItem.menu = menu
-        if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "bird", accessibilityDescription: "Perch")
-            button.imagePosition = .imageLeading
-        }
+        statusItem.button?.imagePosition = .imageLeading
         engine.$model
             .receive(on: DispatchQueue.main)
             .sink { [weak self] in self?.render($0) }
@@ -40,6 +37,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func render(_ model: PopoverModel?) {
         statusItem.button?.title = model?.trayTitle ?? ""
+        applyIcon(model)
         menu.removeAllItems()
 
         guard let model else {
@@ -75,6 +73,30 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         addQuit()
     }
 
+    /// Draw the glyph the model chose, dimmed when the data behind it has
+    /// gone stale. `staleness` is a value whose presence *is* the flag, and
+    /// its `label` is a finished sentence from Rust — rendered verbatim as
+    /// the item's accessibility description, never re-phrased here.
+    private func applyIcon(_ model: PopoverModel?) {
+        guard let button = statusItem.button else { return }
+        let stale = model?.staleness
+        // No model yet means the engine has not emitted once (a startup
+        // failure, in practice); the shipped default glyph is the honest
+        // thing to draw until it does.
+        let icon = model?.menuBarIcon ?? .bird
+        let image = NSImage(
+            systemSymbolName: icon.systemSymbolName,
+            accessibilityDescription: stale?.label ?? "Perch"
+        )
+        // Template rendering is what makes the glyph follow the menu bar's
+        // own light/dark appearance instead of staying one fixed colour.
+        image?.isTemplate = true
+        button.image = image
+        // `appearsDisabled` fades image and title together without making
+        // the item unclickable — the menu still opens while data is stale.
+        button.appearsDisabled = stale != nil
+    }
+
     private func add<V: View>(_ view: V) {
         let item = NSMenuItem()
         let host = NSHostingView(rootView: view)
@@ -102,4 +124,22 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func openWindow() { onOpenWindow?() }
     @objc private func openSettings() { onOpenSettings?() }
     @objc private func quit() { NSApp.terminate(nil) }
+}
+
+/// The SF Symbol each menu-bar variant draws as. This mapping lives in Swift
+/// on purpose: what a glyph is *called* is the one genuinely macOS-specific
+/// fact in the chain, and `MenuBarIcon` crosses the FFI as a variant so Rust
+/// never has to know it. All four names were checked against this SDK.
+private extension MenuBarIcon {
+    var systemSymbolName: String {
+        switch self {
+        case .bird: "bird"
+        case .binoculars: "binoculars"
+        // The literal dot: a small filled circle, unadorned.
+        case .dot: "circle.fill"
+        // Level bars, not a hamburger — this sits beside a session count, so
+        // `line.3.horizontal` would read as "menu" rather than "activity".
+        case .bars: "chart.bar.fill"
+        }
+    }
 }

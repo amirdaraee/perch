@@ -2,7 +2,7 @@
 
 use crate::db::Db;
 use crate::live::{LiveSession, SessionStatus};
-use crate::settings::{MenuBarDisplay, RowDensity, Settings};
+use crate::settings::{MenuBarDisplay, MenuBarIcon, RowDensity, Settings};
 use crate::ui::format::{elapsed_or_dash, human_cost, human_elapsed, human_tokens};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -103,6 +103,10 @@ pub struct PopoverModel {
     /// How much breathing room each row gets. Drawing is the shell's; the
     /// choice is not.
     pub row_density: RowDensity,
+    /// Which glyph the menu bar item draws. The variant crosses, never a
+    /// symbol name: what an SF Symbol is called is the one genuinely
+    /// macOS-specific fact here, and it belongs in the macOS shell.
+    pub menu_bar_icon: MenuBarIcon,
 }
 
 const DASH: &str = "—";
@@ -228,6 +232,7 @@ impl PopoverModel {
             show_working: defaults.show_working,
             show_recent: defaults.show_recent,
             row_density: defaults.row_density,
+            menu_bar_icon: defaults.menu_bar_icon,
         }
     }
 }
@@ -459,6 +464,7 @@ pub fn build_model(
         show_working: settings.show_working,
         show_recent: settings.show_recent,
         row_density: settings.row_density,
+        menu_bar_icon: settings.menu_bar_icon,
     }
 }
 
@@ -1190,6 +1196,24 @@ mod tests {
         assert!(
             m.recent.is_empty(),
             "a hidden section is not queried, let alone drawn"
+        );
+    }
+
+    #[test]
+    fn the_chosen_menu_bar_icon_reaches_the_model() {
+        let s = Settings {
+            menu_bar_icon: MenuBarIcon::Binoculars,
+            ..Settings::default()
+        };
+        assert_eq!(
+            build_model(None, &[], 10_000, None, &s).menu_bar_icon,
+            MenuBarIcon::Binoculars,
+            "the shell maps the variant to a glyph; it must not read the setting itself"
+        );
+        assert_eq!(
+            PopoverModel::empty().menu_bar_icon,
+            Settings::default().menu_bar_icon,
+            "the pre-first-tick model draws the shipped default, not a second one"
         );
     }
 
