@@ -86,6 +86,30 @@ impl From<settings::RowDensity> for RowDensity {
     }
 }
 
+/// Mirrors `perch_core::settings::MenuBarIcon`. The *variant* crosses, never a
+/// symbol name: what a glyph is called is platform-specific trivia, and the
+/// macOS shell is the only thing entitled to know it. Like `RowDensity`, it
+/// rides the model rather than a `Settings` record, so the menu bar and the
+/// settings window cannot disagree about which icon is on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MenuBarIcon {
+    Bird,
+    Binoculars,
+    Dot,
+    Bars,
+}
+
+impl From<settings::MenuBarIcon> for MenuBarIcon {
+    fn from(i: settings::MenuBarIcon) -> Self {
+        match i {
+            settings::MenuBarIcon::Bird => MenuBarIcon::Bird,
+            settings::MenuBarIcon::Binoculars => MenuBarIcon::Binoculars,
+            settings::MenuBarIcon::Dot => MenuBarIcon::Dot,
+            settings::MenuBarIcon::Bars => MenuBarIcon::Bars,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct PopoverModel {
     pub stats: Stats,
@@ -99,6 +123,7 @@ pub struct PopoverModel {
     pub show_working: bool,
     pub show_recent: bool,
     pub row_density: RowDensity,
+    pub menu_bar_icon: MenuBarIcon,
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -225,6 +250,7 @@ impl From<core_model::PopoverModel> for PopoverModel {
             show_working,
             show_recent,
             row_density,
+            menu_bar_icon,
         } = m;
         PopoverModel {
             stats: stats.into(),
@@ -238,6 +264,7 @@ impl From<core_model::PopoverModel> for PopoverModel {
             show_working,
             show_recent,
             row_density: row_density.into(),
+            menu_bar_icon: menu_bar_icon.into(),
         }
     }
 }
