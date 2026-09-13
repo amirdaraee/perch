@@ -294,6 +294,17 @@ pub fn build_model(
         None => dashed_stats(),
     };
 
+    // Looked up once for the whole tick rather than per row. A failure here
+    // is not worth flagging: every row already falls back to the live
+    // record's own name, so the worst case is the slug the popover showed
+    // before titles existed at all.
+    let titles = db
+        .and_then(|d| {
+            let ids: Vec<&str> = live.iter().map(|s| s.session_id.as_str()).collect();
+            crate::query::titles_for(d, &ids).ok()
+        })
+        .unwrap_or_default();
+
     // A row- or recent-list-level query failure still degrades honestly (a dash,
     // an empty list — never a fabricated zero), but must not vanish silently:
     // flag it here and fold it into `error` below, without clobbering a more
@@ -347,11 +358,17 @@ pub fn build_model(
             SessionRow {
                 id: s.session_id.clone(),
                 pid: s.pid,
-                name: if s.name.is_empty() {
-                    s.session_id.chars().take(8).collect()
-                } else {
-                    s.name.clone()
-                },
+                // The indexed title first: a live record carries Claude
+                // Code's `<project>-<id>` slug, which is not what a human
+                // named this work. The slug is the fallback, and the id
+                // prefix the fallback's fallback.
+                name: titles.get(&s.session_id).cloned().unwrap_or_else(|| {
+                    if s.name.is_empty() {
+                        s.session_id.chars().take(8).collect()
+                    } else {
+                        s.name.clone()
+                    }
+                }),
                 project,
                 kind,
                 version,
@@ -402,7 +419,14 @@ pub fn build_model(
                     };
                     RecentRow {
                         id: r.id,
-                        name: project.clone(),
+                        // Its own title, not its project's name — otherwise
+                        // three finished sessions in one project render as
+                        // the same word three times over.
+                        name: r
+                            .title
+                            .clone()
+                            .filter(|t| !t.trim().is_empty())
+                            .unwrap_or_else(|| project.clone()),
                         project,
                         ended_ago,
                         tokens,
@@ -1245,5 +1269,122 @@ mod tests {
             m.live[0].detail_line,
             "proj · interactive · v2.1.251 · 2.0M"
         );
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::*;
+    use crate::db::open_in_memory;
+    use crate::model::SessionRecord;
+
+    /// A session's own title is the point of having indexed one. The popover
+    /// showed Claude Code's `<project>-<id>` slug for live rows and, worse,
+    /// the *project* name for recent ones — so three sessions in one project
+    /// read as the same word three times.
+    fn seed(db: &crate::db::Db, id: &str, cwd: &str, title: Option<&str>, last: i64) {
+        let pid = db.upsert_project("-work-api", "/work/api", false).unwrap();
+        db.upsert_session(&SessionRecord {
+            id: id.into(),
+            project_id: pid,
+            file_path: format!("/tmp/{id}.jsonl"),
+            file_size: 0,
+            indexed_offset: 0,
+            started_at: Some(1),
+            last_activity_at: Some(last),
+            cwd: Some(cwd.into()),
+            git_branch: None,
+            cc_version: None,
+            title: title.map(Into::into),
+            message_count: 1,
+        })
+        .unwrap();
+    }
+
+    fn running(id: &str, name: &str, cwd: &str) -> LiveSession {
+        LiveSession {
+            pid: 1,
+            session_id: id.into(),
+            cwd: cwd.into(),
+            name: name.into(),
+            kind: "interactive".into(),
+            status: SessionStatus::Working,
+            started_at: 1,
+            status_updated_at: 5,
+            cc_version: None,
+            socket_path: None,
+        }
+    }
+
+    #[test]
+    fn a_live_row_prefers_the_indexed_title_over_the_slug() {
+        let db = open_in_memory().unwrap();
+        seed(
+            &db,
+            "s1",
+            "/work/api",
+            Some("Pricing module security review"),
+            9,
+        );
+        let m = build_model(
+            Some(&db),
+            &[running("s1", "api-s1", "/work/api")],
+            10,
+            None,
+            &Settings::default(),
+        );
+        assert_eq!(m.live[0].name, "Pricing module security review");
+    }
+
+    #[test]
+    fn a_live_row_falls_back_to_the_record_name_when_untitled() {
+        let db = open_in_memory().unwrap();
+        seed(&db, "s1", "/work/api", None, 9);
+        let m = build_model(
+            Some(&db),
+            &[running("s1", "api-s1", "/work/api")],
+            10,
+            None,
+            &Settings::default(),
+        );
+        assert_eq!(
+            m.live[0].name, "api-s1",
+            "an untitled session is not a reason to show nothing"
+        );
+    }
+
+    #[test]
+    fn recent_rows_show_the_session_not_its_project() {
+        let db = open_in_memory().unwrap();
+        seed(
+            &db,
+            "a",
+            "/work/api",
+            Some("Pricing module security review"),
+            10,
+        );
+        seed(&db, "b", "/work/api", Some("ci.yml security hardening"), 20);
+        let m = build_model(Some(&db), &[], 100, None, &Settings::default());
+        let names: Vec<&str> = m.recent.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            names.contains(&"Pricing module security review"),
+            "got {names:?}"
+        );
+        assert!(
+            names.contains(&"ci.yml security hardening"),
+            "got {names:?}"
+        );
+        assert_ne!(
+            names[0], names[1],
+            "two sessions in one project must not read alike"
+        );
+    }
+
+    #[test]
+    fn an_untitled_recent_row_still_names_its_project() {
+        let db = open_in_memory().unwrap();
+        seed(&db, "a", "/work/api", None, 10);
+        let m = build_model(Some(&db), &[], 100, None, &Settings::default());
+        assert_eq!(m.recent[0].name, "api");
     }
 }
