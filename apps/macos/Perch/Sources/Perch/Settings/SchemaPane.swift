@@ -187,7 +187,10 @@ struct SchemaPane: View {
                     TextField(resolvedLabel, text: draftBinding(r, value))
                         .focused($focusedField, equals: fieldId(r))
                         .onSubmit { commitDraft(r, stored: value) }
-                        .frame(minWidth: 200)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(minWidth: 260)
+                        .help(value.isEmpty ? resolvedLabel : value)
                     Button("Choose…") { chooseFolder(r, current: value) }
                     if !value.isEmpty {
                         Button("Automatic") { setDraft(r, "") }
@@ -209,10 +212,17 @@ struct SchemaPane: View {
 
         case let .info(valueLabel):
             LabeledContent(r.label) {
+                // One line, truncated in the middle. These carry paths and
+                // composed commands, and wrapping one across two ragged
+                // right-aligned lines reads as a broken layout rather than
+                // as information. The whole value stays reachable: the
+                // tooltip shows it and the text is still selectable.
                 Text(valueLabel)
                     .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.trailing)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
                     .textSelection(.enabled)
+                    .help(valueLabel)
             }
         }
     }
