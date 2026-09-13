@@ -3875,4 +3875,875 @@ mod tests {
             .iter()
             .any(|g| g.heading == "Index" && !g.rows.is_empty()));
     }
+
+    // --- Every setting, end to end ----------------------------------------
+    //
+    // The tests above this point check one seam each. These drive the whole
+    // settings surface the way the window does: through `Perch`, against a
+    // real `config.toml` and a real `index.db` in throwaway directories. What
+    // only they can catch is a key wired to the wrong TOML entry, a write that
+    // reports success without reaching disk, and a refusal that half-applies —
+    // none of which `perch-core`'s own schema tests can see, because none of
+    // them saves anything.
+
+    /// A terminal this machine certainly does not have installed, used to
+    /// prove the picker still offers whatever the file names.
+    const UNSEEN_TERMINAL: &str = "Perch Test Terminal";
+
+    /// Every key, as the boundary spells them. Taken from core's own list
+    /// rather than restated here, so a twenty-seventh setting joins these
+    /// tests by existing.
+    fn all_keys() -> Vec<SettingKey> {
+        settings::SettingKey::ALL
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    /// The shape `key` *stores*, which is the key's business and never the
+    /// control's: `PreferredTerminal` draws as a picker and stores `Text`,
+    /// `ClaudeConfigDir` draws as a folder and stores `Text`, and `ChartDays`
+    /// draws as a picker over numbers and stores `Int`.
+    fn stored_shape(key: SettingKey) -> settings::SettingValue {
+        settings::Settings::default().get(key.into())
+    }
+
+    /// What the schema currently shows for `key`, read back out of whichever
+    /// control draws it and into the shape the key stores — i.e. exactly the
+    /// value a shell would send back after the user touched that control.
+    fn schema_value(panes: &[SettingsPane], key: SettingKey) -> SettingValue {
+        let control = control_for(panes, key);
+        match (&control, stored_shape(key)) {
+            (Control::Toggle { on }, settings::SettingValue::Bool(_)) => {
+                SettingValue::Bool { value: *on }
+            }
+            (Control::Stepper { value, .. }, settings::SettingValue::Int(_)) => {
+                SettingValue::Int { value: *value }
+            }
+            (Control::IntChoice { selected, .. }, settings::SettingValue::Int(_)) => {
+                SettingValue::Int { value: *selected }
+            }
+            (Control::Choice { selected, .. }, settings::SettingValue::Choice(_)) => {
+                SettingValue::Choice {
+                    value: selected.clone(),
+                }
+            }
+            (Control::Choice { selected, .. }, settings::SettingValue::Text(_)) => {
+                SettingValue::Text {
+                    value: selected.clone(),
+                }
+            }
+            (Control::Text { value, .. }, settings::SettingValue::Text(_)) => SettingValue::Text {
+                value: value.clone(),
+            },
+            (Control::Folder { value, .. }, settings::SettingValue::Text(_)) => {
+                SettingValue::Text {
+                    value: value.clone(),
+                }
+            }
+            (c, shape) => panic!("{key:?} is drawn by {c:?} but stores {shape:?}"),
+        }
+    }
+
+    /// A different, valid, in-range value for `key`, drawn from the bounds and
+    /// options the schema itself advertises. Nothing here is out of range on
+    /// purpose: a clamped write would come back as a value the test never sent
+    /// and turn a round-trip assertion into a coin flip.
+    fn other_value(
+        panes: &[SettingsPane],
+        key: SettingKey,
+        real_dir: &std::path::Path,
+    ) -> SettingValue {
+        let control = control_for(panes, key);
+        match (control, stored_shape(key)) {
+            (Control::Toggle { on }, _) => SettingValue::Bool { value: !on },
+            (
+                Control::Stepper {
+                    value,
+                    min,
+                    max,
+                    step,
+                    ..
+                },
+                _,
+            ) => {
+                let next = if value + step <= max {
+                    value + step
+                } else {
+                    value - step
+                };
+                assert!(
+                    (min..=max).contains(&next) && next != value,
+                    "{key:?} advertises {min}..={max} step {step}, which offers no second value"
+                );
+                SettingValue::Int { value: next }
+            }
+            (Control::IntChoice { selected, options }, _) => {
+                let other = options
+                    .iter()
+                    .find(|o| o.value != selected)
+                    .unwrap_or_else(|| panic!("{key:?} offers no second value: {options:?}"));
+                SettingValue::Int { value: other.value }
+            }
+            (Control::Choice { selected, options }, settings::SettingValue::Choice(_)) => {
+                let other = options
+                    .iter()
+                    .find(|o| o.id != selected)
+                    .unwrap_or_else(|| panic!("{key:?} offers no second choice: {options:?}"));
+                SettingValue::Choice {
+                    value: other.id.clone(),
+                }
+            }
+            // The picker over applications Perch *found*. Its ids are not an
+            // enum's wire values, so the stored shape is `Text` and the value
+            // need not be one of the ids offered — a terminal Perch cannot see
+            // is still a terminal the user may have.
+            (Control::Choice { selected, .. }, settings::SettingValue::Text(_)) => {
+                assert_ne!(selected, UNSEEN_TERMINAL);
+                SettingValue::Text {
+                    value: UNSEEN_TERMINAL.to_string(),
+                }
+            }
+            // A folder that is not a directory is dropped back to
+            // auto-detection by `validated` and reported, so a round trip has
+            // to name somewhere real.
+            (Control::Folder { .. }, settings::SettingValue::Text(_)) => SettingValue::Text {
+                value: real_dir.to_string_lossy().into_owned(),
+            },
+            (c, shape) => panic!(
+                "{key:?} is drawn by {c:?} and stores {shape:?}; \
+                 this helper has no alternative value for that pairing"
+            ),
+        }
+    }
+
+    /// Every key the schema currently shows, in `SettingKey::ALL` order, with
+    /// the value it shows for it. An ordered list rather than a map because
+    /// the boundary's `SettingKey` is deliberately a plain mirror enum with no
+    /// `Hash`, and a test is no reason to widen a published type.
+    fn schema_values(panes: &[SettingsPane]) -> Vec<(SettingKey, SettingValue)> {
+        all_keys()
+            .into_iter()
+            .map(|k| (k, schema_value(panes, k)))
+            .collect()
+    }
+
+    /// Which pane each key lives in — read out of the schema rather than
+    /// restated here, so this can never be the stale second copy.
+    fn pane_of_each_key(panes: &[SettingsPane]) -> Vec<(SettingKey, PaneId)> {
+        all_keys()
+            .into_iter()
+            .map(|key| {
+                let pane = panes
+                    .iter()
+                    .find(|pane| {
+                        pane.groups
+                            .iter()
+                            .flat_map(|g| g.rows.iter())
+                            .any(|r| r.key == Some(key))
+                    })
+                    .unwrap_or_else(|| panic!("{key:?} is drawn by no pane"));
+                (key, pane.id)
+            })
+            .collect()
+    }
+
+    /// The one entry for `key` in an association list built by the two helpers
+    /// above.
+    fn at<T: Clone>(list: &[(SettingKey, T)], key: SettingKey) -> T {
+        list.iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("{key:?} is missing"))
+    }
+
+    fn keys_in(panes: &[SettingsPane]) -> Vec<SettingKey> {
+        panes
+            .iter()
+            .flat_map(|p| p.groups.iter())
+            .flat_map(|g| g.rows.iter())
+            .filter_map(|r| r.key)
+            .collect()
+    }
+
+    fn labels_in(panes: &[SettingsPane]) -> Vec<String> {
+        panes
+            .iter()
+            .flat_map(|p| p.groups.iter())
+            .flat_map(|g| g.rows.iter())
+            .map(|r| r.label.clone())
+            .collect()
+    }
+
+    /// The value of one Advanced-pane fact row.
+    fn fact(model: &AdvancedModel, label: &str) -> String {
+        model
+            .groups
+            .iter()
+            .flat_map(|g| g.rows.iter())
+            .find(|r| r.label == label)
+            .unwrap_or_else(|| panic!("no {label} row"))
+            .value
+            .clone()
+    }
+
+    /// One assistant turn in the shape Claude Code writes it.
+    fn assistant_line(ts: &str, cwd: &str, input: u64, output: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","cwd":"{cwd}","gitBranch":"main","version":"2.1.1","timestamp":"{ts}","message":{{"model":"claude-fable-5","usage":{{"input_tokens":{input},"output_tokens":{output},"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#
+        )
+    }
+
+    /// Two priced turns for `model`, one project, one session — the smallest
+    /// index in which a cost figure can be wrong.
+    fn seed_two_million_tokens(data: &std::path::Path, model: &str) {
+        let database = db::open(&data.join("index.db")).unwrap();
+        database
+            .conn()
+            .execute(
+                "INSERT INTO projects (id, slug, real_path) VALUES (1, 'p', '/p')",
+                [],
+            )
+            .unwrap();
+        database
+            .conn()
+            .execute(
+                "INSERT INTO sessions (id, project_id, file_path) VALUES ('s1', 1, '/p/s1.jsonl')",
+                [],
+            )
+            .unwrap();
+        database
+            .conn()
+            .execute(
+                "INSERT INTO turns (session_id, ts, model, input, output) \
+                 VALUES ('s1', 1, ?1, 1000000, 1000000)",
+                [model],
+            )
+            .unwrap();
+    }
+
+    /// **The test that matters most.** Every one of the twenty-six keys,
+    /// written through the FFI with a value of its own shape, read back from
+    /// the schema the write returned, and then read again through a *second*
+    /// `Perch` built over the same `config.toml` — which shares nothing with
+    /// the first but the file on disk. A key wired to the wrong TOML entry
+    /// passes the first assertion and fails the second.
+    #[test]
+    fn every_setting_written_through_the_ffi_reaches_disk_and_comes_back() {
+        let (p, _guard, data, claude) = perch_in_temp();
+        let elsewhere = tempfile::tempdir().unwrap();
+
+        let mut written: Vec<(SettingKey, SettingValue)> = Vec::new();
+        for key in all_keys() {
+            let before = p.settings_schema(None).panes;
+            let original = schema_value(&before, key);
+            let changed = other_value(&before, key, elsewhere.path());
+            assert_ne!(
+                changed, original,
+                "{key:?}: this test would assert nothing — it wrote the value already there"
+            );
+
+            let out = p
+                .set_setting(key, changed.clone())
+                .unwrap_or_else(|e| panic!("{key:?} refused a value of its own shape: {e:?}"));
+            assert!(
+                out.notes.is_empty(),
+                "{key:?}: an in-range write earned a note, so it was altered on the way \
+                 to disk: {:?}",
+                out.notes
+            );
+            assert_eq!(
+                schema_value(&out.panes, key),
+                changed,
+                "{key:?}: the schema returned by the write does not show the write"
+            );
+            written.push((key, changed));
+        }
+
+        assert!(
+            data.path().join("config.toml").is_file(),
+            "nothing was ever written to disk"
+        );
+
+        let fresh = Perch::new(Some(claude.path().to_string_lossy().into_owned())).unwrap();
+        let reread = fresh.settings_schema(None).panes;
+        for (key, expected) in &written {
+            assert_eq!(
+                &schema_value(&reread, *key),
+                expected,
+                "{key:?} did not survive the trip to disk — it reported a write it did not make, \
+                 or it is wired to a different entry in config.toml than it reads back from"
+            );
+        }
+        assert_eq!(
+            written.len(),
+            26,
+            "a key was added without joining this loop"
+        );
+    }
+
+    /// For every key, every shape that is not its own is refused, and the
+    /// refusal is total: neither the schema nor the file behind it moves.
+    #[test]
+    fn a_wrongly_shaped_write_is_refused_through_the_ffi_and_applies_nothing() {
+        let (p, _guard, _data, claude) = perch_in_temp();
+        let shapes = [
+            SettingValue::Bool { value: true },
+            SettingValue::Int { value: 1 },
+            SettingValue::Text {
+                value: "x".to_string(),
+            },
+            SettingValue::Choice {
+                value: "x".to_string(),
+            },
+        ];
+
+        for key in all_keys() {
+            let before = p.settings_schema(None).panes;
+            let mine = schema_value(&before, key);
+            for shape in &shapes {
+                if std::mem::discriminant(shape) == std::mem::discriminant(&mine) {
+                    continue;
+                }
+                match p.set_setting(key, shape.clone()) {
+                    Err(PerchError::Setting { .. }) => {}
+                    Err(other) => {
+                        panic!("{key:?} refused {shape:?}, but not as a shape error: {other:?}")
+                    }
+                    // Deliberately not printing the schema it returned: the
+                    // fact that it returned one at all is the whole failure.
+                    Ok(_) => panic!("{key:?} accepted {shape:?}"),
+                }
+            }
+            // Not just the in-memory schema: a fresh `Perch` reading the same
+            // file must find the value the refusal was supposed to protect.
+            let fresh = Perch::new(Some(claude.path().to_string_lossy().into_owned())).unwrap();
+            assert_eq!(
+                schema_value(&fresh.settings_schema(None).panes, key),
+                mine,
+                "{key:?} changed on disk after a refused write"
+            );
+        }
+    }
+
+    /// A hand-edited `config.toml` is the one path on which a value arrives
+    /// out of range, and both halves of the contract matter: it is clamped so
+    /// Perch still runs, *and* the clamp is reported so the window does not
+    /// quietly show a number the user did not type. Both ends of every bound.
+    #[test]
+    fn a_hand_edited_out_of_range_value_is_clamped_on_read_and_reported() {
+        let (p, _guard, data, _claude) = perch_in_temp();
+        let cases: [(&str, &str, i64, i64, SettingKey); 14] = [
+            ("sessions", "poll_seconds", 0, 1, SettingKey::PollSeconds),
+            (
+                "sessions",
+                "poll_seconds",
+                9999,
+                60,
+                SettingKey::PollSeconds,
+            ),
+            (
+                "notifications",
+                "waiting_after_minutes",
+                0,
+                1,
+                SettingKey::WaitingAfterMinutes,
+            ),
+            (
+                "notifications",
+                "waiting_after_minutes",
+                10000,
+                240,
+                SettingKey::WaitingAfterMinutes,
+            ),
+            (
+                "menu_bar",
+                "stale_after_minutes",
+                0,
+                1,
+                SettingKey::StaleAfterMinutes,
+            ),
+            (
+                "menu_bar",
+                "stale_after_minutes",
+                9999,
+                120,
+                SettingKey::StaleAfterMinutes,
+            ),
+            ("popover", "recent_limit", 0, 1, SettingKey::RecentLimit),
+            ("popover", "recent_limit", 999, 20, SettingKey::RecentLimit),
+            (
+                "projects",
+                "active_within_days",
+                0,
+                1,
+                SettingKey::ActiveWithinDays,
+            ),
+            (
+                "projects",
+                "active_within_days",
+                9999,
+                90,
+                SettingKey::ActiveWithinDays,
+            ),
+            (
+                "usage",
+                "top_projects_count",
+                0,
+                3,
+                SettingKey::TopProjectsCount,
+            ),
+            (
+                "usage",
+                "top_projects_count",
+                999,
+                20,
+                SettingKey::TopProjectsCount,
+            ),
+            (
+                "usage",
+                "top_projects_days",
+                0,
+                7,
+                SettingKey::TopProjectsDays,
+            ),
+            (
+                "usage",
+                "top_projects_days",
+                9999,
+                180,
+                SettingKey::TopProjectsDays,
+            ),
+        ];
+
+        for (section, name, written, clamped, key) in cases {
+            std::fs::write(
+                data.path().join("config.toml"),
+                format!("version = 2\n\n[{section}]\n{name} = {written}\n"),
+            )
+            .unwrap();
+
+            let out = p.settings_schema(None);
+            assert_eq!(
+                schema_value(&out.panes, key),
+                SettingValue::Int { value: clamped },
+                "{section}.{name} = {written} was not clamped to {clamped}"
+            );
+            let wanted = format!("{name} was {written}; clamped to {clamped}");
+            assert!(
+                out.notes.iter().any(|n| n.contains(&wanted)),
+                "{section}.{name} = {written} was clamped in silence; notes were {:?}",
+                out.notes
+            );
+        }
+    }
+
+    /// Per-pane reset, through the FFI, for all nine panes including the three
+    /// that carry no rows. Every setting is drifted first, so a reset that
+    /// reached too far is as visible as one that reached too little.
+    #[test]
+    fn resetting_one_pane_through_the_ffi_restores_its_own_keys_and_no_others() {
+        let (p, _guard, _data, _claude) = perch_in_temp();
+        let elsewhere = tempfile::tempdir().unwrap();
+
+        let factory_panes = p.reset_all_settings().unwrap().panes;
+        let factory = schema_values(&factory_panes);
+        let home = pane_of_each_key(&factory_panes);
+        assert_eq!(home.len(), 26, "a key is drawn by no pane");
+
+        let drift: Vec<(SettingKey, SettingValue)> = all_keys()
+            .into_iter()
+            .map(|k| (k, other_value(&factory_panes, k, elsewhere.path())))
+            .collect();
+
+        let rowless = [PaneId::Prices, PaneId::Diagnostics, PaneId::Advanced];
+        let every_pane = [
+            PaneId::General,
+            PaneId::MenuBar,
+            PaneId::Popover,
+            PaneId::Projects,
+            PaneId::Usage,
+            PaneId::Prices,
+            PaneId::Notifications,
+            PaneId::Diagnostics,
+            PaneId::Advanced,
+        ];
+
+        for target in every_pane {
+            p.reset_all_settings().unwrap();
+            for key in all_keys() {
+                p.set_setting(key, at(&drift, key)).unwrap();
+            }
+
+            let out = p.reset_pane(target).unwrap();
+            for key in all_keys() {
+                let lives_in = at(&home, key);
+                let expected = if lives_in == target {
+                    at(&factory, key)
+                } else {
+                    at(&drift, key)
+                };
+                assert_eq!(
+                    schema_value(&out.panes, key),
+                    expected,
+                    "after resetting {target:?}, {key:?} (which lives in {lives_in:?}) is wrong"
+                );
+            }
+
+            if rowless.contains(&target) {
+                assert!(
+                    !home.iter().any(|(_, pane)| *pane == target),
+                    "{target:?} is supposed to carry no settings rows"
+                );
+                assert_eq!(
+                    schema_values(&out.panes),
+                    drift,
+                    "resetting the rowless {target:?} changed a setting"
+                );
+            }
+        }
+    }
+
+    /// Search, through the FFI, where the shell only ever sends keystrokes.
+    /// The failure worth naming is the last one: a filter that falls back to
+    /// "everything" when it matches nothing is indistinguishable from a broken
+    /// filter, and it tells the user their typo was a real setting.
+    #[test]
+    fn search_through_the_ffi_reaches_labels_help_and_pane_titles_and_never_falls_back() {
+        let (p, _guard, _data, _claude) = perch_in_temp();
+        let all = p.settings_schema(None);
+
+        // A term that matches exactly one row, by its label.
+        let by_label = p.settings_schema(Some("Open at login".to_string())).panes;
+        assert_eq!(
+            keys_in(&by_label),
+            vec![SettingKey::LaunchAtLogin],
+            "labels: {:?}",
+            labels_in(&by_label)
+        );
+
+        // A term that appears in a row's help and in no label anywhere.
+        let by_help = p
+            .settings_schema(Some("already watching".to_string()))
+            .panes;
+        assert_eq!(
+            keys_in(&by_help),
+            vec![SettingKey::LaunchAtLogin],
+            "help text must be searched, not only labels"
+        );
+        assert!(
+            !labels_in(&all.panes)
+                .iter()
+                .any(|l| l.to_lowercase().contains("already watching")),
+            "the term is supposed to appear in no label, or this proves nothing"
+        );
+
+        // A pane reachable only by its title, because it has no rows at all.
+        let by_title = p.settings_schema(Some("prices".to_string())).panes;
+        assert_eq!(
+            by_title.iter().map(|x| x.id).collect::<Vec<_>>(),
+            vec![PaneId::Prices]
+        );
+        assert!(
+            by_title[0].groups.is_empty(),
+            "Prices has no rows to keep — it was found by its title"
+        );
+
+        // An empty query is not a filter.
+        assert_eq!(
+            p.settings_schema(Some("   ".to_string())).panes,
+            all.panes,
+            "a blank query must return everything, unchanged"
+        );
+
+        // And nonsense returns nothing.
+        assert!(p
+            .settings_schema(Some("zzzznotasetting".to_string()))
+            .panes
+            .is_empty());
+    }
+
+    /// The whole reason the Prices pane exists: a model with recorded turns
+    /// and no rate contributes every one of its tokens and none of its
+    /// dollars, which reads everywhere as work that cost nothing. Pricing it
+    /// must move a real cost figure off zero, and un-pricing it must move it
+    /// back — with the tokens still counted, because "I do not know what this
+    /// costs" is a different claim from "it costs nothing".
+    #[test]
+    fn pricing_a_model_in_use_turns_a_confident_zero_into_a_real_cost_and_back() {
+        let (p, _guard, data, _claude) = perch_in_temp();
+        const MODEL: &str = "perch-test-model";
+        p.prices().expect("the shipped table seeds itself");
+        seed_two_million_tokens(data.path(), MODEL);
+
+        let mine = |p: &Arc<Perch>| {
+            p.usage()
+                .unwrap()
+                .by_model
+                .into_iter()
+                .find(|m| m.model == MODEL)
+                .expect("the indexed model is reported by usage")
+        };
+
+        let before = mine(&p);
+        assert_eq!(before.tokens, 2_000_000);
+        assert_eq!(
+            before.cost, "$0.00",
+            "an unpriced model's tokens must currently read as free — this is the bug"
+        );
+        assert!(
+            p.prices()
+                .unwrap()
+                .unpriced
+                .iter()
+                .any(|u| u.model == MODEL),
+            "and the pane must say so, because the gap is invisible from inside the table"
+        );
+
+        let rates = |input: &str, output: &str| RateFields {
+            input: input.to_string(),
+            output: output.to_string(),
+            cache_read: "1".to_string(),
+            cache_write: "2".to_string(),
+        };
+
+        let after = p.set_price(MODEL.to_string(), rates("10", "20")).unwrap();
+        assert!(
+            !after.unpriced.iter().any(|u| u.model == MODEL),
+            "the gap must close in the pane the edit returned"
+        );
+        assert!(after.unpriced_summary.is_none());
+        let row = after.rows.iter().find(|r| r.model == MODEL).unwrap();
+        assert!(
+            !row.is_default,
+            "a model the user added is not a shipped one"
+        );
+        // One million input at $10/M plus one million output at $20/M.
+        assert_eq!(
+            mine(&p).cost,
+            "$30.00",
+            "the cost figure must move off zero"
+        );
+
+        // Edited.
+        p.set_price(MODEL.to_string(), rates("1", "2")).unwrap();
+        assert_eq!(
+            mine(&p).cost,
+            "$3.00",
+            "an edited rate must reprice the past"
+        );
+
+        // Removed: back to no cost, with every token still counted.
+        let removed = p.remove_price(MODEL.to_string()).unwrap();
+        assert!(!removed.rows.iter().any(|r| r.model == MODEL));
+        assert!(removed.unpriced.iter().any(|u| u.model == MODEL));
+        let gone = mine(&p);
+        assert_eq!(gone.cost, "$0.00");
+        assert_eq!(
+            gone.tokens, 2_000_000,
+            "forgetting a rate must not forget the tokens"
+        );
+
+        // Reset: the user's model is gone and every shipped rate is back.
+        p.set_price(MODEL.to_string(), rates("10", "20")).unwrap();
+        let shipped = p
+            .prices()
+            .unwrap()
+            .rows
+            .iter()
+            .find(|r| r.is_default)
+            .expect("Perch ships at least one rate")
+            .model
+            .clone();
+        p.set_price(shipped.clone(), rates("99", "99")).unwrap();
+
+        let reset = p.reset_prices().unwrap();
+        assert!(
+            !reset.rows.iter().any(|r| r.model == MODEL),
+            "a reset discards every model the user added"
+        );
+        assert_eq!(
+            reset
+                .rows
+                .iter()
+                .find(|r| r.model == shipped)
+                .map(|r| r.is_default),
+            Some(true),
+            "and restores the rate Perch ships"
+        );
+        assert_eq!(mine(&p).cost, "$0.00", "the user's model is unpriced again");
+    }
+
+    /// Reset-all is about the twenty-six settings and nothing else. The index,
+    /// the notes a user typed against their projects and the rates they
+    /// entered all live elsewhere and must survive it — a "reset settings"
+    /// that quietly emptied the index would be unrecoverable.
+    #[test]
+    fn resetting_every_setting_leaves_the_index_the_notes_and_the_prices_alone() {
+        let (p, _guard, data, _claude) = perch_in_temp();
+        let elsewhere = tempfile::tempdir().unwrap();
+        const MODEL: &str = "perch-test-model";
+
+        p.prices().unwrap();
+        seed_two_million_tokens(data.path(), MODEL);
+        p.set_note(1, "keep me".to_string()).unwrap();
+        p.set_price(
+            MODEL.to_string(),
+            RateFields {
+                input: "10".to_string(),
+                output: "20".to_string(),
+                cache_read: "1".to_string(),
+                cache_write: "2".to_string(),
+            },
+        )
+        .unwrap();
+
+        let factory = schema_values(&p.reset_all_settings().unwrap().panes);
+        for key in all_keys() {
+            let panes = p.settings_schema(None).panes;
+            let drifted = other_value(&panes, key, elsewhere.path());
+            p.set_setting(key, drifted).unwrap();
+        }
+
+        let out = p.reset_all_settings().unwrap();
+        assert_eq!(
+            schema_values(&out.panes),
+            factory,
+            "a reset that leaves anything drifted is a partial reset"
+        );
+        assert!(
+            out.panes
+                .iter()
+                .flat_map(|pane| pane.groups.iter())
+                .flat_map(|g| g.rows.iter())
+                .all(|r| r.is_default),
+            "and every row must say so"
+        );
+
+        assert_eq!(
+            p.project_detail(1).unwrap().note,
+            "keep me",
+            "a settings reset must not touch the notes a user typed"
+        );
+        let prices = p.prices().unwrap();
+        assert!(
+            prices.rows.iter().any(|r| r.model == MODEL),
+            "nor the rates they entered"
+        );
+        assert_eq!(fact(&p.advanced(), "Turns indexed"), "1", "nor the index");
+    }
+
+    /// A reindex that did nothing must never look like one that worked. The
+    /// honest proof is a session file that was not there before: the counts
+    /// the call returns are the ones this run produced.
+    #[test]
+    fn a_reindex_indexes_what_appeared_and_reports_the_counts_it_produced() {
+        let (p, _guard, _data, claude) = perch_in_temp();
+        assert_eq!(fact(&p.advanced(), "Sessions indexed"), "0");
+        assert_eq!(fact(&p.advanced(), "Turns indexed"), "0");
+
+        let project = claude.path().join("projects").join("-Users-a-one");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("aaaa.jsonl"),
+            format!(
+                "{}\n{}\n",
+                assistant_line("2026-08-18T10:00:00.000Z", "/Users/a/one", 1, 2),
+                assistant_line("2026-08-18T10:01:00.000Z", "/Users/a/one", 3, 4),
+            ),
+        )
+        .unwrap();
+
+        let m = p.reindex_now().expect("a readable directory reindexes");
+        assert_eq!(
+            fact(&m, "Sessions indexed"),
+            "1",
+            "the pane the call returned must show what the call produced"
+        );
+        assert_eq!(fact(&m, "Turns indexed"), "2");
+        assert_eq!(
+            fact(&p.advanced(), "Turns indexed"),
+            "2",
+            "and it must have reached the index, not only the returned pane"
+        );
+    }
+
+    /// A v1 file, opened through `Perch`. `include_background` moved from
+    /// `[sessions]` to `[notifications]`, and to the deserializer a key that
+    /// moved is simply absent — so without the migration the user's `true`
+    /// would come back as the default `false` with nothing failing anywhere.
+    /// Everything else in the file is theirs and must survive untouched.
+    #[test]
+    fn a_v1_config_carries_include_background_into_notifications_and_keeps_the_file() {
+        let (p, _guard, data, claude) = perch_in_temp();
+        let path = data.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "# my own note at the top of the file\n\
+             version = 1\n\
+             \n\
+             [sessions]\n\
+             poll_seconds = 7\n\
+             # background sessions count as waiting on me\n\
+             include_background = true\n\
+             \n\
+             [experimental]\n\
+             something_a_newer_perch_wrote = 3\n",
+        )
+        .unwrap();
+
+        let panes = p.settings_schema(None).panes;
+        assert_eq!(
+            schema_value(&panes, SettingKey::IncludeBackground),
+            SettingValue::Bool { value: true },
+            "a v1 file's include_background must arrive under its new home, not as the default"
+        );
+        assert_eq!(
+            schema_value(&panes, SettingKey::PollSeconds),
+            SettingValue::Int { value: 7 },
+            "and the key that did not move must still be read"
+        );
+
+        // The file itself migrates the first time anything is saved, so the
+        // dead original does not sit there looking editable.
+        p.set_setting(SettingKey::Sound, SettingValue::Bool { value: false })
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+
+        assert!(
+            text.contains("# my own note at the top of the file"),
+            "the user's comment was dropped: {text}"
+        );
+        assert!(
+            text.contains("something_a_newer_perch_wrote = 3"),
+            "a key Perch does not recognize was dropped: {text}"
+        );
+        assert!(
+            text.contains("# background sessions count as waiting on me"),
+            "the comment above the moved key did not move with it: {text}"
+        );
+
+        let sessions_at = text.find("[sessions]").expect("the section survives");
+        let notifications_at = text
+            .find("[notifications]")
+            .expect("the destination section exists");
+        assert!(
+            !text[sessions_at..notifications_at].contains("include_background"),
+            "a dead [sessions].include_background reads as a live setting: {text}"
+        );
+        assert!(
+            text[notifications_at..].contains("include_background = true"),
+            "the value did not land in [notifications]: {text}"
+        );
+
+        let fresh = Perch::new(Some(claude.path().to_string_lossy().into_owned())).unwrap();
+        assert_eq!(
+            schema_value(
+                &fresh.settings_schema(None).panes,
+                SettingKey::IncludeBackground
+            ),
+            SettingValue::Bool { value: true },
+            "the migrated file must still read true"
+        );
+    }
 }
