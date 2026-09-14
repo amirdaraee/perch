@@ -1374,7 +1374,13 @@ mod tests {
         assert!(!m.stats.day_cost.contains('$'), "{:?}", m.stats.day_cost);
         assert!(m.live.iter().all(|r| !r.cost.contains('$')));
         assert!(m.live.iter().all(|r| !r.detail_line.contains('$')));
-        assert!(m.recent.iter().all(|r| !r.ended_line.contains('$')));
+        // No assertion about `m.recent` here, deliberately. This model has a
+        // *live* session, so `recent` is empty — and a RecentRow carries no
+        // cost anyway. The assertion that used to sit here iterated an empty
+        // vector of a type with no dollars in it, could never fail either
+        // way, and is why "Show tokens and cost" looked covered for the
+        // Recent card while it was in fact ignored there entirely.
+        // `hiding_row_usage_reaches_the_recent_rows_as_well` covers that card.
         assert_eq!(
             m.live[0].tokens, "2.0M",
             "tokens are counted, not inferred; only the dollars go"

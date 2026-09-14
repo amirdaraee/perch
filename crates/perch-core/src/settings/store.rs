@@ -356,9 +356,21 @@ pub fn save(path: &Path, s: &Settings) -> Result<()> {
                 path.display()
             )
         })?,
-        Err(_) => TEMPLATE
+        // Absent is the ordinary first run: write a fresh file from the
+        // template. Anything else — unreadable permissions, an I/O error —
+        // gets the same refusal as unparseable TOML above, and for the same
+        // reason: replacing the file with the template would discard the
+        // user's comments and any key a newer Perch wrote, which is the one
+        // thing this function exists to avoid.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => TEMPLATE
             .parse::<DocumentMut>()
             .expect("TEMPLATE is valid TOML"),
+        Err(e) => {
+            return Err(anyhow::anyhow!(e).context(format!(
+                "{} could not be read; refusing to overwrite it blindly",
+                path.display()
+            )))
+        }
     };
 
     // Bring the document current before writing over it. `load` migrates
@@ -1134,5 +1146,51 @@ mod inline_table_tests {
             again.settings.launch_at_login,
             "the value must survive the round trip"
         );
+    }
+}
+
+#[cfg(test)]
+mod unreadable_save_tests {
+    use super::{load, save};
+    use crate::settings::Settings;
+    use tempfile::tempdir;
+
+    /// `save` refuses to overwrite a file it cannot parse, precisely so a
+    /// user's comments and unknown keys are never thrown away. A file it
+    /// cannot *read* deserves the same refusal: falling back to the template
+    /// discards exactly the same content, just without the parse error to
+    /// explain it.
+    #[test]
+    fn an_unreadable_file_is_refused_rather_than_replaced() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "# a comment worth keeping\nversion = 2\n").unwrap();
+
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o222); // write-only
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let err = save(&path, &Settings::default()).unwrap_err();
+        assert!(
+            err.to_string().contains("could not be read"),
+            "the refusal must say why: {err}"
+        );
+
+        // Restore read permission and prove nothing was lost.
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o644);
+        std::fs::set_permissions(&path, perms).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# a comment worth keeping"));
+    }
+
+    /// A file that is simply absent is still the ordinary first-run case and
+    /// must still be created from the template.
+    #[test]
+    fn a_missing_file_is_still_created_from_the_template() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        save(&path, &Settings::default()).expect("first run writes a fresh file");
+        assert!(load(&path).error.is_none());
     }
 }
