@@ -808,6 +808,11 @@ pub struct WaitingNotification {
     pub project: String,
     pub title: String,
     pub body: String,
+    /// Whether to play the platform's alert sound with this one. The
+    /// "Play a sound" setting is resolved by the notification engine, which
+    /// already holds every other notification setting; a shell sets the sound
+    /// or leaves it unset, and decides nothing.
+    pub sound: bool,
 }
 
 impl From<notify::Notification> for WaitingNotification {
@@ -818,6 +823,7 @@ impl From<notify::Notification> for WaitingNotification {
             project,
             title,
             body,
+            sound,
         } = n;
         WaitingNotification {
             session_id,
@@ -825,6 +831,7 @@ impl From<notify::Notification> for WaitingNotification {
             project,
             title,
             body,
+            sound,
         }
     }
 }
