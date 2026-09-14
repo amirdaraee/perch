@@ -65,8 +65,9 @@ window closes.
 
 From the project detail pane you can pin, archive, rename, resume an ended session
 (`claude --resume <id>`), or start a fresh one (`claude`) — both in the project's own
-directory. Both actions hand the command to your preferred terminal (a Settings toggle —
-Terminal.app or iTerm2 today; anything else falls back to Terminal.app) by writing a one-shot
+directory. Both actions hand the command to your preferred terminal — Settings lists the ones
+it finds installed (Terminal, iTerm2, Warp, Ghostty, Alacritty, Kitty, WezTerm), though only
+Terminal.app and iTerm2 are launched today and the rest fall back to Terminal.app — by writing a one-shot
 script into Perch's *own* `~/Library/Application Support/Perch/commands/` directory (swept of
 anything older than a minute) and asking `NSWorkspace` to open it there, which is what avoids
 the Automation permission prompt an AppleScript-driven approach would need. The command line
@@ -77,23 +78,44 @@ the main window exactly as they do for the menu.
 
 ### Settings, notifications, and diagnostics
 
-**Settings…** (⌘,) in the status-item menu opens a four-tab window — General, Sessions & Menu
-Bar, Notifications, and Diagnostics — covering all eight of Perch's settings: launch at login,
-the Claude Code directory (auto-detect, or an explicit override for when auto-detection picks
-the wrong one), the menu bar's display mode (icon only, icon + count, or icon + count with a
-distinct glyph when something's waiting on you), the poll interval, the three notification
-settings below, and the preferred terminal. Every setting takes effect immediately; nothing
-needs a relaunch.
+**Settings…** (⌘,) in the status-item menu opens a sidebar window of nine panes — General,
+Menu Bar, Popover, Projects, Usage, Prices, Notifications, Diagnostics, and Advanced —
+covering twenty-seven settings. Among them: launch at login; the Claude Code directory
+(auto-detect, or an explicit override for when auto-detection picks the wrong one); the menu
+bar's display mode, its glyph, and whether it dims once the index has gone unread for longer
+than N minutes; which popover sections are drawn, how many recent sessions they list, the row
+density, and whether a row carries its project folder and its usage; how recently a project
+counts as active and whether archived ones are listed; the chart range, the top-projects
+ranking, the burn-rate unit, and whether costs are shown at all; the three notification
+settings below; the poll interval; the preferred terminal; and whether Resume launches
+Claude Code with `--dangerously-skip-permissions`.
+
+A search field at the top of the sidebar narrows every pane to the rows that match, so a
+setting can be found by what it does rather than by guessing which pane it lives in. A pane
+that has drifted from the shipped defaults offers to reset just itself; Advanced resets
+everything, and also carries the resolved paths, the index's counts, and a reindex button.
+Each pane shows what its current settings actually produce in your own data — the menu-bar
+title as it will read, the burn-rate line the chosen unit gives you, how many projects clear
+the active threshold — so a choice can be judged against the real thing rather than a
+description of it. Prices is an editable model-price table; the shipped numbers are
+placeholders, and a model priced by hand is remembered until you reset it. Every setting takes
+effect immediately; nothing needs a relaunch.
 
 Settings live in Perch's *own* `config.toml` — `~/Library/Application Support/Perch/config.toml`,
-never inside your Claude Code directory — as four TOML tables plus a version key. Set
+never inside your Claude Code directory — as seven TOML tables plus a version key. Set
 `PERCH_CONFIG` to point it somewhere else entirely. The file is watched, so a hand edit while
 Perch is running takes effect without a restart; an out-of-range value is clamped rather than
 rejected, and a file that fails to parse falls back to defaults rather than refusing to start —
 either way, the settings window says so.
 
+The schema itself — every pane, group, row, control, bound, help sentence and search term —
+is built in Rust (`perch-core::settings::schema`) and the window renders it. Swift picks one
+SwiftUI control per control variant and one SF Symbol per semantic icon, and composes no
+caption of its own: "every 1 minute" against "every 2 minutes" is Rust's sentence, not a
+number the window pluralises. CI fails the build if a Swift `Text` ever formats a number.
+
 **The waiting-on-you notification** is the problem Perch was written to solve: a session
-blocked for 32 hours with nobody noticing. Turn it on in Notifications and Perch tells you,
+blocked for 32 hours with nobody noticing. Turn it on in the Notifications pane and Perch tells you,
 once per episode, when a session has been waiting on you longer than N minutes (default 10;
 background sessions excluded by default). macOS asks for notification permission at that
 moment, not at launch, and a later denial is reflected honestly in the toggle rather than the
@@ -106,7 +128,7 @@ Any project can override the global threshold from its own detail pane in the ma
 next to pin, archive, and the note: Default (follow the setting above), a custom number of
 minutes, or Off. Global defaults live in Settings; per-project exceptions live on the project.
 
-**Diagnostics**, a tab in the Settings window, answers one question a confused person actually
+**Diagnostics**, a pane in the Settings window, answers one question a confused person actually
 asks: why isn't my session showing up? For every session record Perch found, it names whether
 the record was accepted or the specific reason it wasn't — no such process, that pid isn't
 `claude`, or the record couldn't be parsed — plus the resolved Claude Code directory and how it

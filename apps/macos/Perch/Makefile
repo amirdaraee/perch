@@ -15,6 +15,13 @@ bundle: build
 	mkdir -p build/Perch.app/Contents/MacOS build/Perch.app/Contents/Resources
 	cp .build/release/Perch build/Perch.app/Contents/MacOS/Perch
 	cp Resources/Info.plist build/Perch.app/Contents/Info.plist
+	cp Resources/Perch.icns build/Perch.app/Contents/Resources/Perch.icns
+	# Ad-hoc sign *after* the Info.plist is in place, so the signature is
+	# bound to it and the bundle identity is dev.perch.app rather than the
+	# linker's bare "Perch". UserNotifications refuses to grant
+	# authorization to a bundle whose identity is not bound to its
+	# signature — it fails with UNErrorDomain 1 and never prompts.
+	codesign --force --deep --sign - build/Perch.app
 	@echo "open build/Perch.app"
 
 clean:

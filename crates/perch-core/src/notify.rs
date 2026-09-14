@@ -36,6 +36,11 @@ pub struct Notification {
     pub project: String,
     pub title: String,
     pub body: String,
+    /// Whether the shell should play the platform's alert sound when it
+    /// delivers this one. The decision is made here, where the settings
+    /// already are, so a shell never reads `Settings` to decide what to do:
+    /// it plays the sound or it does not.
+    pub sound: bool,
 }
 
 /// The directory name Perch shows everywhere: the last path component of `cwd`.
@@ -183,6 +188,7 @@ pub fn decide(
             project,
             title,
             body,
+            sound: settings.sound,
         });
         remembered.insert(episode);
     }
@@ -249,6 +255,28 @@ mod tests {
             60 * MIN,
         );
         assert!(n.is_empty());
+    }
+
+    /// "Play a sound" is decided here, beside every other notification
+    /// setting, and travels on the notification itself — a shell must never
+    /// read `Settings` to work out whether to chime.
+    #[test]
+    fn the_sound_preference_travels_with_the_notification() {
+        let fire = |sound: bool| {
+            let s = Settings { sound, ..on() };
+            let (n, _) = decide(
+                &[waiting("a", "/p", 0, "interactive")],
+                &s,
+                &no_override(),
+                &no_id(),
+                &HashSet::new(),
+                60 * MIN,
+            );
+            assert_eq!(n.len(), 1, "the alert itself still fires either way");
+            n[0].sound
+        };
+        assert!(fire(true), "sound on: the shell is told to chime");
+        assert!(!fire(false), "sound off: the shell is told not to");
     }
 
     #[test]

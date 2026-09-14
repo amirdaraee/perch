@@ -4,7 +4,7 @@ use crate::db::Db;
 use crate::model::TurnUsage;
 use crate::pricing::{cost_usd, price_for};
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 
 #[derive(Debug, Clone)]
 pub struct ProjectSummary {
@@ -176,8 +176,34 @@ pub struct RecentSession {
     pub id: String,
     pub cwd: Option<String>,
     pub last_activity_at: i64,
+    /// The session's own title, as recovered from its transcript. `None`
+    /// for the handful that never recorded one.
+    pub title: Option<String>,
     pub usage: TurnUsage,
     pub cost_usd: f64,
+}
+
+/// The stored titles for the given session ids. Live records carry Claude
+/// Code's `<project>-<id>` slug rather than a title, so a shell showing live
+/// sessions has to come back here for the name a human would recognise.
+pub fn titles_for(db: &Db, ids: &[&str]) -> Result<std::collections::HashMap<String, String>> {
+    let mut out = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let mut stmt = db
+        .conn()
+        .prepare("SELECT title FROM sessions WHERE id = ?1")?;
+    for id in ids {
+        let title: Option<String> = stmt
+            .query_row([id], |r| r.get::<_, Option<String>>(0))
+            .optional()?
+            .flatten();
+        if let Some(t) = title.filter(|t| !t.trim().is_empty()) {
+            out.insert((*id).to_string(), t);
+        }
+    }
+    Ok(out)
 }
 
 /// Tokens and estimated cost for one session, priced per model and summed.
@@ -202,7 +228,7 @@ pub fn recent_sessions(
         return Ok(Vec::new());
     }
     let mut stmt = db.conn().prepare(
-        "SELECT id, cwd, last_activity_at FROM sessions
+        "SELECT id, cwd, last_activity_at, title FROM sessions
          WHERE last_activity_at IS NOT NULL
          ORDER BY last_activity_at DESC",
     )?;
@@ -211,12 +237,13 @@ pub fn recent_sessions(
             r.get::<_, String>(0)?,
             r.get::<_, Option<String>>(1)?,
             r.get::<_, i64>(2)?,
+            r.get::<_, Option<String>>(3)?,
         ))
     })?;
 
     let mut out = Vec::new();
     for row in rows {
-        let (id, cwd, last) = row?;
+        let (id, cwd, last, title) = row?;
         if exclude_ids.iter().any(|x| x == &id) {
             continue;
         }
@@ -225,6 +252,7 @@ pub fn recent_sessions(
             id,
             cwd,
             last_activity_at: last,
+            title,
             usage,
             cost_usd,
         });

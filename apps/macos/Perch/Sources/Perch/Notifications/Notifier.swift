@@ -67,13 +67,44 @@ final class Notifier: NSObject, ObservableObject, UNUserNotificationCenterDelega
             granted = try await UNUserNotificationCenter.current()
                 .requestAuthorization(options: [.alert, .sound])
         } catch {
-            lastFailure = error.localizedDescription
+            lastFailure = Self.explain(error)
         }
         // Re-read rather than trusting `granted`: the request's own answer
         // says what just happened, `notificationSettings()` says what is now
         // true, and everything else in this app keys off the latter.
         await refreshAuthorization()
         return granted
+    }
+
+    /// Composed here rather than in `perch-core`, deliberately: these are
+    /// macOS's own failure modes, and a Linux shell would have entirely
+    /// different ones. What must not reach the user is the raw Foundation
+    /// string — "The operation couldn't be completed. (UNErrorDomain error
+    /// 1.)" says nothing about what happened or what to do about it.
+    private static func explain(_ error: Error) -> String {
+        let ns = error as NSError
+        guard ns.domain == UNErrorDomain,
+              let code = UNError.Code(rawValue: ns.code)
+        else { return error.localizedDescription }
+
+        switch code {
+        case .notificationsNotAllowed:
+            return """
+            macOS would not let Perch ask for permission to show \
+            notifications. That usually means this copy of the app is not \
+            signed in a way macOS accepts. If you built it yourself, \
+            `make bundle` signs it; otherwise check Notifications in \
+            System Settings.
+            """
+        case .attachmentInvalidURL, .attachmentUnrecognizedType,
+             .attachmentInvalidFileSize, .attachmentNotInDataStore,
+             .attachmentMoveIntoDataStoreFailed, .attachmentCorrupt:
+            return "macOS rejected the notification's attachment."
+        case .notificationInvalidNoDate, .notificationInvalidNoContent:
+            return "Perch composed a notification macOS considered incomplete."
+        @unknown default:
+            return error.localizedDescription
+        }
     }
 
     /// Re-reads the *current* authorization state, without prompting, into
@@ -121,7 +152,10 @@ final class Notifier: NSObject, ObservableObject, UNUserNotificationCenterDelega
             let content = UNMutableNotificationContent()
             content.title = item.title
             content.body = item.body
-            content.sound = .default
+            // Rust resolved the "Play a sound" setting when it decided this
+            // alert had been earned; this side only carries the answer out.
+            // `nil` is UserNotifications' own spelling of "silent".
+            content.sound = item.sound ? UNNotificationSound.default : nil
             // Only what a click needs to be routed. `projectId` is omitted
             // entirely when Rust resolved none, so its absence at click time
             // is the same "no project to open" it was at delivery time.

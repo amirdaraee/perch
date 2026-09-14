@@ -14,6 +14,19 @@ pub fn human_cost(usd: f64) -> String {
     format!("${usd:.2}")
 }
 
+/// "1 minute", never "1 minutes". One helper, in the one module every shell
+/// already formats through, because a second copy is how two spellings of the
+/// same duration appear -- and this app has shipped "1 seconds" twice. Every
+/// caption that interpolates a count goes through here: the settings schema's
+/// stepper captions, the notification labels, the project row summaries.
+pub fn plural(n: i64, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{n} {many}")
+    }
+}
+
 /// Deliberately no "days" bucket: a session blocked for 32 hours should read
 /// as 32h, which is more alarming than 1d 8h. That alarm is the point.
 pub fn human_elapsed(ms: i64) -> String {
@@ -24,6 +37,23 @@ pub fn human_elapsed(ms: i64) -> String {
         format!("{}m", s / 60)
     } else {
         format!("{}h", s / 3600)
+    }
+}
+
+/// A file size as a person reads it. Decimal units, because that is what
+/// Finder shows for the same file and a settings pane that disagrees with
+/// Finder about the size of one file on disk is just wrong twice.
+pub fn human_bytes(n: u64) -> String {
+    const KB: f64 = 1_000.0;
+    let n = n as f64;
+    if n < KB {
+        format!("{n:.0} bytes")
+    } else if n < KB * KB {
+        format!("{:.0} KB", n / KB)
+    } else if n < KB * KB * KB {
+        format!("{:.1} MB", n / (KB * KB))
+    } else {
+        format!("{:.1} GB", n / (KB * KB * KB))
     }
 }
 
@@ -51,10 +81,28 @@ mod tests {
     }
 
     #[test]
+    fn bytes_read_the_way_finder_reads_them() {
+        assert_eq!(human_bytes(0), "0 bytes");
+        assert_eq!(human_bytes(512), "512 bytes");
+        assert_eq!(human_bytes(2_048), "2 KB");
+        assert_eq!(human_bytes(12_400_000), "12.4 MB");
+        assert_eq!(human_bytes(3_200_000_000), "3.2 GB");
+    }
+
+    #[test]
     fn cost_has_two_decimals() {
         assert_eq!(human_cost(0.0), "$0.00");
         assert_eq!(human_cost(8.204), "$8.20");
         assert_eq!(human_cost(38.0), "$38.00");
+    }
+
+    #[test]
+    fn one_is_singular() {
+        // "Check every 1 seconds" has reached a shipped build of this app
+        // twice. This is the whole reason the helper exists.
+        assert_eq!(plural(1, "minute", "minutes"), "1 minute");
+        assert_eq!(plural(0, "minute", "minutes"), "0 minutes");
+        assert_eq!(plural(2, "session", "sessions"), "2 sessions");
     }
 
     #[test]

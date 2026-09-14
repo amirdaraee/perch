@@ -386,7 +386,7 @@ struct ProjectDetailPane: View {
         // view first loaded — a `preferredTerminal` change (from this
         // window, or a hand-edited config.toml) is picked up on the very
         // next launch with no extra plumbing.
-        let terminal = await engine.settings()?.settings.preferredTerminal ?? "Terminal"
+        let terminal = await engine.preferredTerminal() ?? "Terminal"
         do {
             try Launcher.run(command, terminal: terminal)
         } catch {
