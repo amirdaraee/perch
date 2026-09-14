@@ -206,6 +206,27 @@ pub fn titles_for(db: &Db, ids: &[&str]) -> Result<std::collections::HashMap<Str
     Ok(out)
 }
 
+/// The git branch the index last recorded for one session, or `None` when it
+/// has never seen one. Like `titles_for`, an unknown session is simply absent
+/// rather than an error: the popover asks about live sessions, and a session
+/// that has not been indexed yet is an ordinary, momentary state.
+///
+/// `git_branch` is LATEST-wins in `scan.rs`, so this is the branch the session
+/// was on when it last wrote a turn — which is the branch it is on now,
+/// unless the user switched without saying anything to Claude Code.
+pub fn session_branch(db: &Db, session_id: &str) -> Result<Option<String>> {
+    let branch: Option<String> = db
+        .conn()
+        .query_row(
+            "SELECT git_branch FROM sessions WHERE id = ?1",
+            [session_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(branch.filter(|b| !b.trim().is_empty()))
+}
+
 /// Tokens and estimated cost for one session, priced per model and summed.
 /// An unknown session is simply zero — it is not an error to ask.
 pub fn session_usage(db: &Db, session_id: &str) -> Result<(TurnUsage, f64)> {
@@ -656,6 +677,52 @@ mod tests {
             }],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn session_branch_is_the_one_the_index_recorded_and_nothing_when_it_has_none() {
+        let db = open_in_memory().unwrap();
+        let pid = db
+            .upsert_project("-Users-a-one", "/Users/a/one", false)
+            .unwrap();
+
+        // No branch recorded at all, a recorded branch, and a blank one —
+        // which the transcript writes when the session is not in a git
+        // checkout. All three must read as "Perch does not know", so the
+        // detail row shows an em dash rather than an empty label.
+        for (id, branch) in [
+            ("s-none", None),
+            ("s-main", Some("main".to_string())),
+            ("s-blank", Some("   ".to_string())),
+        ] {
+            db.upsert_session(&SessionRecord {
+                id: id.into(),
+                project_id: pid,
+                file_path: format!("/tmp/{id}.jsonl"),
+                file_size: 0,
+                indexed_offset: 0,
+                started_at: Some(1_000),
+                last_activity_at: Some(2_000),
+                cwd: None,
+                git_branch: branch,
+                cc_version: None,
+                title: None,
+                message_count: 1,
+            })
+            .unwrap();
+        }
+
+        assert_eq!(
+            session_branch(&db, "s-main").unwrap().as_deref(),
+            Some("main")
+        );
+        assert_eq!(session_branch(&db, "s-none").unwrap(), None);
+        assert_eq!(session_branch(&db, "s-blank").unwrap(), None);
+        assert_eq!(
+            session_branch(&db, "never-indexed").unwrap(),
+            None,
+            "asking about a session the index has never seen is not an error"
+        );
     }
 
     #[test]
