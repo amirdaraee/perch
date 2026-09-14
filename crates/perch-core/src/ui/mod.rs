@@ -6,6 +6,7 @@ pub mod format;
 pub mod main_window;
 pub mod model;
 pub mod prices;
+pub mod session_menu;
 pub mod settings;
 pub mod usage;
 pub mod watcher;
