@@ -359,9 +359,14 @@ pub fn build_model(
                 (t, "") => Some(t.to_string()),
                 (t, c) => Some(format!("{t} · {c}")),
             };
+            // Every segment is guarded, not just the version: a session
+            // record needs only `pid` and `sessionId`, so a missing `cwd`
+            // (blank by `live.rs`'s own default) or a missing `kind` would
+            // otherwise contribute an empty segment and leave the line
+            // starting with " · ".
             let detail_line = [
-                Some(project.clone()),
-                Some(kind.clone()),
+                (!project.is_empty()).then(|| project.clone()),
+                (!kind.is_empty()).then(|| kind.clone()),
                 (!version.is_empty()).then(|| format!("v{version}")),
                 usage_part,
             ]
@@ -1280,6 +1285,21 @@ mod tests {
         assert_eq!(
             m.live[0].detail_line, "proj · interactive · v2.1.251",
             "and the composed line drops the segment too"
+        );
+    }
+
+    /// `live::parse_session_record` requires only `pid` and `sessionId`, and
+    /// defaults a missing `cwd` to `""` — so `project` can genuinely be
+    /// empty, and an empty segment must drop out of the composed line rather
+    /// than leaving it starting with " · ".
+    #[test]
+    fn an_absent_cwd_leaves_no_leading_separator() {
+        let sess = live(9, "a", "alpha", "", SessionStatus::Working, "interactive");
+        let m = build_model(None, &[sess], 10_000, None, &count_and_waiting());
+        assert_eq!(m.live[0].project, "", "nothing is known about the folder");
+        assert_eq!(
+            m.live[0].detail_line, "interactive · v2.1.251",
+            "and the line starts with what is known"
         );
     }
 
