@@ -11,6 +11,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let menu = NSMenu()
     private let engine: PerchEngine
     private var cancellables = Set<AnyCancellable>()
+    /// The metrics the last rendered model chose; `nil` until one arrives.
+    private var density: PerchDensityMetrics?
 
     /// Set by `AppDelegate`. The status item owns the menu, not the window's
     /// lifetime, so it just asks for the window to be shown.
@@ -35,10 +37,18 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         engine.refresh()
     }
 
+    /// Every display choice below arrives on the model — which sections to
+    /// draw, how tight a row is, whether a row carries its folder. None of it
+    /// is read out of `Settings` here: two readers of one preference is how a
+    /// window and a menu come to disagree about what is on screen.
     private func render(_ model: PopoverModel?) {
         statusItem.button?.title = model?.trayTitle ?? ""
         applyIcon(model)
         menu.removeAllItems()
+        // The density the *current* model asks for, handed to every card
+        // hosted below. Before the first model there is none, so `add` falls
+        // back to the environment default, which is the shipped one.
+        density = model?.rowDensity.metrics
 
         guard let model else {
             add(EmptyCard(title: engine.startupError ?? "Starting…", detail: nil))
@@ -54,15 +64,17 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         if let err = model.error { add(EmptyCard(title: "Index unavailable", detail: err)) }
         menu.addItem(.separator())
 
+        // The banner is Rust's decision, not a section: it reports that
+        // something is blocked on the user, which stays true whether or not
+        // they keep the waiting list on screen.
         if let banner = model.waitingBanner {
             add(EmptyCard(title: banner, detail: nil))
         }
-        if model.live.isEmpty {
-            add(EmptyCard(title: "No sessions running", detail: nil))
-        } else {
-            for row in model.live { add(SessionRowView(row: row)) }
-        }
-        if !model.recent.isEmpty {
+        addLiveSections(model)
+        // `show_recent == false` already leaves `recent` empty — the section
+        // is not even queried — so there is nothing to re-filter here. The
+        // flag decides only whether the header is drawn.
+        if model.showRecent && !model.recent.isEmpty {
             menu.addItem(.separator())
             add(RecentCard(rows: model.recent))
         }
@@ -71,6 +83,27 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         addSettings()
         menu.addItem(.separator())
         addQuit()
+    }
+
+    /// The two live sections, each drawn only if the user kept it. A session
+    /// belongs to exactly one of them — waiting, or everything still open —
+    /// so no session can fall through both toggles and become undrawable.
+    private func addLiveSections(_ model: PopoverModel) {
+        let waiting = model.live.filter { $0.status == .waiting }
+        let working = model.live.filter { $0.status != .waiting }
+
+        if model.live.isEmpty {
+            add(EmptyCard(title: "No sessions running", detail: nil))
+            return
+        }
+        if model.showWaiting && !waiting.isEmpty {
+            add(SectionHeaderCard(title: "Waiting on you"))
+            for row in waiting { add(SessionRowView(row: row)) }
+        }
+        if model.showWorking && !working.isEmpty {
+            add(SectionHeaderCard(title: "Working"))
+            for row in working { add(SessionRowView(row: row)) }
+        }
     }
 
     /// Draw the glyph the model chose, dimmed when the data behind it has
@@ -97,9 +130,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         button.appearsDisabled = stale != nil
     }
 
+    /// Each card is its own hosting view, so the density has to be injected
+    /// per root rather than once at a shared ancestor — there isn't one.
     private func add<V: View>(_ view: V) {
         let item = NSMenuItem()
-        let host = NSHostingView(rootView: view)
+        let host = NSHostingView(rootView: view.environment(\.perchDensity, density ?? .comfortable))
         host.frame.size = host.fittingSize
         item.view = host
         menu.addItem(item)

@@ -4,10 +4,11 @@ import PerchFFI
 /// Up to a few recently-ended sessions, listed below the live ones.
 struct RecentCard: View {
     let rows: [RecentRow]
+    @Environment(\.perchDensity) private var density
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Recent").font(.caption2).foregroundStyle(.secondary).textCase(.uppercase)
+        VStack(alignment: .leading, spacing: density.rowSpacing / 2) {
+            SectionHeader(title: "Recent")
             ForEach(rows, id: \.id) { r in
                 HStack {
                     Circle().fill(Color.perchBackground).frame(width: 8, height: 8)
