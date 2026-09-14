@@ -74,14 +74,17 @@ final class SessionSubmenu: NSObject, NSMenuDelegate {
             return
         }
 
-        let host = NSHostingView(
-            rootView: SessionDetailCard(rows: model.detail).environment(\.perchDensity, density)
-        )
-        host.frame.size = host.fittingSize
-        let detail = NSMenuItem()
-        detail.view = host
-        menu.addItem(detail)
+        menu.addItem(card(SessionDetailCard(rows: model.detail)))
         menu.addItem(.separator())
+
+        // Empty in every field is how Rust says the user turned these numbers
+        // off, and a section the user hid is no section at all — not a
+        // heading with nothing under it, and not a separator with nothing
+        // between.
+        if !isHidden(model.usage) {
+            menu.addItem(card(SessionUsageCard(usage: model.usage)))
+            menu.addItem(.separator())
+        }
 
         for action in model.actions {
             menu.addItem(item(for: action))
@@ -92,6 +95,30 @@ final class SessionSubmenu: NSObject, NSMenuDelegate {
     }
 
     // MARK: - Items
+
+    /// A SwiftUI view as one menu item, sized to what it asked for.
+    private func card(_ view: some View) -> NSMenuItem {
+        let host = NSHostingView(rootView: view.environment(\.perchDensity, density))
+        host.frame.size = host.fittingSize
+        let item = NSMenuItem()
+        item.view = host
+        return item
+    }
+
+    /// Whether Rust left the usage section entirely empty, which is what
+    /// `show_row_usage` being off looks like from here. Every field is
+    /// checked rather than the heading alone: this is the one place a menu
+    /// item is added or not, and an empty card between two separators is the
+    /// failure it exists to prevent.
+    private func isHidden(_ usage: SessionUsage) -> Bool {
+        usage.heading.isEmpty
+            && usage.classes.isEmpty
+            && usage.modelsHeading.isEmpty
+            && usage.byModel.isEmpty
+            && usage.chartCaption.isEmpty
+            && usage.chart.isEmpty
+            && usage.note == nil
+    }
 
     private func placeholder() -> NSMenuItem {
         let item = NSMenuItem()
