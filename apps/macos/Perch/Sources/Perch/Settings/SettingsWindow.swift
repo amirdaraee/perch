@@ -701,11 +701,41 @@ struct SettingsRootView: View {
     /// sidebar, so the filtered view is asked for again.
     private func adopt(_ result: SettingsResult) async {
         notes = result.notes
+        reconcileLoginItem(result.panes)
         guard let q = queryOrNil else {
             panes = result.panes
             return
         }
         panes = await engine.settingsSchema(query: q)?.panes ?? result.panes
+    }
+
+    /// macOS owns whether Perch is a login item; the settings file only
+    /// records what Perch asked for. Toggling the row keeps the two in step,
+    /// but a reset writes the file without going near the row — so a reset
+    /// that claims to put all twenty-six settings back to factory values
+    /// would leave Perch still launching at login, and the pane's "Reset to
+    /// defaults" would then hide for a value that had not reset.
+    ///
+    /// Every mutating call funnels through here, so reconciling here covers
+    /// both resets without either having to remember to.
+    private func reconcileLoginItem(_ panes: [SettingsPane]) {
+        let stored = panes
+            .lazy
+            .flatMap(\.groups)
+            .flatMap(\.rows)
+            .first { $0.key == .launchAtLogin }
+            .flatMap { row -> Bool? in
+                if case let .toggle(on) = row.control { return on }
+                return nil
+            }
+        guard let stored, stored != LoginItem.isRegistered else { return }
+        do {
+            try LoginItem.setRegistered(stored)
+        } catch {
+            // Surfaced, never swallowed: a registration macOS refused must
+            // not look like one that took.
+            actionError = error.localizedDescription
+        }
     }
 }
 
