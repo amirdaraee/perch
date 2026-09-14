@@ -7,7 +7,7 @@ use perch_core::ui::{
     advanced as core_advanced, diagnostics as core_diagnostics, main_window, model as core_model,
     prices as core_prices, settings as core_ui_settings, usage as core_usage, watcher,
 };
-use perch_core::{config, db, index, live, notify, pricing, query, settings, terminals};
+use perch_core::{config, db, discovery, index, live, notify, pricing, query, settings, terminals};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
@@ -1706,14 +1706,23 @@ impl ThisPerch {
         // now — must be reflected the moment the *next* tick's model goes
         // out, not only after some separate settings-watch machinery reacts.
         let loaded_settings = settings::store::load(&self.config_path).settings;
-        // This tick's read is the newest successful one when the index
-        // opened; when it did not, the last one that did still stands, and
-        // the gap between it and now is exactly the staleness the user asked
-        // to be dimmed for.
+        // Can we still reach the user's session data? This — not `db::open`
+        // — is what "Perch has managed to re-read your sessions" means. Our
+        // own SQLite file is created by opening it, so it opens on every tick
+        // whether or not Claude Code's directory is still there; measuring
+        // staleness against that made `dim_when_stale` unfireable.
+        // `check_readable` owns the judgement and the wording (see its doc
+        // comment for why an empty-but-listable `projects/` counts as a
+        // successful read).
+        let read_result = discovery::check_readable(&self.config_dir());
+        // This tick's read is the newest successful one when both the index
+        // opened and the user's sessions were reachable; when either failed,
+        // the last one that did still stands, and the gap between it and now
+        // is exactly the staleness the user asked to be dimmed for.
         let now = now_ms();
         let last_read = {
             let mut last = self.last_read_ms.lock().unwrap();
-            if db_result.is_ok() {
+            if db_result.is_ok() && read_result.is_ok() {
                 *last = Some(now);
             }
             *last
@@ -1733,6 +1742,15 @@ impl ThisPerch {
             model
                 .error
                 .get_or_insert_with(|| format!("could not open index: {e}"));
+        }
+        // A vanished Claude Code directory must read as an error, not as
+        // frozen numbers: `index_all` tolerates a missing projects root and
+        // succeeds over nothing, so `reindex_error` would stay `None` and the
+        // popover would keep showing the last totals forever. This is also
+        // more specific than a re-index failure remembered from an earlier
+        // tick, so it is folded first.
+        if let Err(e) = &read_result {
+            model.error.get_or_insert_with(|| e.to_string());
         }
         if let Some(err) = self.reindex_error.lock().unwrap().clone() {
             model.error.get_or_insert(err);
@@ -2985,6 +3003,56 @@ mod tests {
             snap.error.is_some(),
             "an unopenable index must surface in model.error on every tick, \
              not just around an explicit re-index"
+        );
+    }
+
+    /// The one test that exercises staleness through the *engine* rather
+    /// than by handing `build_model` a `last_read_ms` by hand. The pure
+    /// function was always right; what was wrong was that nothing could ever
+    /// hand it an old value, because the signal was "our own SQLite file
+    /// opened" — and `db::open` creates that file, so it succeeded on every
+    /// tick even with the Claude Code directory moved away.
+    #[test]
+    fn a_vanished_claude_code_directory_stops_the_clock_and_says_so() {
+        let claude = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(claude.path().join("projects")).unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _guard = DataDirGuard::set(data.path());
+        let perch = Perch::new(Some(claude.path().to_string_lossy().into_owned())).unwrap();
+
+        let healthy = perch.current();
+        assert!(
+            healthy.staleness.is_none(),
+            "a readable Claude Code directory is a successful read, empty or not"
+        );
+        assert!(healthy.error.is_none(), "and no error: {:?}", healthy.error);
+        let read_at = perch.last_read_ms.lock().unwrap().expect("a read happened");
+
+        // The user moves ~/.claude aside, and ten minutes pass.
+        let ten_minutes_ago = read_at - 10 * 60_000;
+        *perch.last_read_ms.lock().unwrap() = Some(ten_minutes_ago);
+        let path = claude.path().to_path_buf();
+        claude.close().unwrap();
+        assert!(!path.exists());
+
+        let gone = perch.current();
+        assert_eq!(
+            *perch.last_read_ms.lock().unwrap(),
+            Some(ten_minutes_ago),
+            "a tick that could not reach the user's sessions is not a read, \
+             however well our own index opened"
+        );
+        let stale = gone
+            .staleness
+            .expect("ten minutes without a read is past the five-minute default");
+        assert!(
+            stale.label.starts_with("Last updated"),
+            "finished words, not a number: {}",
+            stale.label
+        );
+        assert!(
+            gone.error.is_some(),
+            "and a vanished Claude Code directory is an error, not frozen numbers"
         );
     }
 
