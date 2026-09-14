@@ -1,4 +1,5 @@
 import SwiftUI
+import PerchFFI
 
 /// Colours and layout shared by every menu card, kept in one place so a
 /// future tweak can't drift the shade or width apart between cards.
@@ -70,21 +71,86 @@ private enum PerchCardMetrics {
     static let horizontalPadding: CGFloat = 14
 }
 
+/// Which shape of card is being drawn. Each kind has its own vertical padding
+/// — section cards breathe more than session rows — and each density has its
+/// own table of the three.
+enum PerchCardKind {
+    case section
+    case row
+    case stats
+}
+
+/// The pixel table one `RowDensity` selects. The *choice* is the model's; the
+/// measurements are drawing, which is the shell's half of the bargain. Nothing
+/// here reads a setting: the metrics arrive from `PopoverModel.rowDensity` via
+/// the environment, so the menu bar cannot disagree with the settings window
+/// about how tight a row is.
+struct PerchDensityMetrics {
+    let section: CGFloat
+    let row: CGFloat
+    let stats: CGFloat
+    /// Gap between a row's dot and its text column.
+    let rowSpacing: CGFloat
+    /// Gap between the stacked lines inside one row.
+    let lineSpacing: CGFloat
+
+    static let comfortable = PerchDensityMetrics(
+        section: 8, row: 6, stats: 10, rowSpacing: 9, lineSpacing: 1
+    )
+    /// Roughly two-thirds the vertical air of `comfortable`, which is enough
+    /// to read as tighter at a glance without the lines touching.
+    static let compact = PerchDensityMetrics(
+        section: 5, row: 2, stats: 6, rowSpacing: 7, lineSpacing: 0
+    )
+
+    func padding(for kind: PerchCardKind) -> CGFloat {
+        switch kind {
+        case .section: section
+        case .row: row
+        case .stats: stats
+        }
+    }
+}
+
+extension RowDensity {
+    var metrics: PerchDensityMetrics {
+        switch self {
+        case .comfortable: .comfortable
+        case .compact: .compact
+        }
+    }
+}
+
+private struct PerchDensityKey: EnvironmentKey {
+    /// Matches `Settings::default().row_density`, so a card hosted before the
+    /// first model arrives draws at the shipped density rather than a second
+    /// one invented here.
+    static let defaultValue = PerchDensityMetrics.comfortable
+}
+
+extension EnvironmentValues {
+    var perchDensity: PerchDensityMetrics {
+        get { self[PerchDensityKey.self] }
+        set { self[PerchDensityKey.self] = newValue }
+    }
+}
+
 /// The common menu-card shape: full popover width, shared horizontal padding,
-/// and a per-card vertical padding (section cards are looser than session rows).
+/// and a vertical padding chosen by the card's kind at the current density.
 struct PerchCardStyle: ViewModifier {
-    var verticalPadding: CGFloat
+    var kind: PerchCardKind
+    @Environment(\.perchDensity) private var density
 
     func body(content: Content) -> some View {
         content
             .padding(.horizontal, PerchCardMetrics.horizontalPadding)
-            .padding(.vertical, verticalPadding)
+            .padding(.vertical, density.padding(for: kind))
             .frame(width: PerchCardMetrics.width, alignment: .leading)
     }
 }
 
 extension View {
-    func perchCard(verticalPadding: CGFloat = 8) -> some View {
-        modifier(PerchCardStyle(verticalPadding: verticalPadding))
+    func perchCard(_ kind: PerchCardKind = .section) -> some View {
+        modifier(PerchCardStyle(kind: kind))
     }
 }
