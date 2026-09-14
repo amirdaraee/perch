@@ -14,8 +14,11 @@ final class SessionSubmenu: NSObject, NSMenuDelegate {
 
     private let engine: PerchEngine
     private let sessionId: String
-    private let pid: Int32
-    private let density: PerchDensityMetrics
+    /// `claude`'s own pid, which Focus walks upward from. Refreshed by
+    /// `adopt`: a session id outlives any one process only in principle, but
+    /// nothing here needs to assume it doesn't.
+    private var pid: Int32
+    private var density: PerchDensityMetrics
 
     /// What the last `menuNeedsUpdate` composed, kept because the click comes
     /// afterwards and the handlers need the id and path Rust handed over.
@@ -38,6 +41,14 @@ final class SessionSubmenu: NSObject, NSMenuDelegate {
         // enough to make it real, and `menuNeedsUpdate` clears it before it
         // can ever be seen.
         menu.addItem(placeholder())
+    }
+
+    /// Take on the newest row for this session. Called on every render,
+    /// because the controller is reused across them — a submenu being read
+    /// must not be dropped just because the popover behind it redrew.
+    func adopt(row: SessionRow, density: PerchDensityMetrics) {
+        self.pid = row.pid
+        self.density = density
     }
 
     /// Sent immediately before the submenu is displayed, which is exactly

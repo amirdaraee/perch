@@ -13,11 +13,17 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var cancellables = Set<AnyCancellable>()
     /// The metrics the last rendered model chose; `nil` until one arrives.
     private var density: PerchDensityMetrics?
-    /// One per session row currently drawn. An `NSMenuItem` does not retain
-    /// its submenu's delegate, so these are held here for exactly as long as
-    /// the rows they belong to are on screen, and replaced wholesale on the
-    /// next render.
-    private var submenus: [SessionSubmenu] = []
+    /// One per session, keyed by session id. An `NSMenuItem` holds its target
+    /// and its submenu's delegate weakly, so the controller has to be held
+    /// here or a submenu would go inert the moment it was built.
+    ///
+    /// Kept *across* renders rather than rebuilt with the rows, because the
+    /// model re-emits at least every `poll_seconds` — including while the
+    /// menu is open and a submenu is being read. Rebuilding these wholesale
+    /// would drop the controller a user is pointing at, and their click would
+    /// land on nothing. Entries are pruned when their session stops being
+    /// drawn, so this tracks the live set rather than growing.
+    private var submenus: [String: SessionSubmenu] = [:]
 
     /// Set by `AppDelegate`. The status item owns the menu, not the window's
     /// lifetime, so it just asks for the window to be shown.
@@ -49,8 +55,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private func render(_ model: PopoverModel?) {
         statusItem.button?.title = model?.trayTitle ?? ""
         applyIcon(model)
+        // Detach every submenu from the item that carried it before the items
+        // go: an `NSMenu` may belong to one menu item at a time, and these
+        // menus outlive the items, being reattached to next render's rows.
+        for item in menu.items { item.submenu = nil }
         menu.removeAllItems()
-        submenus.removeAll()
         // The density the *current* model asks for, handed to every card
         // hosted below. Before the first model there is none, so `add` falls
         // back to the environment default, which is the shipped one.
@@ -98,6 +107,12 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         let waiting = model.live.filter { $0.status == .waiting }
         let working = model.live.filter { $0.status != .waiting }
 
+        // A session that is no longer live has no row to hang a submenu off,
+        // so its controller goes. Done before the rows are added, never
+        // after: the reuse below is what keeps the survivors.
+        let liveIds = Set(model.live.map(\.id))
+        submenus = submenus.filter { liveIds.contains($0.key) }
+
         if model.live.isEmpty {
             add(EmptyCard(title: "No sessions running", detail: nil))
             return
@@ -119,8 +134,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// gets there, so its facts are read at the moment they are shown.
     private func addSession(_ row: SessionRow) {
         let item = add(SessionRowView(row: row))
-        let submenu = SessionSubmenu(engine: engine, row: row, density: density ?? .comfortable)
-        submenus.append(submenu)
+        let metrics = density ?? .comfortable
+        // Reused when this session already had one, so a submenu being read
+        // right now survives the re-render underneath it. Its contents are
+        // composed afresh on every open regardless, so nothing stale is kept
+        // — only the pid and the density it draws at, which are updated here.
+        let submenu = submenus[row.id] ?? SessionSubmenu(engine: engine, row: row, density: metrics)
+        submenu.adopt(row: row, density: metrics)
+        submenus[row.id] = submenu
         item.submenu = submenu.menu
     }
 
