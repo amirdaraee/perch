@@ -271,6 +271,9 @@ stale_after_minutes = 5
 poll_seconds = 5
 # Which terminal "Resume" opens.
 preferred_terminal = "Terminal"
+# Launch "Resume" with --dangerously-skip-permissions, so Claude Code never
+# asks before running a command or editing a file.
+resume_bypass_permissions = false
 
 [popover]
 # Which sections the menu-bar popover shows.
@@ -394,6 +397,7 @@ pub fn save(path: &Path, s: &Settings) -> Result<()> {
     let sessions = ensure_table(&mut doc, "sessions");
     sessions["poll_seconds"] = value(i64::from(s.poll_seconds));
     sessions["preferred_terminal"] = value(s.preferred_terminal.clone());
+    sessions["resume_bypass_permissions"] = value(s.resume_bypass_permissions);
 
     let popover = ensure_table(&mut doc, "popover");
     popover["show_waiting"] = value(s.show_waiting);
@@ -925,6 +929,7 @@ mod tests {
             stale_after_minutes: 11,
             poll_seconds: 12,
             preferred_terminal: "iTerm2".to_string(),
+            resume_bypass_permissions: true,
             show_waiting: false,
             show_working: false,
             show_recent: false,

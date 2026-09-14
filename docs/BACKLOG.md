@@ -44,7 +44,7 @@ Status legend: **now** = next task · **next** = this milestone or the following
   ranking, and a per-model breakdown, as a second tab alongside the project list.
 - **Settings window.** A sidebar window of nine panes (General, Menu Bar, Popover, Projects,
   Usage, Prices, Notifications, Diagnostics, Advanced) reached from the status-item menu's
-  **Settings…**, covering twenty-six settings — every one wired to real behaviour, not just
+  **Settings…**, covering twenty-seven settings — every one wired to real behaviour, not just
   stored. The schema is built in Rust (`settings::schema`): panes, groups, rows, controls,
   bounds, help sentences, search terms, the attention badges, and the per-pane preview of
   what the current choices produce in the user's own data. Swift renders one SwiftUI control

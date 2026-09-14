@@ -278,6 +278,9 @@ pub struct Settings {
     pub poll_seconds: u32,
     /// "Terminal" | "iTerm2" | ...
     pub preferred_terminal: String,
+    /// Launch Resume with `--dangerously-skip-permissions`, so the resumed
+    /// session never stops to ask before acting.
+    pub resume_bypass_permissions: bool,
     pub show_waiting: bool,
     pub show_working: bool,
     pub show_recent: bool,
@@ -324,6 +327,10 @@ impl Default for Settings {
             stale_after_minutes: 5,
             poll_seconds: 5,
             preferred_terminal: "Terminal".to_string(),
+            // Resume has always prompted; off is what the user already has,
+            // and the one default here where the safe answer and the
+            // unchanged answer agree.
+            resume_bypass_permissions: false,
             // Today's popover shows all three sections.
             show_waiting: true,
             show_working: true,
@@ -510,6 +517,7 @@ impl Default for MenuBarSection {
 struct SessionsSection {
     poll_seconds: u32,
     preferred_terminal: String,
+    resume_bypass_permissions: bool,
 }
 
 impl Default for SessionsSection {
@@ -518,6 +526,7 @@ impl Default for SessionsSection {
         SessionsSection {
             poll_seconds: d.poll_seconds,
             preferred_terminal: d.preferred_terminal,
+            resume_bypass_permissions: d.resume_bypass_permissions,
         }
     }
 }
@@ -642,6 +651,7 @@ impl From<Settings> for SettingsFile {
             sessions: SessionsSection {
                 poll_seconds: s.poll_seconds,
                 preferred_terminal: s.preferred_terminal,
+                resume_bypass_permissions: s.resume_bypass_permissions,
             },
             popover: PopoverSection {
                 show_waiting: s.show_waiting,
@@ -684,6 +694,7 @@ impl From<SettingsFile> for Settings {
             stale_after_minutes: f.menu_bar.stale_after_minutes,
             poll_seconds: f.sessions.poll_seconds,
             preferred_terminal: f.sessions.preferred_terminal,
+            resume_bypass_permissions: f.sessions.resume_bypass_permissions,
             show_waiting: f.popover.show_waiting,
             show_working: f.popover.show_working,
             show_recent: f.popover.show_recent,

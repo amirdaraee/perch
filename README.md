@@ -80,14 +80,15 @@ the main window exactly as they do for the menu.
 
 **Settings…** (⌘,) in the status-item menu opens a sidebar window of nine panes — General,
 Menu Bar, Popover, Projects, Usage, Prices, Notifications, Diagnostics, and Advanced —
-covering twenty-six settings. Among them: launch at login; the Claude Code directory
+covering twenty-seven settings. Among them: launch at login; the Claude Code directory
 (auto-detect, or an explicit override for when auto-detection picks the wrong one); the menu
 bar's display mode, its glyph, and whether it dims once the index has gone unread for longer
 than N minutes; which popover sections are drawn, how many recent sessions they list, the row
 density, and whether a row carries its project folder and its usage; how recently a project
 counts as active and whether archived ones are listed; the chart range, the top-projects
 ranking, the burn-rate unit, and whether costs are shown at all; the three notification
-settings below; the poll interval; and the preferred terminal.
+settings below; the poll interval; the preferred terminal; and whether Resume launches
+Claude Code with `--dangerously-skip-permissions`.
 
 A search field at the top of the sidebar narrows every pane to the rows that match, so a
 setting can be found by what it does rather than by guessing which pane it lives in. A pane

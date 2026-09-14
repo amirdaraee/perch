@@ -712,7 +712,7 @@ struct SettingsRootView: View {
     /// macOS owns whether Perch is a login item; the settings file only
     /// records what Perch asked for. Toggling the row keeps the two in step,
     /// but a reset writes the file without going near the row — so a reset
-    /// that claims to put all twenty-six settings back to factory values
+    /// that claims to put all twenty-seven settings back to factory values
     /// would leave Perch still launching at login, and the pane's "Reset to
     /// defaults" would then hide for a value that had not reset.
     ///

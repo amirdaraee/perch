@@ -168,7 +168,7 @@ final class PerchEngine: ObservableObject {
         }.value
     }
 
-    /// Restore every setting at once. One call, not twenty-six: a reset that
+    /// Restore every setting at once. One call, not twenty-seven: a reset that
     /// failed halfway would leave a configuration that is neither what Perch
     /// ships nor what the user chose.
     func resetAllSettings() async -> Result<SettingsResult, Error> {
