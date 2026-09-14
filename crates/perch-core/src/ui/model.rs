@@ -412,12 +412,20 @@ pub fn build_model(
                         .map(project_of)
                         .unwrap_or_else(|| r.id.chars().take(8).collect());
                     let ended_ago = human_elapsed(now_ms - r.last_activity_at);
-                    let tokens = if r.usage.total_tokens() > 0 {
+                    // Same two-sentinel rule the live rows above follow:
+                    // `show_row_usage` off blanks the segment ("you asked not
+                    // to see this"), while a session the index has no turns
+                    // for gets the dash ("Perch does not know"). Both drop
+                    // out of the composed line rather than leaving a stray
+                    // " · " behind.
+                    let tokens = if !settings.show_row_usage {
+                        String::new()
+                    } else if r.usage.total_tokens() > 0 {
                         human_tokens(r.usage.total_tokens())
                     } else {
                         DASH.into()
                     };
-                    let ended_line = if tokens == DASH {
+                    let ended_line = if tokens.is_empty() || tokens == DASH {
                         format!("ended {ended_ago} ago")
                     } else {
                         format!("{tokens} · ended {ended_ago} ago")
@@ -1263,6 +1271,33 @@ mod tests {
         assert_eq!(
             m.live[0].detail_line, "proj · interactive · v2.1.251",
             "and the composed line drops the segment too"
+        );
+    }
+
+    /// The Recent card is the other half of the same popover: "Show tokens
+    /// and cost" has to reach it too, or one card drops its usage while the
+    /// one beneath it still reads `2.0M · ended 1s ago`.
+    #[test]
+    fn hiding_row_usage_reaches_the_recent_rows_as_well() {
+        // No live sessions, so the seeded one is *recent* rather than live.
+        let shown = build_model(Some(&priced_db()), &[], 10_000, None, &count_and_waiting());
+        assert_eq!(shown.recent.len(), 1, "the recent row is there to hide");
+        assert_eq!(shown.recent[0].tokens, "2.0M");
+        assert_eq!(shown.recent[0].ended_line, "2.0M · ended 1s ago");
+
+        let s = Settings {
+            show_row_usage: false,
+            ..count_and_waiting()
+        };
+        let hidden = build_model(Some(&priced_db()), &[], 10_000, None, &s);
+        assert_eq!(hidden.recent.len(), 1);
+        assert_eq!(
+            hidden.recent[0].tokens, "",
+            "blank says the user hid it; a dash would say Perch does not know"
+        );
+        assert_eq!(
+            hidden.recent[0].ended_line, "ended 1s ago",
+            "and the composed line drops the segment without a dangling separator"
         );
     }
 
