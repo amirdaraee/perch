@@ -13,6 +13,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var cancellables = Set<AnyCancellable>()
     /// The metrics the last rendered model chose; `nil` until one arrives.
     private var density: PerchDensityMetrics?
+    /// One per session row currently drawn. An `NSMenuItem` does not retain
+    /// its submenu's delegate, so these are held here for exactly as long as
+    /// the rows they belong to are on screen, and replaced wholesale on the
+    /// next render.
+    private var submenus: [SessionSubmenu] = []
 
     /// Set by `AppDelegate`. The status item owns the menu, not the window's
     /// lifetime, so it just asks for the window to be shown.
@@ -45,6 +50,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         statusItem.button?.title = model?.trayTitle ?? ""
         applyIcon(model)
         menu.removeAllItems()
+        submenus.removeAll()
         // The density the *current* model asks for, handed to every card
         // hosted below. Before the first model there is none, so `add` falls
         // back to the environment default, which is the shipped one.
@@ -98,12 +104,24 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
         if model.showWaiting && !waiting.isEmpty {
             add(SectionHeaderCard(title: "Waiting on you"))
-            for row in waiting { add(SessionRowView(row: row)) }
+            for row in waiting { addSession(row) }
         }
         if model.showWorking && !working.isEmpty {
             add(SectionHeaderCard(title: "Working"))
-            for row in working { add(SessionRowView(row: row)) }
+            for row in working { addSession(row) }
         }
+    }
+
+    /// One session row, plus the side menu of that session's own detail and
+    /// actions. The row keeps its hosting view — which is why `SessionRowView`
+    /// draws its own chevron, AppKit drawing no disclosure arrow for a
+    /// view-backed item — and the submenu fills itself in when the pointer
+    /// gets there, so its facts are read at the moment they are shown.
+    private func addSession(_ row: SessionRow) {
+        let item = add(SessionRowView(row: row))
+        let submenu = SessionSubmenu(engine: engine, row: row, density: density ?? .comfortable)
+        submenus.append(submenu)
+        item.submenu = submenu.menu
     }
 
     /// Draw the glyph the model chose, dimmed when the data behind it has
@@ -132,12 +150,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     /// Each card is its own hosting view, so the density has to be injected
     /// per root rather than once at a shared ancestor — there isn't one.
-    private func add<V: View>(_ view: V) {
+    @discardableResult
+    private func add<V: View>(_ view: V) -> NSMenuItem {
         let item = NSMenuItem()
         let host = NSHostingView(rootView: view.environment(\.perchDensity, density ?? .comfortable))
         host.frame.size = host.fittingSize
         item.view = host
         menu.addItem(item)
+        return item
     }
 
     private func addOpenWindow() {

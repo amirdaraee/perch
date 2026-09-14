@@ -36,6 +36,16 @@ struct SessionRowView: View {
                         .truncationMode(.middle)
                 }
             }
+            Spacer(minLength: 10)
+            // AppKit draws no disclosure arrow on a menu item that carries a
+            // custom view, so without this the side menu would exist with
+            // nothing on screen to say so. `.forward` rather than `.right`:
+            // it is the trailing edge that matters, and a menu mirrors.
+            Image(systemName: "chevron.forward")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .padding(.top, 3)
+                .accessibilityHidden(true)
         }
         .perchCard(.row)
     }

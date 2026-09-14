@@ -103,6 +103,22 @@ final class PerchEngine: ObservableObject {
         }.value
     }
 
+    /// One session's own menu, for the submenu hanging off its popover row.
+    ///
+    /// Synchronous, unlike every other read here, because AppKit asks for a
+    /// submenu's contents from `menuNeedsUpdate(_:)` and cannot await. The
+    /// work is one directory read and a couple of indexed lookups — the same
+    /// shape of read `current()` already performs on the main thread at
+    /// startup.
+    ///
+    /// `owningApp` is the application the shell resolved the session's pid
+    /// to: Rust phrases the Focus action, but only AppKit can say what is
+    /// running. `nil` back means the session is no longer live (or the engine
+    /// never started).
+    func sessionMenu(sessionId: String, owningApp: String?) -> SessionMenu? {
+        perch?.sessionMenu(sessionId: sessionId, owningApp: owningApp)
+    }
+
     /// Builders are pure (non-throwing) on the Rust side; `nil` here only
     /// means the engine itself isn't running.
     func resumeCommand(sessionId: String, cwd: String) async -> TerminalCommand? {
