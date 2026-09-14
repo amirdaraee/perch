@@ -165,9 +165,17 @@ pub fn build_main_window(
     // still has to be decided here, not by whichever shell renders it.
     let mut projects: Vec<(ProjectRow, Option<i64>)> = summaries
         .into_iter()
-        .map(|s| {
+        .filter_map(|s| {
             let meta = db.project_meta(s.id).ok();
             let archived = meta.as_ref().is_some_and(|m| m.archived);
+            // "Show archived projects" is a grouping decision, so it is made
+            // here rather than by whichever shell draws the sidebar. Hidden
+            // means gone, not demoted: an archived project must never
+            // reappear under Pinned or Recent because the group that owned it
+            // was suppressed.
+            if archived && !settings.show_archived {
+                return None;
+            }
             let pinned = meta.as_ref().is_some_and(|m| m.pinned);
             let group = if archived {
                 ProjectGroup::Archived
@@ -221,7 +229,7 @@ pub fn build_main_window(
                 last_active,
                 live_session_count,
             };
-            (row, s.last_activity_at)
+            Some((row, s.last_activity_at))
         })
         .collect();
 
@@ -458,6 +466,42 @@ mod tests {
             group_of(arch),
             ProjectGroup::Archived,
             "archived beats pinned"
+        );
+    }
+
+    /// "Show archived projects" is a grouping decision, so it is made here and
+    /// not in a shell: with it off, an archived project leaves the sidebar
+    /// entirely rather than reappearing under Pinned or Recent.
+    #[test]
+    fn hiding_archived_projects_drops_them_rather_than_regrouping_them() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let now = 100 * DAY;
+        let live_one = project_with_session(&db, "-a-fresh", "/a/fresh", "s1", now - DAY, 1_000);
+        let arch = project_with_session(&db, "-a-arch", "/a/arch", "s4", now - DAY, 1_000);
+        db.set_pinned(arch, true).unwrap();
+        db.set_archived(arch, true).unwrap();
+
+        let settings = Settings {
+            show_archived: false,
+            ..Default::default()
+        };
+        let m = build_main_window(Some(&db), PopoverModel::empty(), &[], now, &settings);
+        assert!(
+            m.projects.iter().all(|p| p.id != arch),
+            "an archived project is gone when the user hid archived projects, not moved: {:?}",
+            m.projects
+                .iter()
+                .map(|p| (p.id, p.group))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            m.projects.iter().all(|p| p.group != ProjectGroup::Archived),
+            "no Archived group is left for a shell to draw"
+        );
+        assert!(
+            m.projects.iter().any(|p| p.id == live_one),
+            "every other project is untouched"
         );
     }
 
