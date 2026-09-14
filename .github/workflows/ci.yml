@@ -42,8 +42,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # No `version:` here — package.json's `packageManager` field pins pnpm,
+      # and giving both makes the action refuse with "Multiple versions of
+      # pnpm specified".
       - uses: pnpm/action-setup@v4
-        with: { version: 10 }
       - uses: actions/setup-node@v4
         with: { node-version: 24, cache: pnpm }
       - run: pnpm install --frozen-lockfile
@@ -422,7 +424,11 @@ jobs:
           mkdir -p "$SELFTEST_ROOT/src/nested"
           printf 'new WebSocket("wss://example.com")\n' > "$SELFTEST_ROOT/src/nested/x.tsx"
           printf '<script src="https://cdn.example/x.js"></script>\n' > "$SELFTEST_ROOT/index.html"
-          selftest_hits=$( cd "$SELFTEST_ROOT" && frontend_hits )
+          # `|| true` because GitHub runs these steps under `bash -e`, where a
+          # grep that matches nothing returns 1 and kills the step before it
+          # can report anything. A clean tree is the normal case, so without
+          # this the guard fails exactly when it should pass.
+          selftest_hits=$( cd "$SELFTEST_ROOT" && frontend_hits || true )
           if ! printf '%s\n' "$selftest_hits" | grep -q 'src/nested/x.tsx'; then
             echo "::error::Guard self-test failed: the frontend scan no longer reaches nested src/*.tsx."
             exit 1
@@ -433,7 +439,7 @@ jobs:
           fi
           rm -rf "$SELFTEST_ROOT"
 
-          hits=$(frontend_hits)
+          hits=$(frontend_hits || true)
           if [ -n "$hits" ]; then
             printf '%s\n' "$hits"
             echo "::error::The frontend gained an outbound network call or an absolute URL. The popover talks only to the Tauri backend."
@@ -493,7 +499,7 @@ jobs:
           fi
           rm -rf "$SELFTEST_ROOT"
 
-          hits=$(swift_hits)
+          hits=$(swift_hits || true)
           if [ -n "$hits" ]; then
             printf '%s\n' "$hits"
             echo "::error::The native macOS app gained an outbound network call or an absolute URL. It talks only to perch-ffi."
@@ -634,6 +640,115 @@ jobs:
           fi
 
           echo "native app filesystem surface clean (writes confined to $LAUNCHER_PATH; no Swift source references the Claude Code directory)"
+
+      - name: Assert no Swift source composes a user-visible caption from a number
+        run: |
+          set -uo pipefail
+
+          # Rust owns everything except drawing: every string the UI shows is
+          # composed in perch-core, and Swift never formats a number, a
+          # duration, or a currency. Three defects in the settings milestone
+          # came from breaking exactly this, and "Check every 1 seconds"
+          # reached a shipped build twice, because nothing checked it.
+          #
+          # Scoped to Sources/Perch, which is the hand-written Swift.
+          # Sources/PerchFFI is a sibling directory and therefore out of
+          # scope by construction: it is UniFFI's generated bindings, built
+          # by scripts/build-xcframework.sh, git-ignored, and absent on a
+          # fresh checkout.
+          #
+          # Line-oriented, like every other guard here: a Text(...) split
+          # across lines with its interpolation on a line of its own is not
+          # seen. Every Text literal in the tree is written on one line, and
+          # a guard that catches the shape people actually write beats one
+          # that catches none of them.
+          SWIFT_APP_SRC_DIR=apps/macos/Perch/Sources/Perch
+
+          # An interpolation inside a Text literal whose contents are
+          # visibly numeric: a numeric literal (a digit that does not sit
+          # inside an identifier, so `v2Label` is not a number), arithmetic,
+          # `.count`, a numeric conversion or format call, or a format
+          # specifier.
+          NUMBER_IN_TEXT='Text\(.*\\\(([^()"]*[^A-Za-z0-9_])?[0-9]|Text\(.*\\\([^()"]*([-+*/%]|\.count|\.formatted|\.rounded|\.magnitude|(Int|UInt|Int32|Int64|UInt32|UInt64|Double|Float|CGFloat|Decimal|NSNumber)\(|String\(format:|specifier:)'
+
+          # The other half, and the one that actually shipped: an
+          # interpolation followed by a counted noun. `"Check every
+          # \(seconds) seconds"` names no number syntactically — only its
+          # unit gives it away — and the pluralisation it gets wrong is
+          # precisely what Rust's counted_stepper already composes
+          # correctly.
+          COUNTED_NOUN_IN_TEXT='Text\(.*\\\([^()"]*\)[[:space:]]*(second|minute|hour|day|week|month|year|session|project|token|turn|item|file|row|model|character|byte|entr(y|ies))'
+
+          # -H forces the filename prefix even when only one file matches
+          # (grep omits it for a single-file argument list otherwise) — the
+          # exact trap that silently broke a previous self-test here.
+          text_number_hits() {
+            find "$SWIFT_APP_SRC_DIR" -name '*.swift' -print0 \
+              | xargs -0 grep -nHE "$NUMBER_IN_TEXT|$COUNTED_NOUN_IN_TEXT"
+          }
+
+          # Positive control, both halves of the pattern.
+          printf 'Text("\\(remaining - 1) left")\n' > /tmp/swift-text-number-selftest.swift
+          if ! grep -nHE "$NUMBER_IN_TEXT" /tmp/swift-text-number-selftest.swift > /dev/null; then
+            echo "::error::Guard self-test failed: the numeric-interpolation pattern no longer detects a number composed into a Text."
+            exit 1
+          fi
+          printf 'Text("Check every \\(pollSeconds) seconds")\n' > /tmp/swift-text-plural-selftest.swift
+          if ! grep -nHE "$COUNTED_NOUN_IN_TEXT" /tmp/swift-text-plural-selftest.swift > /dev/null; then
+            echo "::error::Guard self-test failed: the counted-noun pattern no longer detects a caption pluralised in Swift."
+            exit 1
+          fi
+
+          # Negative control: joining two strings that are already finished
+          # in Rust is legitimate and must keep passing — UsageView.swift
+          # does exactly this to build a VoiceOver label out of a day label
+          # and a class label. A guard that flags it gets disabled the first
+          # time it cries wolf, so its innocence is checked, not assumed.
+          printf 'Text("\\(segment.dayLabel), \\(segment.classLabel)")\n' > /tmp/swift-text-strings-selftest.swift
+          if grep -nHE "$NUMBER_IN_TEXT|$COUNTED_NOUN_IN_TEXT" /tmp/swift-text-strings-selftest.swift > /dev/null; then
+            echo "::error::Guard self-test failed: the pattern now flags two already-finished Rust strings joined in a Text."
+            exit 1
+          fi
+          # And interpolating a user's search query into a sentence — which
+          # SettingsWindow.swift really does — is a string, not a number.
+          printf 'Text("No setting matches \\u{201C}\\(query)\\u{201D}.")\n' > /tmp/swift-text-query-selftest.swift
+          if grep -nHE "$NUMBER_IN_TEXT|$COUNTED_NOUN_IN_TEXT" /tmp/swift-text-query-selftest.swift > /dev/null; then
+            echo "::error::Guard self-test failed: the pattern now flags a string interpolated into a sentence."
+            exit 1
+          fi
+
+          # Positive control for coverage: a fixture placed as if it were a
+          # nested file under Sources/Perch (never in the real tree — it
+          # lives entirely under /tmp) must be found through the exact path
+          # the real check uses, and its sibling under Sources/PerchFFI must
+          # not be.
+          SELFTEST_ROOT=/tmp/swift-text-number-selftest-tree
+          rm -rf "$SELFTEST_ROOT"
+          mkdir -p "$SELFTEST_ROOT/$SWIFT_APP_SRC_DIR/Nested"
+          mkdir -p "$SELFTEST_ROOT/apps/macos/Perch/Sources/PerchFFI"
+          printf 'Text("Check every \\(pollSeconds) seconds")\n' \
+            > "$SELFTEST_ROOT/$SWIFT_APP_SRC_DIR/Nested/x.swift"
+          printf 'Text("Check every \\(pollSeconds) seconds")\n' \
+            > "$SELFTEST_ROOT/apps/macos/Perch/Sources/PerchFFI/perch_ffi.swift"
+          selftest_hits=$( cd "$SELFTEST_ROOT" && text_number_hits || true )
+          if ! printf '%s\n' "$selftest_hits" | grep -q "$SWIFT_APP_SRC_DIR/Nested/x.swift"; then
+            echo "::error::Guard self-test failed: the Text scan no longer reaches a nested $SWIFT_APP_SRC_DIR/**/*.swift."
+            exit 1
+          fi
+          if printf '%s\n' "$selftest_hits" | grep -q "Sources/PerchFFI"; then
+            echo "::error::Guard self-test failed: the Text scan now reaches the generated bindings under Sources/PerchFFI."
+            exit 1
+          fi
+          rm -rf "$SELFTEST_ROOT"
+
+          hits=$(text_number_hits || true)
+          if [ -n "$hits" ]; then
+            printf '%s\n' "$hits"
+            echo "::error::Swift composed a user-visible caption from a number. Every displayed string is Rust's to compose (perch-core); Swift draws it. Add or extend the string in perch-core and carry it across the FFI."
+            exit 1
+          fi
+
+          echo "no numeric captions composed in Swift ($SWIFT_APP_SRC_DIR)"
 
   native-app:
     runs-on: macos-latest

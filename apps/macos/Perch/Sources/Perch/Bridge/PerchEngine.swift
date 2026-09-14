@@ -119,21 +119,119 @@ final class PerchEngine: ObservableObject {
         }.value
     }
 
-    /// `nil` only means the engine itself isn't running — Rust's own read
-    /// never fails (a bad on-disk file degrades to defaults, reported via
-    /// `SettingsModel.error`/`.notes`, not a thrown error).
-    func settings() async -> SettingsModel? {
+    /// Which terminal Resume and Open should launch, read at the moment of
+    /// launch rather than cached — so a change made in the settings window
+    /// (or hand-edited into `config.toml`) takes effect on the very next
+    /// launch. `nil` only means the engine itself isn't running.
+    func preferredTerminal() async -> String? {
         guard let perch else { return nil }
-        return await Task.detached(priority: .userInitiated) { perch.settings() }.value
+        return await Task.detached(priority: .userInitiated) { perch.preferredTerminal() }.value
     }
 
-    /// Throws only when the write itself fails (e.g. the config directory
-    /// isn't writable); a merely out-of-range value is clamped and reported
-    /// back in the returned model's `notes`, not rejected.
-    func saveSettings(_ s: Settings) async -> Result<SettingsModel, Error> {
+    // MARK: - The settings schema
+    //
+    // The whole settings window is built on these: Rust owns the panes, the
+    // captions, the enablement and the search, and every write names one key
+    // rather than shipping a whole struct back. `nil` from `settingsSchema`
+    // means the engine itself isn't running — Rust's own read never fails.
+
+    /// `query` is matched in Rust by `filter_panes`. Swift sends keystrokes
+    /// and draws whatever comes back; it does no matching of its own, or the
+    /// window would carry a second, staler copy of every label.
+    /// Carries `notes` as well as the panes: a value clamped on the way *in*
+    /// (a `poll_seconds = 9999` hand-edited into `config.toml`) is reported
+    /// by the read that found it, not only by some later write.
+    func settingsSchema(query: String?) async -> SettingsResult? {
+        guard let perch else { return nil }
+        return await Task.detached(priority: .userInitiated) {
+            perch.settingsSchema(query: query)
+        }.value
+    }
+
+    /// Store one value under one key. Returns the schema that resulted plus
+    /// whatever `validated` had to change on the way to disk, so the caller
+    /// never re-reads to see its own write and never has to discover a clamp
+    /// for itself.
+    func setSetting(key: SettingKey, value: SettingValue) async -> Result<SettingsResult, Error> {
         guard let perch else { return .failure(EngineUnavailable()) }
         return await Task.detached(priority: .userInitiated) {
-            Result { try perch.saveSettings(s: s) }
+            Result { try perch.setSetting(key: key, value: value) }
+        }.value
+    }
+
+    /// Restore every setting one pane shows to its factory value, leaving
+    /// every other pane alone.
+    func resetPane(_ pane: PaneId) async -> Result<SettingsResult, Error> {
+        guard let perch else { return .failure(EngineUnavailable()) }
+        return await Task.detached(priority: .userInitiated) {
+            Result { try perch.resetPane(pane: pane) }
+        }.value
+    }
+
+    /// Restore every setting at once. One call, not twenty-seven: a reset that
+    /// failed halfway would leave a configuration that is neither what Perch
+    /// ships nor what the user chose.
+    func resetAllSettings() async -> Result<SettingsResult, Error> {
+        guard let perch else { return .failure(EngineUnavailable()) }
+        return await Task.detached(priority: .userInitiated) {
+            Result { try perch.resetAllSettings() }
+        }.value
+    }
+
+    // MARK: - Prices
+    //
+    // Every one of these returns the whole pane — the table *and* the models
+    // in use that still have no rate — so the caller adopts one value and
+    // the two can never disagree about what is missing. Nothing here mutates
+    // anything locally first: a control that moved before its write landed
+    // has nothing to move back to when the write fails.
+
+    func prices() async -> Result<PricesModel, Error> {
+        guard let perch else { return .failure(EngineUnavailable()) }
+        return await Task.detached(priority: .userInitiated) {
+            Result { try perch.prices() }
+        }.value
+    }
+
+    /// The rates travel as the text the user typed. Rust parses them, and a
+    /// field it cannot read is refused with a sentence naming the column —
+    /// nothing is stored, so the rate already in force stays in force.
+    func setPrice(model: String, rates: RateFields) async -> Result<PricesModel, Error> {
+        guard let perch else { return .failure(EngineUnavailable()) }
+        return await Task.detached(priority: .userInitiated) {
+            Result { try perch.setPrice(model: model, rates: rates) }
+        }.value
+    }
+
+    func removePrice(model: String) async -> Result<PricesModel, Error> {
+        guard let perch else { return .failure(EngineUnavailable()) }
+        return await Task.detached(priority: .userInitiated) {
+            Result { try perch.removePrice(model: model) }
+        }.value
+    }
+
+    func resetPrices() async -> Result<PricesModel, Error> {
+        guard let perch else { return .failure(EngineUnavailable()) }
+        return await Task.detached(priority: .userInitiated) {
+            Result { try perch.resetPrices() }
+        }.value
+    }
+
+    // MARK: - Advanced
+
+    func advanced() async -> AdvancedModel? {
+        guard let perch else { return nil }
+        return await Task.detached(priority: .userInitiated) { perch.advanced() }.value
+    }
+
+    /// Rebuilds the index from Claude Code's session files. Slow by nature —
+    /// it reads every one of them — and it returns the pane the run
+    /// produced, so the new counts are this run's rather than the old ones
+    /// redrawn.
+    func reindexNow() async -> Result<AdvancedModel, Error> {
+        guard let perch else { return .failure(EngineUnavailable()) }
+        return await Task.detached(priority: .userInitiated) {
+            Result { try perch.reindexNow() }
         }.value
     }
 

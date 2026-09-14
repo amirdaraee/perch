@@ -5,11 +5,8 @@ use crate::db::{Db, NotifyOverride};
 use crate::live::LiveSession;
 use crate::query;
 use crate::settings::Settings;
-use crate::ui::format::{elapsed_or_dash, human_cost, human_elapsed, human_tokens};
+use crate::ui::format::{elapsed_or_dash, human_cost, human_elapsed, human_tokens, plural};
 use crate::ui::model::PopoverModel;
-
-const SPARK_DAYS: usize = 14;
-const ACTIVE_WINDOW_MS: i64 = 7 * 86_400_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ProjectGroup {
@@ -103,17 +100,6 @@ fn dir_name(path: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
-/// `pub(crate)` so the settings window's own view-model can pluralize its
-/// two stepper captions through the same helper, rather than growing a
-/// second one that could disagree with this about what "1 minute" reads like.
-pub(crate) fn plural(n: i64, one: &str, many: &str) -> String {
-    if n == 1 {
-        format!("1 {one}")
-    } else {
-        format!("{n} {many}")
-    }
-}
-
 /// What `NotifyOverride::Default` currently means: the global
 /// `waiting_after_minutes` setting, spelled out as a finished sentence
 /// fragment rather than a bare number a shell would have to pluralize and
@@ -144,11 +130,15 @@ fn since(now_ms: i64, ts: Option<i64>) -> String {
 /// Every project the index knows, grouped for the sidebar. `db: None` (or a
 /// failing read) yields an empty list with the reason attached — never a silently
 /// empty window.
+///
+/// `settings.active_within_days` is the Active/Recent boundary — the user's
+/// window, not a frozen seven days.
 pub fn build_main_window(
     db: Option<&Db>,
     now: PopoverModel,
     live: &[LiveSession],
     now_ms: i64,
+    settings: &Settings,
 ) -> MainWindowModel {
     let Some(db) = db else {
         return MainWindowModel {
@@ -157,6 +147,7 @@ pub fn build_main_window(
             error: Some("index unavailable".into()),
         };
     };
+    let active_window_ms = i64::from(settings.active_within_days) * query::DAY_MS;
     let summaries = match query::project_summaries(db) {
         Ok(s) => s,
         Err(e) => {
@@ -174,9 +165,17 @@ pub fn build_main_window(
     // still has to be decided here, not by whichever shell renders it.
     let mut projects: Vec<(ProjectRow, Option<i64>)> = summaries
         .into_iter()
-        .map(|s| {
+        .filter_map(|s| {
             let meta = db.project_meta(s.id).ok();
             let archived = meta.as_ref().is_some_and(|m| m.archived);
+            // "Show archived projects" is a grouping decision, so it is made
+            // here rather than by whichever shell draws the sidebar. Hidden
+            // means gone, not demoted: an archived project must never
+            // reappear under Pinned or Recent because the group that owned it
+            // was suppressed.
+            if archived && !settings.show_archived {
+                return None;
+            }
             let pinned = meta.as_ref().is_some_and(|m| m.pinned);
             let group = if archived {
                 ProjectGroup::Archived
@@ -184,7 +183,7 @@ pub fn build_main_window(
                 ProjectGroup::Pinned
             } else if s
                 .last_activity_at
-                .is_some_and(|t| now_ms - t <= ACTIVE_WINDOW_MS)
+                .is_some_and(|t| now_ms - t <= active_window_ms)
             {
                 ProjectGroup::Active
             } else {
@@ -196,22 +195,41 @@ pub fn build_main_window(
                 .unwrap_or_else(|| dir_name(&s.real_path));
             let session_count = plural(s.sessions, "session", "sessions");
             let tokens = human_tokens(s.usage.total_tokens());
-            let cost = human_cost(s.cost_usd);
+            // Hidden means absent, not "$0.00" — same rule `ui::model` and
+            // `ui::usage` already follow: a blank string here says "the user
+            // hid this", not "this project cost nothing".
+            let cost = if settings.show_cost {
+                human_cost(s.cost_usd)
+            } else {
+                String::new()
+            };
             let last_active = since(now_ms, s.last_activity_at);
             let live_session_count = live.iter().filter(|l| l.cwd == s.real_path).count() as u32;
+            // Composed as optional fragments, not a fixed-arity `format!`, so
+            // a hidden cost drops cleanly instead of leaving a stray " · ".
+            let subtitle = [
+                Some(session_count.clone()),
+                Some(tokens.clone()),
+                (!cost.is_empty()).then(|| cost.clone()),
+                Some(last_active.clone()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
             let row = ProjectRow {
                 id: s.id,
                 name,
                 path: s.real_path.clone(),
                 group,
-                subtitle: format!("{session_count} · {tokens} · {cost} · {last_active}"),
+                subtitle,
                 session_count,
                 tokens,
                 cost,
                 last_active,
                 live_session_count,
             };
-            (row, s.last_activity_at)
+            Some((row, s.last_activity_at))
         })
         .collect();
 
@@ -251,8 +269,11 @@ fn recency_key(ts: Option<i64>) -> (u8, i64) {
     }
 }
 
-/// One project in full: its note, totals, a fourteen-day sparkline scoped to
-/// this project alone, and every session ever recorded for it.
+/// One project in full: its note, totals, a `settings.chart_days`-long
+/// sparkline scoped to this project alone, and every session ever recorded for
+/// it. That is the same setting `ui::usage`'s daily chart spans: the two were
+/// separate constants that both happened to be 14, and a user who widened one
+/// would have been left comparing two different date ranges.
 pub fn build_project_detail(
     db: &Db,
     project_id: i64,
@@ -271,18 +292,19 @@ pub fn build_project_detail(
         .clone()
         .unwrap_or_else(|| dir_name(&summary.real_path));
 
-    let days = query::daily_usage_for_project(db, project_id, SPARK_DAYS, now_ms)?;
+    let chart_days = settings.chart_days as usize;
+    let days = query::daily_usage_for_project(db, project_id, chart_days, now_ms)?;
     let sparkline = days
         .iter()
         .enumerate()
         .map(|(i, d)| {
-            let days_ago = SPARK_DAYS - 1 - i;
+            let days_ago = chart_days - 1 - i;
             SparkPoint {
                 day_index: i as i32,
                 tokens: d.usage.total_tokens(),
                 // Same scheme as `ui::usage`'s daily chart over the identical
-                // 14-day window — "Today", "1d" … "13d" — not `human_elapsed`,
-                // which caps at hours and would read "313h ago" for day 0.
+                // window — "Today", "1d" … — not `human_elapsed`, which caps
+                // at hours and would read "313h ago" for day 0.
                 label: if days_ago == 0 {
                     "Today".to_string()
                 } else {
@@ -297,13 +319,22 @@ pub fn build_project_detail(
         .map(|h| {
             let is_live = live.iter().any(|l| l.session_id == h.id);
             let tokens = human_tokens(h.usage.total_tokens());
-            let cost = human_cost(h.cost_usd);
+            // Hidden means absent, not "$0.00" — same rule as the project
+            // row above.
+            let cost = if settings.show_cost {
+                human_cost(h.cost_usd)
+            } else {
+                String::new()
+            };
             let started = since(now_ms, h.started_at);
             let duration = match (h.started_at, h.last_activity_at) {
                 (Some(a), Some(b)) if b >= a => human_elapsed(b - a),
                 _ => "—".to_string(),
             };
-            let mut parts = vec![format!("{tokens} · {cost}")];
+            let mut parts = vec![tokens.clone()];
+            if !cost.is_empty() {
+                parts.push(cost.clone());
+            }
             if duration != "—" {
                 parts.push(format!("{duration} long"));
             }
@@ -337,7 +368,13 @@ pub fn build_project_detail(
         name,
         note: meta.note.unwrap_or_default(),
         tokens: human_tokens(summary.usage.total_tokens()),
-        cost: human_cost(summary.cost_usd),
+        // Hidden means absent, not "$0.00" — same rule as the project row
+        // and the session history row above.
+        cost: if settings.show_cost {
+            human_cost(summary.cost_usd)
+        } else {
+            String::new()
+        },
         session_count: plural(summary.sessions, "session", "sessions"),
         sparkline,
         sessions,
@@ -410,7 +447,13 @@ mod tests {
         db.set_pinned(arch, true).unwrap();
         db.set_archived(arch, true).unwrap();
 
-        let m = build_main_window(Some(&db), PopoverModel::empty(), &[], now);
+        let m = build_main_window(
+            Some(&db),
+            PopoverModel::empty(),
+            &[],
+            now,
+            &Settings::default(),
+        );
         let group_of = |id: i64| m.projects.iter().find(|p| p.id == id).unwrap().group;
         assert_eq!(group_of(pinned), ProjectGroup::Pinned);
         assert_eq!(
@@ -424,6 +467,112 @@ mod tests {
             ProjectGroup::Archived,
             "archived beats pinned"
         );
+    }
+
+    /// "Show archived projects" is a grouping decision, so it is made here and
+    /// not in a shell: with it off, an archived project leaves the sidebar
+    /// entirely rather than reappearing under Pinned or Recent.
+    #[test]
+    fn hiding_archived_projects_drops_them_rather_than_regrouping_them() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let now = 100 * DAY;
+        let live_one = project_with_session(&db, "-a-fresh", "/a/fresh", "s1", now - DAY, 1_000);
+        let arch = project_with_session(&db, "-a-arch", "/a/arch", "s4", now - DAY, 1_000);
+        db.set_pinned(arch, true).unwrap();
+        db.set_archived(arch, true).unwrap();
+
+        let settings = Settings {
+            show_archived: false,
+            ..Default::default()
+        };
+        let m = build_main_window(Some(&db), PopoverModel::empty(), &[], now, &settings);
+        assert!(
+            m.projects.iter().all(|p| p.id != arch),
+            "an archived project is gone when the user hid archived projects, not moved: {:?}",
+            m.projects
+                .iter()
+                .map(|p| (p.id, p.group))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            m.projects.iter().all(|p| p.group != ProjectGroup::Archived),
+            "no Archived group is left for a shell to draw"
+        );
+        assert!(
+            m.projects.iter().any(|p| p.id == live_one),
+            "every other project is untouched"
+        );
+    }
+
+    /// A project's Active/Recent boundary is the user's `active_within_days`,
+    /// not a frozen seven-day window: the same project falls on either side of
+    /// it depending only on the setting.
+    #[test]
+    fn a_project_is_active_within_its_configured_window() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let now = 100 * DAY;
+        let pid = project_with_session(&db, "-a-p", "/a/proj", "s1", now - 10 * DAY, 1_000);
+        let group_of = |days: u32| {
+            let s = Settings {
+                active_within_days: days,
+                ..Settings::default()
+            };
+            build_main_window(Some(&db), PopoverModel::empty(), &[], now, &s)
+                .projects
+                .iter()
+                .find(|p| p.id == pid)
+                .unwrap()
+                .group
+        };
+
+        assert_eq!(
+            group_of(7),
+            ProjectGroup::Recent,
+            "ten days is outside seven"
+        );
+        assert_eq!(
+            group_of(14),
+            ProjectGroup::Active,
+            "the very same project is inside fourteen"
+        );
+    }
+
+    /// The defect this prevents: `CHART_DAYS` and `SPARK_DAYS` were two
+    /// independent declarations that both happened to be 14, so exposing
+    /// either alone would let the usage chart and a project's sparkline
+    /// silently disagree about their own date range.
+    #[test]
+    fn one_setting_drives_both_the_chart_and_the_sparkline() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let now = 100 * DAY + 3_600_000;
+        let pid = project_with_session(&db, "-a-p", "/a/proj", "s1", now - 1000, 1_000_000);
+
+        for days in [7u32, 30, 90] {
+            let s = Settings {
+                chart_days: days,
+                ..Settings::default()
+            };
+            let want = days as usize;
+            assert_eq!(
+                crate::ui::usage::build_usage(&db, now, &s)
+                    .unwrap()
+                    .daily
+                    .len(),
+                want,
+                "the usage chart must span chart_days"
+            );
+            assert_eq!(
+                build_project_detail(&db, pid, &[], now, &s)
+                    .unwrap()
+                    .sparkline
+                    .len(),
+                want,
+                "the sparkline must span the very same setting"
+            );
+        }
     }
 
     #[test]
@@ -459,7 +608,13 @@ mod tests {
         })
         .unwrap();
 
-        let m = build_main_window(Some(&db), PopoverModel::empty(), &[], now);
+        let m = build_main_window(
+            Some(&db),
+            PopoverModel::empty(),
+            &[],
+            now,
+            &Settings::default(),
+        );
         let ids: Vec<i64> = m.projects.iter().map(|p| p.id).collect();
         assert_eq!(
             ids,
@@ -476,7 +631,13 @@ mod tests {
         let now = 100 * DAY;
         project_with_session(&db, "-a-p", "/a/proj", "s1", now - 3_600_000, 2_000_000);
 
-        let m = build_main_window(Some(&db), PopoverModel::empty(), &[], now);
+        let m = build_main_window(
+            Some(&db),
+            PopoverModel::empty(),
+            &[],
+            now,
+            &Settings::default(),
+        );
         let row = &m.projects[0];
         assert_eq!(row.name, "proj", "directory name, not the slug");
         assert_eq!(row.tokens, "2.0M");
@@ -510,13 +671,25 @@ mod tests {
             message_count: 1,
         })
         .unwrap();
-        let m = build_main_window(Some(&db), PopoverModel::empty(), &[], now);
+        let m = build_main_window(
+            Some(&db),
+            PopoverModel::empty(),
+            &[],
+            now,
+            &Settings::default(),
+        );
         assert_eq!(m.projects[0].session_count, "2 sessions");
     }
 
     #[test]
     fn no_database_yields_an_empty_list_and_no_panic() {
-        let m = build_main_window(None, PopoverModel::empty(), &[], 100 * DAY);
+        let m = build_main_window(
+            None,
+            PopoverModel::empty(),
+            &[],
+            100 * DAY,
+            &Settings::default(),
+        );
         assert!(m.projects.is_empty());
         assert!(m.error.is_some(), "the user is told why the list is empty");
     }
@@ -794,6 +967,67 @@ mod tests {
             "the number and the label must never disagree: {}",
             d.notify_default_label
         );
+    }
+
+    #[test]
+    fn hiding_cost_hides_it_in_the_main_window_too() {
+        // Task 7 (faa3e8d) wired `show_cost` into the popover and the usage
+        // view but left this file's three sites unconverted: the project
+        // row, the project summary, and the session history row. Off means
+        // absent — a blank string, never a fabricated dollar figure.
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let now = 100 * DAY;
+        let pid = project_with_session(&db, "-a-p", "/a/proj", "s1", now - 3_600_000, 2_000_000);
+        let settings = Settings {
+            show_cost: false,
+            ..Settings::default()
+        };
+
+        let m = build_main_window(Some(&db), PopoverModel::empty(), &[], now, &settings);
+        let row = &m.projects[0];
+        assert_eq!(row.cost, "", "show_cost off hides the project row's cost");
+        assert!(
+            !row.subtitle.contains('$'),
+            "the project row subtitle must not leak a cost when hidden: {}",
+            row.subtitle
+        );
+
+        let d = build_project_detail(&db, pid, &[], now, &settings).unwrap();
+        assert_eq!(d.cost, "", "show_cost off hides the project summary's cost");
+        let session = &d.sessions[0];
+        assert_eq!(
+            session.cost, "",
+            "show_cost off hides the session row's cost"
+        );
+        assert!(
+            !session.detail_line.contains('$'),
+            "the session detail line must not leak a cost when hidden: {}",
+            session.detail_line
+        );
+    }
+
+    #[test]
+    fn showing_cost_leaves_the_main_window_unchanged() {
+        // The other half of the fix: `show_cost = true` (the default) must
+        // reproduce every figure exactly as before, so the fix above cannot
+        // have over-reached.
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let now = 100 * DAY;
+        let pid = project_with_session(&db, "-a-p", "/a/proj", "s1", now - 3_600_000, 2_000_000);
+        let settings = Settings::default();
+        assert!(settings.show_cost, "default is on");
+
+        let m = build_main_window(Some(&db), PopoverModel::empty(), &[], now, &settings);
+        let row = &m.projects[0];
+        assert_eq!(row.cost, "$30.00");
+        assert!(row.subtitle.contains("$30.00"));
+
+        let d = build_project_detail(&db, pid, &[], now, &settings).unwrap();
+        assert_eq!(d.cost, "$30.00");
+        assert_eq!(d.sessions[0].cost, "$30.00");
+        assert!(d.sessions[0].detail_line.contains("$30.00"));
     }
 }
 

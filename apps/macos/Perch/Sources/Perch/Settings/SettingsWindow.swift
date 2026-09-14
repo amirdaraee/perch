@@ -52,27 +52,62 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
                 window.deminiaturize(nil)
             }
             window.makeKeyAndOrderFront(nil)
-            (window.contentView as? NSHostingView<SettingsRootView>)?.rootView =
-                SettingsRootView(engine: engine, refreshToken: refreshToken)
+            (window.contentViewController as? NSHostingController<SettingsRootView>)?
+                .rootView = rootView()
             return
         }
 
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 520, height: 420),
-            styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
+            contentRect: NSRect(x: 0, y: 0, width: 880, height: 640),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
-        w.title = "Perch Settings"
-        w.center()
+        w.title = "Settings"
+        w.titlebarAppearsTransparent = false
         w.isReleasedWhenClosed = false
         w.delegate = self
-        w.contentView = NSHostingView(rootView: SettingsRootView(engine: engine, refreshToken: refreshToken))
         window = w
+        // A *controller*, not a bare `NSHostingView` set as `contentView`.
+        // The view sizes itself to fit its content, and AppKit's origin is
+        // bottom-left — so a tree taller than the content area hangs off the
+        // *top* of the window. That is not theoretical: it shipped. The
+        // sidebar's nine rows and the detail's first two groups were all
+        // above the visible frame, leaving an empty column beside a pane
+        // that began halfway down. A hosting controller is constrained to
+        // the window, and the scrollable parts scroll instead.
+        let host = NSHostingController(rootView: rootView())
+        // Measured, not guessed: without this the split view laid out at its
+        // *content* height — 1465pt inside a 640pt window, at y = -386.5 —
+        // so 438pt of it sat above the visible top. The sidebar's rows and
+        // the detail's first groups were all up there, which is why the
+        // column read as empty and every pane opened halfway down.
+        host.sizingOptions = []
+        w.contentViewController = host
+
+        // Sized *after* the controller is installed: assigning one resizes
+        // the window to the controller's preferred size, which would discard
+        // both the intended size and any frame the user had dragged to.
+        w.minSize = NSSize(width: 720, height: 480)
+        w.setContentSize(NSSize(width: 880, height: 640))
+        w.center()
+        w.setFrameAutosaveName("PerchSettingsWindow")
 
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         w.makeKeyAndOrderFront(nil)
+    }
+
+    /// The window's title names the pane the user is looking at, so the
+    /// title bar says where they are rather than repeating the app's name at
+    /// them. SwiftUI's `navigationTitle` does not reach an `NSWindow` this
+    /// view was merely dropped into, so the view hands the string back here.
+    private func rootView() -> SettingsRootView {
+        SettingsRootView(
+            engine: engine,
+            refreshToken: refreshToken,
+            setTitle: { [weak self] title in self?.window?.title = title }
+        )
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -85,26 +120,25 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 }
 
-/// The settings window's content: three editable panes plus Diagnostics,
-/// reachable directly rather than hidden behind a toggle.
+/// The settings window's content: a sidebar of panes over a detail side that
+/// draws whichever one is selected.
 ///
-/// Per-project overrides (notifications, pin, archive, note) live on the
-/// project in the main window's detail pane, not here — this view only ever
-/// edits the eight global `Settings` fields. It deliberately does not list
-/// projects.
+/// **The sidebar is the schema's, not Swift's.** Every pane, its title, its
+/// icon, its attention phrase and all of its rows arrive from
+/// `settingsSchema(query:)`; a hardcoded list here would be a second copy of
+/// all of it, and the copy is what goes stale. Search is Rust's too — this
+/// view sends keystrokes and draws what comes back.
 ///
-/// **Save timing:** every discrete control (toggle, picker, stepper) saves
-/// immediately on change, adopting the returned `SettingsModel` exactly like
-/// `ProjectDetailPane`'s pin/archive toggles do. The one free-text field —
-/// the Claude Code directory path — saves on commit (focus loss, Return, or
-/// the folder picker) instead, mirroring that same file's note editor: a
-/// path typed character by character would otherwise rewrite the config file
-/// on every keystroke. Saves themselves are queued one at a time (see
-/// `update(_:)`/`pendingSave`) so two controls edited in quick succession
-/// never race each other over the same whole-struct `saveSettings` call.
+/// What makes this window Perch's rather than a generic preferences sheet is
+/// the panel at the top of the detail side: each pane previews its own effect
+/// against the user's real index — `12 Active · 19 Recent · 4 Archived` — and
+/// the sidebar flags, in a short phrase, any pane whose current configuration
+/// is costing something right now. Both strings are composed in Rust from
+/// real counts; neither is ever a fabricated zero.
 struct SettingsRootView: View {
     let engine: PerchEngine
     let refreshToken: Int
+    let setTitle: @MainActor (String) -> Void
 
     /// Observed, not merely read: `Notifier` re-reads macOS's authorization
     /// on every delivery, so a permission granted or revoked while this
@@ -113,411 +147,614 @@ struct SettingsRootView: View {
     @ObservedObject private var notifier: Notifier
 
     @MainActor
-    init(engine: PerchEngine, refreshToken: Int) {
+    init(engine: PerchEngine, refreshToken: Int, setTitle: @escaping @MainActor (String) -> Void) {
         self.engine = engine
         self.refreshToken = refreshToken
+        self.setTitle = setTitle
         _notifier = ObservedObject(wrappedValue: engine.notifier)
     }
 
-    @State private var model: SettingsModel?
-    /// Set only when the *initial* `settings()` read fails (the engine isn't
-    /// running) — rendered only while there is no model yet.
+    /// The schema as Rust last returned it — filtered by `query` when one is
+    /// typed. This is the single source every control's `get` reads from.
+    @State private var panes: [SettingsPane] = []
+    /// Whatever `Settings::validated` had to change on the way to disk: a
+    /// number clamped to its range, a folder that was not a folder. Returned
+    /// by the write that caused it, so a clamp is never silent.
+    @State private var notes: [String] = []
+    /// Set only when the schema read itself fails — i.e. the engine isn't
+    /// running. Rendered only while there are no panes to draw.
     @State private var loadError: String?
-    /// Set when a `saveSettings` call fails, independent of `loadError`.
-    /// Rendered unconditionally, whether or not a model has loaded — mirrors
-    /// `ProjectDetailPane.actionError`, which exists for exactly this reason:
-    /// a post-load action failure must never be gated behind the "still
-    /// loading" branch, or it silently disappears once a model exists.
+    /// Set when a write fails, independent of `loadError`. Rendered
+    /// unconditionally, whether or not panes have loaded — mirrors
+    /// `ProjectDetailPane.actionError`, which exists for exactly this
+    /// reason: a post-load failure must never be gated behind the "still
+    /// loading" branch, or it silently disappears the moment a model exists.
     @State private var actionError: String?
 
-    @State private var claudeDirDraft: String = ""
-    @FocusState private var claudeDirFocused: Bool
+    @State private var query: String = ""
+    /// Cancels the previous keystroke's fetch so a fast typist's results
+    /// cannot land out of order.
+    @State private var searchTask: Task<Void, Never>?
 
-    /// Chains queued saves so a second control's edit always builds on the
-    /// model left by the first save's `apply()`, not on the pre-edit
-    /// baseline both would otherwise read if their `saveSettings` calls
-    /// overlapped — see `update(_:)`.
+    /// Chains queued writes so a second control's edit always builds on the
+    /// schema the first write returned, not on the pre-edit one both would
+    /// otherwise read if their `setSetting` calls overlapped.
     @State private var pendingSave: Task<Void, Never>?
 
-    enum Tab: Hashable { case general, sessions, notifications, diagnostics }
-    @State private var tab: Tab = .general
+    /// Per-viewer window state, not settings: neither belongs in
+    /// `config.toml`, which is the user's own hand-editable file.
+    @AppStorage("settings.selectedPane") private var storedPaneKey: String = "general"
 
-    /// Rust's own `Settings::default()`, read once. Every control below falls
-    /// back to these while `model` is still nil, rather than to a Swift
-    /// literal of the same value: a literal here is a second source of truth
-    /// for a default Rust already owns, and it drifts silently the day that
-    /// one changes. `preferredTerminal` is the one field still defaulted by a
-    /// literal below — the whole terminal-choice seam is being replaced next
-    /// milestone, when Rust supplies the detected-terminal list.
-    private static let defaults = PerchFFI.defaultSettings()
-
-    /// macOS has been asked and said no: the toggle is forced off *and*
-    /// disabled, because nothing the user does in this window can change it.
-    private var notificationsDenied: Bool { notifier.authorization == .denied }
-
-    /// Anything short of "would actually be shown" — `.notDetermined`
-    /// included. This, not `notificationsDenied`, is what the toggle and its
-    /// dependent controls read: `.notDetermined` is the state a
-    /// `waiting_enabled = true` hand-edited into config.toml leaves behind,
-    /// and it delivers exactly as little as a denial. The toggle stays
-    /// *enabled* in that state, though — flipping it on is precisely what
-    /// asks macOS for permission.
-    private var notificationsDeliverable: Bool { notifier.canDeliver }
+    /// `List(selection:)` needs an optional; `@AppStorage` will not hold one.
+    /// Kept in sync with `storedPaneKey` so the choice survives a reopen.
+    @State private var selectedPaneKey: String?
 
     var body: some View {
-        VStack(spacing: 0) {
-            if let loadError, model == nil {
+        NavigationSplitView {
+            // Shaped exactly like `MainWindow/Sidebar.swift`, which works: the
+            // `List` *is* the sidebar column's content, and the column width
+            // modifier goes on the list itself. An earlier version wrapped it
+            // and fed `ideal:` a width the sidebar itself reported back; the
+            // column then rendered nothing at all.
+            List(selection: $selectedPaneKey) {
+                if panes.isEmpty {
+                    emptySidebarNotice
+                } else {
+                    ForEach(panes, id: \.id.key) { pane in
+                        sidebarRow(pane).tag(pane.id.key)
+                    }
+                }
+            }
+            .frame(minWidth: 280)
+            .navigationSplitViewColumnWidth(min: 280, ideal: 300, max: 420)
+            .searchable(text: $query, placement: .sidebar, prompt: "Search settings")
+        } detail: {
+            detail
+        }
+        // An ideal *and* an unbounded max. With only a `min`, the split
+        // view reported its content's height as its own ideal — 1465pt —
+        // and the host centred that inside 640pt, hanging 438pt off the top.
+        .frame(
+            minWidth: 720, idealWidth: 880, maxWidth: .infinity,
+            minHeight: 480, idealHeight: 640, maxHeight: .infinity
+        )
+        .task(id: refreshToken) { await load() }
+        .onChange(of: query) { _, q in search(q) }
+        .onChange(of: currentPane?.title) { _, title in
+            setTitle(title ?? "Settings")
+        }
+        .onChange(of: selectedPaneKey) { _, key in
+            // Persist only a real choice. A filtered sidebar that drops the
+            // selected row sets this to nil, and remembering *that* would
+            // reopen the window on whatever pane happened to be first.
+            if let key { storedPaneKey = key }
+        }
+        .onAppear {
+            if selectedPaneKey == nil { selectedPaneKey = storedPaneKey }
+            setTitle(currentPane?.title ?? "Settings")
+        }
+    }
+
+    // MARK: - Sidebar
+
+    /// Never an empty sidebar. An empty list and a broken window look exactly
+    /// alike, and the user has no way to tell which one they are looking at —
+    /// which is precisely what happened here. This covers *both* reasons the
+    /// list can be empty, not just the search one: a schema that failed to
+    /// load is the case that actually shipped.
+    @ViewBuilder
+    private var emptySidebarNotice: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if query.isEmpty {
+                Text("Settings could not be loaded.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("No setting matches \u{201C}\(query)\u{201D}.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Clear search") { query = "" }
+                    .buttonStyle(.link)
+            }
+        }
+        .padding(.vertical, 6)
+    }
+
+    private func sidebarRow(_ pane: SettingsPane) -> some View {
+        HStack(spacing: 8) {
+            // Monochrome by choice. Coloured icon tiles solve a problem
+            // Perch does not have — nine panes of one app do not need
+            // colour to be told apart, and the one accent here is spent on
+            // selection and on the attention phrases instead.
+            Image(systemName: symbolName(pane.icon))
+                .font(.system(size: 13))
+                .frame(width: 18, alignment: .center)
+            Text(pane.title)
+                .lineLimit(1)
+            Spacer(minLength: 4)
+            // Drawn only when Rust says something is actually costing the
+            // user something. `nil` draws nothing at all — never a zero, and
+            // never a placeholder, or the badge stops being read.
+            if let attention = pane.attention {
+                Text(attention)
+                    .font(.caption2)
+                    .foregroundStyle(Color.accentColor)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 1)
+                    .background(Capsule().fill(Color.accentColor.opacity(0.14)))
+                    .fixedSize()
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    // MARK: - Detail
+
+    @ViewBuilder
+    private var detail: some View {
+        // A scroll container, because `maxHeight: .infinity` with a top
+        // alignment stretches the *frame* while still handing the child its
+        // ideal height. The Form inside asked for all 1327pt of its rows,
+        // the split view grew to 1465pt to match, and the host centred that
+        // inside 640pt — hanging 438pt of sidebar and detail off the top of
+        // the window. Measured, not guessed.
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+            if let loadError, panes.isEmpty {
                 banner(loadError, color: .red)
             }
+            // Unconditional: a write that failed must reach the user whether
+            // or not a schema is on screen behind it.
             if let actionError {
                 banner(actionError, color: .red)
             }
-            if let model {
-                // Both must reach the user: `error` means a hand-edited file
-                // failed to parse at all (running on defaults); `notes` means
-                // it parsed but Rust refused a value as it stood — a number
-                // clamped to its range, or a `claude_config_dir` that is not
-                // a directory, dropped back to auto-detection. Neither is
-                // silent, and `notes` is how a rejected directory reaches the
-                // user at save time rather than at the next launch.
-                if let error = model.error {
-                    banner(error, color: .red)
-                }
-                if !model.notes.isEmpty {
-                    banner(model.notes.joined(separator: "\n"), color: .orange)
-                }
+            if !notes.isEmpty {
+                banner(notes.joined(separator: "\n"), color: .orange)
             }
 
-            TabView(selection: $tab) {
-                generalPane
-                    .tabItem { Label("General", systemImage: "gearshape") }
-                    .tag(Tab.general)
-                sessionsPane
-                    .tabItem { Label("Sessions & Menu Bar", systemImage: "clock") }
-                    .tag(Tab.sessions)
-                notificationsPane
-                    .tabItem { Label("Notifications", systemImage: "bell") }
-                    .tag(Tab.notifications)
-                DiagnosticsView(engine: engine, refreshToken: refreshToken)
-                    .tabItem { Label("Diagnostics", systemImage: "stethoscope") }
-                    .tag(Tab.diagnostics)
+            if let pane = currentPane {
+                if let preview = pane.preview {
+                    previewPanel(preview)
+                }
+                if pane.id == .notifications {
+                    notificationPermissionNotes
+                }
+                paneBody(pane)
+            } else if !query.isEmpty {
+                emptyDetail
+            } else if loadError == nil {
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                Spacer()
             }
         }
-        .frame(width: 520, height: 420)
-        .task(id: refreshToken) { await load() }
-        .onChange(of: claudeDirFocused) { _, focused in
-            if !focused { commitClaudeDir() }
+            .frame(maxWidth: .infinity, alignment: .topLeading)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// Perch's differentiator, and so the first thing on the detail side
+    /// rather than something buried under the controls: what this pane's
+    /// settings are doing right now, in the user's own numbers. Every string
+    /// is composed in Rust.
+    private func previewPanel(_ preview: PanePreview) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("Right now")
+                .font(.caption2.weight(.semibold))
+                .textCase(.uppercase)
+                .foregroundStyle(.secondary)
+            Text(preview.summary)
+                .font(.title3)
+                .fixedSize(horizontal: false, vertical: true)
+            ForEach(Array(preview.detail.enumerated()), id: \.offset) { _, line in
+                Text(line)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.08))
+        )
+        .padding(.horizontal, 20)
+        .padding(.top, 18)
+    }
+
+    @ViewBuilder
+    private func paneBody(_ pane: SettingsPane) -> some View {
+        switch pane.id {
+        case .prices:
+            // Bespoke because an editable table of four rates per model is
+            // not a list of scalar options — and because the thing this pane
+            // most needs to show, the models in use with no rate at all, is
+            // not in the table it would render.
+            PricesPane(
+                engine: engine,
+                refreshToken: refreshToken,
+                // A price edit changes this pane's own preview and the
+                // sidebar's "3 unpriced" badge, both of which live in the
+                // schema — so the schema is re-read once the write lands.
+                schemaChanged: { refreshSchema() }
+            )
+        case .advanced:
+            AdvancedPane(
+                engine: engine,
+                refreshToken: refreshToken,
+                // The global reset returns the whole schema, so it is
+                // applied by the view that owns it rather than by the pane
+                // that asked for it.
+                resetAllSettings: { resetAll() }
+            )
+        case .diagnostics:
+            // Already written, already correct — moved from the old tab bar
+            // into the split view rather than left dark for a commit.
+            DiagnosticsView(engine: engine, refreshToken: refreshToken)
+        default:
+            SchemaPane(pane: pane, actions: actions)
+        }
+    }
+
+    private var emptyDetail: some View {
+        VStack(spacing: 8) {
+            Text("No setting matches “\(query)”.")
+                .font(.title3)
+            Text("Search looks at every label and every explanation, so try a word you would expect to read here.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(40)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// The three things macOS can say about notifications that the stored
+    /// setting cannot — kept verbatim from the window this one replaces,
+    /// each of them a defect someone found once already.
+    @ViewBuilder
+    private var notificationPermissionNotes: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if notifier.authorization == .denied {
+                Text("Perch isn't allowed to show notifications.")
+                    .foregroundStyle(.red)
+                Button("Open Notification Settings…") { openSystemNotificationSettings() }
+                    .buttonStyle(.link)
+            } else if !notifier.canDeliver && storedWaitingEnabled {
+                // The settings file says on, macOS has never been asked. The
+                // toggle below already reads OFF, which is the honest state —
+                // this says why it disagrees with the file the user edited,
+                // and what to do about it.
+                Text("The settings file turns these on, but macOS hasn't been asked for permission yet. Switch this on here to ask.")
+                    .foregroundStyle(.orange)
+            }
+            // macOS refused a delivery Rust had already decided on. Reported
+            // verbatim rather than swallowed — see `Notifier.lastFailure`.
+            if let failure = notifier.lastFailure {
+                Text(failure).foregroundStyle(.red)
+            }
+        }
+        .font(.callout)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 20)
+        .padding(.top, 12)
     }
 
     private func banner(_ text: String, color: Color) -> some View {
         Text(text)
             .font(.callout)
             .foregroundStyle(color)
+            .fixedSize(horizontal: false, vertical: true)
             .padding(8)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(color.opacity(0.12))
     }
 
-    // MARK: - General
-
-    @ViewBuilder
-    private var generalPane: some View {
-        Form {
-            Toggle("Launch at login", isOn: launchAtLoginBinding)
-
-            Section("Claude Code Directory") {
-                TextField("Auto-detected", text: $claudeDirDraft)
-                    .focused($claudeDirFocused)
-                    .onSubmit { commitClaudeDir() }
-                HStack {
-                    Button("Choose…") { chooseClaudeDir() }
-                    if !claudeDirDraft.isEmpty {
-                        Button("Use Default (Auto-Detect)") {
-                            claudeDirDraft = ""
-                            commitClaudeDir()
-                        }
-                    }
-                }
-            }
-
-            Section("Preferred Terminal") {
-                Picker("Preferred terminal", selection: preferredTerminalBinding) {
-                    Text("Terminal").tag("Terminal")
-                    Text("iTerm2").tag("iTerm2")
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-            }
+    /// The single place a semantic icon becomes a macOS glyph. Rust names the
+    /// concept; only this function knows what SF Symbols calls it. Monochrome
+    /// by choice: nine panes of one app do not need colour to be told apart.
+    private func symbolName(_ icon: IconId) -> String {
+        switch icon {
+        case .general:       return "gearshape"
+        case .menuBar:       return "menubar.rectangle"
+        case .popover:       return "rectangle.on.rectangle"
+        case .projects:      return "folder"
+        case .usage:         return "chart.bar"
+        case .prices:        return "dollarsign.circle"
+        case .notifications: return "bell"
+        case .diagnostics:   return "stethoscope"
+        case .advanced:      return "slider.horizontal.3"
         }
-        .padding(20)
-        .disabled(model == nil)
     }
 
-    private func chooseClaudeDir() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Choose"
-        if !claudeDirDraft.isEmpty {
-            panel.directoryURL = URL(fileURLWithPath: claudeDirDraft)
-        }
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        claudeDirDraft = url.path
-        commitClaudeDir()
-    }
-
-    private func commitClaudeDir() {
-        guard let model, claudeDirDraft != model.settings.claudeConfigDir else { return }
-        update { $0.claudeConfigDir = claudeDirDraft }
-    }
-
-    // MARK: - Sessions & Menu Bar
-
-    @ViewBuilder
-    private var sessionsPane: some View {
-        Form {
-            Stepper(value: pollSecondsBinding, in: 1...60) {
-                Text(pollSecondsLabel(seconds: pollSecondsBinding.wrappedValue))
-            }
-
-            Picker("Menu bar shows", selection: menuBarDisplayBinding) {
-                Text("Icon only").tag(MenuBarDisplay.icon)
-                Text("Icon + count").tag(MenuBarDisplay.count)
-                Text("Icon + count + waiting").tag(MenuBarDisplay.countAndWaiting)
-            }
-        }
-        .padding(20)
-        .disabled(model == nil)
-    }
-
-    // MARK: - Notifications
-
-    @ViewBuilder
-    private var notificationsPane: some View {
-        Form {
-            Toggle("Notify when a session is waiting on you", isOn: waitingEnabledBinding)
-                .disabled(notificationsDenied)
-
-            if notificationsDenied {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Perch isn't allowed to show notifications.")
-                        .foregroundStyle(.red)
-                    Button("Open Notification Settings…") { openSystemNotificationSettings() }
-                }
-                .font(.callout)
-                .padding(.vertical, 4)
-            } else if !notificationsDeliverable && storedWaitingEnabled {
-                // The settings file says on, macOS has never been asked. The
-                // toggle above already reads OFF, which is the honest state —
-                // this says why it disagrees with the file the user edited,
-                // and what to do about it.
-                Text("The settings file turns these on, but macOS hasn't been asked for permission yet. Switch this on here to ask.")
-                    .foregroundStyle(.orange)
-                    .font(.callout)
-                    .padding(.vertical, 4)
-            }
-
-            // macOS refused a delivery Rust had already decided on. Reported
-            // verbatim rather than swallowed — see `Notifier.lastFailure`.
-            if let failure = notifier.lastFailure {
-                Text(failure)
-                    .foregroundStyle(.red)
-                    .font(.callout)
-                    .padding(.vertical, 4)
-            }
-
-            // Dependent controls stay visible and greyed rather than
-            // disappearing — hiding them would conceal what is configurable
-            // and make the window twitch when the toggle above flips.
-            let enabled = storedWaitingEnabled && notificationsDeliverable
-
-            Stepper(value: waitingAfterMinutesBinding, in: 1...240) {
-                Text(waitingAfterMinutesLabel(minutes: waitingAfterMinutesBinding.wrappedValue))
-            }
-            .disabled(!enabled)
-
-            Toggle("Include background sessions", isOn: includeBackgroundBinding)
-                .disabled(!enabled)
-        }
-        .padding(20)
-        .disabled(model == nil)
-    }
-
-    /// Deep-links into System Settings' Notifications pane — the same
-    /// `x-apple.systempreferences:` scheme every third-party Mac app uses for
-    /// this, since there is no public API to open a single app's own
-    /// notification settings entry directly.
     private func openSystemNotificationSettings() {
         guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.notifications") else { return }
         NSWorkspace.shared.open(url)
     }
 
-    // MARK: - Bindings
+    // MARK: - Selection
 
-    /// Every binding below saves immediately: each is a discrete, deliberate
-    /// edit (a flip, a single-choice pick, a stepper click), not free typing,
-    /// so there is no keystroke-storm risk in writing it straight through.
+    /// A filtered sidebar can drop the remembered pane; the detail side then
+    /// falls back to whatever the search did return, *without* overwriting
+    /// what the user last deliberately chose.
+    private var currentPane: SettingsPane? {
+        panes.first { $0.id.key == (selectedPaneKey ?? storedPaneKey) } ?? panes.first
+    }
 
-    /// `get` reads macOS's own registration (`LoginItem.isRegistered`), never
-    /// the stored `launchAtLogin` value — the two can disagree (removed via
-    /// System Settings, or a fresh install with a stale hand-edited file),
-    /// and the control must always reflect what is actually registered, not
-    /// what Perch last wrote to disk. `set` registers/unregisters first;
-    /// only on success does it persist the setting, so a refused request
-    /// never leaves a stored `true` that isn't backed by a real
-    /// registration.
-    private var launchAtLoginBinding: Binding<Bool> {
-        Binding(
-            get: { LoginItem.isRegistered },
-            set: { v in
-                do {
-                    try LoginItem.setRegistered(v)
-                    update { $0.launchAtLogin = v }
-                } catch {
-                    actionError = error.localizedDescription
+    // MARK: - Actions handed to the renderer
+
+    private var actions: SchemaPaneActions {
+        SchemaPaneActions(
+            write: { key, value in write(key, value) },
+            reset: { pane in reset(pane) },
+            perform: { _ in
+                // No schema pane carries an action row yet; the buttons that
+                // do anything (reindex, reset everything) belong to the
+                // bespoke Advanced pane.
+            },
+            additionallyDisabled: { row in
+                guard let key = row.key else { return false }
+                switch key {
+                case .waitingAfterMinutes, .includeBackground, .sound:
+                    return !notifier.canDeliver
+                default:
+                    return false
                 }
-            }
+            },
+            systemToggle: { key in systemToggle(key) }
         )
     }
 
-    private var preferredTerminalBinding: Binding<String> {
-        Binding(
-            get: { model?.settings.preferredTerminal ?? "Terminal" },
-            set: { v in update { $0.preferredTerminal = v } }
-        )
+    /// The two toggles whose displayed state is macOS's answer rather than
+    /// the file's, because a setting that lies about its own effect is worse
+    /// than no setting at all.
+    private func systemToggle(_ key: SettingKey) -> SystemToggle? {
+        switch key {
+        case .launchAtLogin:
+            // Reads the actual registration, never the stored value: a user
+            // can remove the login item from System Settings without Perch
+            // hearing about it. `set` registers first and only persists on
+            // success, so a refused request never leaves a stored `true`
+            // with nothing behind it.
+            return SystemToggle(
+                isOn: LoginItem.isRegistered,
+                isDisabled: false,
+                set: { on in
+                    do {
+                        try LoginItem.setRegistered(on)
+                        write(.launchAtLogin, .bool(value: on))
+                    } catch {
+                        actionError = error.localizedDescription
+                    }
+                }
+            )
+        case .waitingEnabled:
+            // Never ON over a channel delivering nothing — a revoked
+            // permission, and equally a `waiting_enabled = true` hand-edited
+            // into config.toml that macOS has never been asked about. The ON
+            // branch asks for authorization at the moment the user asks for
+            // it, and persists only what was granted.
+            return SystemToggle(
+                isOn: notifier.canDeliver && storedWaitingEnabled,
+                isDisabled: notifier.authorization == .denied,
+                set: { on in
+                    guard on else {
+                        write(.waitingEnabled, .bool(value: false))
+                        return
+                    }
+                    Task {
+                        let granted = await engine.notifier.requestAuthorization()
+                        write(.waitingEnabled, .bool(value: granted))
+                    }
+                }
+            )
+        default:
+            return nil
+        }
     }
 
-    private var pollSecondsBinding: Binding<UInt32> {
-        Binding(
-            get: { model?.settings.pollSeconds ?? Self.defaults.pollSeconds },
-            set: { v in update { $0.pollSeconds = v } }
-        )
-    }
-
-    private var menuBarDisplayBinding: Binding<MenuBarDisplay> {
-        Binding(
-            get: { model?.settings.menuBarDisplay ?? Self.defaults.menuBarDisplay },
-            set: { v in update { $0.menuBarDisplay = v } }
-        )
-    }
-
-    /// What the settings file says, before macOS gets a say.
+    /// What the settings file says, before macOS gets a say — read out of the
+    /// schema rather than kept in a second place.
     private var storedWaitingEnabled: Bool {
-        model?.settings.waitingEnabled ?? Self.defaults.waitingEnabled
+        guard let row = row(.waitingEnabled), case let .toggle(on) = row.control else { return false }
+        return on
     }
 
-    /// `get` reports `false` unless a notification would actually be shown —
-    /// a revoked permission, and equally a `waiting_enabled = true` hand-
-    /// edited into config.toml that macOS has never been asked about, so the
-    /// toggle can never sit on over a channel delivering nothing. `set`'s ON
-    /// branch requests authorization *at the moment the user asks for it*,
-    /// never before: granted, it saves `true`; refused, it leaves the
-    /// persisted setting `false` rather than saving a preference that would
-    /// silently do nothing. Both branches leave `notifier.authorization`
-    /// holding whatever macOS now says — `requestAuthorization` re-reads it —
-    /// so this binding's `get` needs no separate flag of its own to keep in
-    /// step.
-    private var waitingEnabledBinding: Binding<Bool> {
-        Binding(
-            get: { notificationsDeliverable && storedWaitingEnabled },
-            set: { v in
-                guard v else {
-                    update { $0.waitingEnabled = false }
-                    return
-                }
-                Task {
-                    let granted = await engine.notifier.requestAuthorization()
-                    update { $0.waitingEnabled = granted }
-                }
-            }
-        )
+    private func row(_ key: SettingKey) -> SettingRow? {
+        panes.lazy.flatMap { $0.groups }.flatMap { $0.rows }.first { $0.key == key }
     }
 
-    private var waitingAfterMinutesBinding: Binding<UInt32> {
-        Binding(
-            get: { model?.settings.waitingAfterMinutes ?? Self.defaults.waitingAfterMinutes },
-            set: { v in update { $0.waitingAfterMinutes = v } }
-        )
-    }
-
-    private var includeBackgroundBinding: Binding<Bool> {
-        Binding(
-            get: { model?.settings.includeBackground ?? Self.defaults.includeBackground },
-            set: { v in update { $0.includeBackground = v } }
-        )
-    }
-
-    // MARK: - Load / save
+    // MARK: - Load, search, write
 
     /// Runs once per `refreshToken` — i.e. once per fresh presentation of the
     /// window, including a reopen after it was previously closed.
     /// `SettingsWindowController.show()` reuses the same `NSHostingView` and
     /// only swaps `.rootView`, so SwiftUI preserves this view's `@State`
     /// across a close/reopen (the same reuse that makes `refreshToken`
-    /// necessary at all) — without clearing `actionError` here, a save that
-    /// failed, closed, and was reopened later would show a stale
-    /// save-failure banner with nothing currently wrong. Cleared
-    /// unconditionally at the top, before the fetch below, rather than only
-    /// in `apply()`: `apply()` only runs if `engine.settings()` succeeds, so
-    /// clearing there would leave a stale `actionError` on screen alongside
-    /// a fresh `loadError` if the engine happened to be unavailable on this
-    /// particular reopen. This does not affect an in-session save: nothing
-    /// but a reopen re-runs `load()`, so a banner a save just produced is
-    /// never wiped before the user can read it.
+    /// necessary at all) — without clearing `actionError` here, a write that
+    /// failed, closed, and was reopened later would show a stale failure
+    /// banner with nothing currently wrong. Cleared unconditionally at the
+    /// top, before the fetch below, rather than only on success: clearing it
+    /// afterwards would leave a stale `actionError` alongside a fresh
+    /// `loadError` if the engine happened to be unavailable on this reopen.
     private func load() async {
         actionError = nil
-        guard let m = await engine.settings() else {
+        notes = []
+        guard let fetched = await engine.settingsSchema(query: queryOrNil) else {
             loadError = EngineUnavailable().localizedDescription
             return
         }
-        apply(m)
+        panes = fetched.panes
+        // The read carries notes too, not only the writes: a `poll_seconds =
+        // 9999` hand-edited into `config.toml` is clamped the moment the file
+        // is read, and this window is where the user finds that out.
+        notes = fetched.notes
+        loadError = nil
         // Never prompts — just reads whatever the OS currently says, so a
         // permission granted or denied from System Settings since this window
-        // last loaded (including from a run that never touched this toggle at
-        // all) is reflected the next time the window opens. Every subsequent
-        // delivery re-reads it too, so an open window keeps up.
+        // last loaded is reflected the next time it opens.
         await engine.notifier.refreshAuthorization()
     }
 
-    /// Queues `mutate` behind whatever save is already pending, rather than
-    /// firing it immediately against `model` as it stands right now. Without
-    /// this, two controls edited in quick succession (ordinary use, not a
-    /// stress case) would both read the same pre-edit `model.settings` if
-    /// the first `saveSettings` round trip hadn't returned yet — a plain
-    /// read-modify-write race in which whichever response lands last
-    /// silently discards the other edit. Chaining through `pendingSave`
-    /// instead means the second `mutate` only runs after the first save's
-    /// `apply()` has already landed, so it always builds on the freshest
-    /// `model`, not a stale baseline both edits started from.
-    private func update(_ mutate: @escaping (inout PerchFFI.Settings) -> Void) {
+    /// The query goes to Rust. Swift does no matching of its own; whatever
+    /// comes back *is* the sidebar.
+    private func search(_ q: String) {
+        searchTask?.cancel()
+        searchTask = Task {
+            let fetched = await engine.settingsSchema(query: q.isEmpty ? nil : q)
+            guard !Task.isCancelled else { return }
+            guard let fetched else {
+                loadError = EngineUnavailable().localizedDescription
+                return
+            }
+            panes = fetched.panes
+            loadError = nil
+        }
+    }
+
+    private var queryOrNil: String? { query.isEmpty ? nil : query }
+
+    /// Re-read the schema after something *other* than a setting changed it
+    /// — a model price, today. The Prices pane's preview and the sidebar's
+    /// "3 unpriced" badge are both computed in Rust from the index, so they
+    /// go stale the instant a rate is added and nothing else would notice.
+    /// Deliberately leaves `notes` alone: they belong to whatever write last
+    /// produced them, and a price edit is not that write.
+    private func refreshSchema() {
+        Task {
+            guard let fetched = await engine.settingsSchema(query: queryOrNil) else { return }
+            panes = fetched.panes
+        }
+    }
+
+    /// Every setting back to its factory value, in one write. Queued behind
+    /// any pending edit like every other write here, and adopting the schema
+    /// that came back — a reset that failed reports and changes nothing,
+    /// which is what makes it safe to offer at all.
+    private func resetAll() {
+        enqueue {
+            switch await engine.resetAllSettings() {
+            case .success(let result):
+                await adopt(result)
+            case .failure(let error):
+                actionError = error.localizedDescription
+            }
+        }
+    }
+
+    private func write(_ key: SettingKey, _ value: SettingValue) {
+        enqueue {
+            switch await engine.setSetting(key: key, value: value) {
+            case .success(let result):
+                await adopt(result)
+            case .failure(let error):
+                // Must reach the user independent of `loadError` — see
+                // `actionError`'s declaration above.
+                actionError = error.localizedDescription
+            }
+        }
+    }
+
+    private func reset(_ pane: PaneId) {
+        enqueue {
+            switch await engine.resetPane(pane) {
+            case .success(let result):
+                await adopt(result)
+            case .failure(let error):
+                actionError = error.localizedDescription
+            }
+        }
+    }
+
+    /// Queues `work` behind whatever write is already pending, rather than
+    /// firing it against the schema as it stands right now. Without this,
+    /// two controls edited in quick succession (ordinary use, not a stress
+    /// case) would both read the same pre-edit schema if the first round
+    /// trip hadn't returned — a plain read-modify-write race in which
+    /// whichever response lands last silently discards the other edit. Each
+    /// write names one key rather than a whole struct, so the two edits no
+    /// longer overwrite each other's *fields*; they still race over which
+    /// schema the second control reads its `get` from, and over which
+    /// `notes` the user is left looking at.
+    private func enqueue(_ work: @escaping () async -> Void) {
         let previous = pendingSave
         pendingSave = Task {
             _ = await previous?.value
-            await performUpdate(mutate)
+            actionError = nil
+            await work()
         }
     }
 
-    private func performUpdate(_ mutate: (inout PerchFFI.Settings) -> Void) async {
-        guard var settings = model?.settings else { return }
-        mutate(&settings)
-        actionError = nil
-        switch await engine.saveSettings(settings) {
-        case .success(let m):
-            apply(m)
-        case .failure(let e):
-            // Must reach the user independent of `model`/`loadError` — see
-            // `actionError`'s declaration above.
-            actionError = e.localizedDescription
+    /// A write returns the whole schema plus whatever `validated` changed, so
+    /// nothing here re-reads to see its own write. While a search is on,
+    /// though, the returned panes are the *unfiltered* ones — adopting them
+    /// as they stand would silently drop the filter out from under the
+    /// sidebar, so the filtered view is asked for again.
+    private func adopt(_ result: SettingsResult) async {
+        notes = result.notes
+        reconcileLoginItem(result.panes)
+        guard let q = queryOrNil else {
+            panes = result.panes
+            return
         }
+        panes = await engine.settingsSchema(query: q)?.panes ?? result.panes
     }
 
-    private func apply(_ m: SettingsModel) {
-        model = m
-        loadError = nil
-        if !claudeDirFocused {
-            claudeDirDraft = m.settings.claudeConfigDir
+    /// macOS owns whether Perch is a login item; the settings file only
+    /// records what Perch asked for. Toggling the row keeps the two in step,
+    /// but a reset writes the file without going near the row — so a reset
+    /// that claims to put all twenty-seven settings back to factory values
+    /// would leave Perch still launching at login, and the pane's "Reset to
+    /// defaults" would then hide for a value that had not reset.
+    ///
+    /// Every mutating call funnels through here, so reconciling here covers
+    /// both resets without either having to remember to.
+    private func reconcileLoginItem(_ panes: [SettingsPane]) {
+        let stored = panes
+            .lazy
+            .flatMap(\.groups)
+            .flatMap(\.rows)
+            .first { $0.key == .launchAtLogin }
+            .flatMap { row -> Bool? in
+                if case let .toggle(on) = row.control { return on }
+                return nil
+            }
+        guard let stored, stored != LoginItem.isRegistered else { return }
+        do {
+            try LoginItem.setRegistered(stored)
+        } catch {
+            // Surfaced, never swallowed: a registration macOS refused must
+            // not look like one that took.
+            actionError = error.localizedDescription
         }
     }
 }
+
+private extension PaneId {
+    /// A stable string for `@AppStorage` and for list selection. Never shown
+    /// to the user — every visible pane name is `SettingsPane.title`, which
+    /// Rust writes.
+    var key: String {
+        switch self {
+        case .general:       return "general"
+        case .menuBar:       return "menuBar"
+        case .popover:       return "popover"
+        case .projects:      return "projects"
+        case .usage:         return "usage"
+        case .prices:        return "prices"
+        case .notifications: return "notifications"
+        case .diagnostics:   return "diagnostics"
+        case .advanced:      return "advanced"
+        }
+    }
+}
+
