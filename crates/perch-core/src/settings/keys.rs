@@ -1,13 +1,13 @@
 //! Every setting addressed as data rather than as a field.
 //!
-//! [`Settings`] is a flat struct of twenty-six differently-typed fields, and
+//! [`Settings`] is a flat struct of twenty-seven differently-typed fields, and
 //! almost nothing outside this module wants to know that: the schema, search,
 //! per-pane reset and the FFI all want to say "this setting, that value".
 //! [`SettingKey`] is that address, and [`Settings::get`]/[`Settings::set`]
 //! are the only two places that translate between an address and a field.
 //!
 //! Both are single exhaustive `match`es with no catch-all arm, and that is
-//! the point of the module: a twenty-seventh setting cannot be added to
+//! the point of the module: a twenty-eighth setting cannot be added to
 //! `Settings` without the compiler demanding a key for it here, and once it
 //! has a key every consumer that walks [`SettingKey::ALL`] picks it up for
 //! free. The alternative — a hand-maintained list per consumer — is how a
@@ -29,6 +29,7 @@ pub enum SettingKey {
     StaleAfterMinutes,
     PollSeconds,
     PreferredTerminal,
+    ResumeBypassPermissions,
     ShowWaiting,
     ShowWorking,
     ShowRecent,
@@ -53,8 +54,8 @@ impl SettingKey {
     /// Every key, once, in the order the fields are declared in [`Settings`].
     /// Consumers walk this instead of keeping their own list, which is what
     /// makes "every key has a row", "every key is searchable" and "every key
-    /// resets" testable as one assertion each rather than twenty-six.
-    pub const ALL: [SettingKey; 26] = [
+    /// resets" testable as one assertion each rather than twenty-seven.
+    pub const ALL: [SettingKey; 27] = [
         SettingKey::LaunchAtLogin,
         SettingKey::ClaudeConfigDir,
         SettingKey::MenuBarDisplay,
@@ -63,6 +64,7 @@ impl SettingKey {
         SettingKey::StaleAfterMinutes,
         SettingKey::PollSeconds,
         SettingKey::PreferredTerminal,
+        SettingKey::ResumeBypassPermissions,
         SettingKey::ShowWaiting,
         SettingKey::ShowWorking,
         SettingKey::ShowRecent,
@@ -207,6 +209,9 @@ impl Settings {
             SettingKey::StaleAfterMinutes => SettingValue::Int(i64::from(self.stale_after_minutes)),
             SettingKey::PollSeconds => SettingValue::Int(i64::from(self.poll_seconds)),
             SettingKey::PreferredTerminal => SettingValue::Text(self.preferred_terminal.clone()),
+            SettingKey::ResumeBypassPermissions => {
+                SettingValue::Bool(self.resume_bypass_permissions)
+            }
             SettingKey::ShowWaiting => SettingValue::Bool(self.show_waiting),
             SettingKey::ShowWorking => SettingValue::Bool(self.show_working),
             SettingKey::ShowRecent => SettingValue::Bool(self.show_recent),
@@ -258,6 +263,9 @@ impl Settings {
             SettingKey::StaleAfterMinutes => self.stale_after_minutes = want_count(key, value)?,
             SettingKey::PollSeconds => self.poll_seconds = want_count(key, value)?,
             SettingKey::PreferredTerminal => self.preferred_terminal = want_text(key, value)?,
+            SettingKey::ResumeBypassPermissions => {
+                self.resume_bypass_permissions = want_bool(key, value)?
+            }
             SettingKey::ShowWaiting => self.show_waiting = want_bool(key, value)?,
             SettingKey::ShowWorking => self.show_working = want_bool(key, value)?,
             SettingKey::ShowRecent => self.show_recent = want_bool(key, value)?,
@@ -383,7 +391,7 @@ mod tests {
         seen.dedup();
         assert_eq!(seen.len(), before, "ALL contains a duplicate");
         assert_eq!(
-            before, 26,
+            before, 27,
             "ALL is missing a key, or gained one without this count"
         );
     }

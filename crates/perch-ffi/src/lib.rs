@@ -940,6 +940,7 @@ pub enum SettingKey {
     StaleAfterMinutes,
     PollSeconds,
     PreferredTerminal,
+    ResumeBypassPermissions,
     ShowWaiting,
     ShowWorking,
     ShowRecent,
@@ -971,6 +972,7 @@ impl From<settings::SettingKey> for SettingKey {
             settings::SettingKey::StaleAfterMinutes => SettingKey::StaleAfterMinutes,
             settings::SettingKey::PollSeconds => SettingKey::PollSeconds,
             settings::SettingKey::PreferredTerminal => SettingKey::PreferredTerminal,
+            settings::SettingKey::ResumeBypassPermissions => SettingKey::ResumeBypassPermissions,
             settings::SettingKey::ShowWaiting => SettingKey::ShowWaiting,
             settings::SettingKey::ShowWorking => SettingKey::ShowWorking,
             settings::SettingKey::ShowRecent => SettingKey::ShowRecent,
@@ -1004,6 +1006,7 @@ impl From<SettingKey> for settings::SettingKey {
             SettingKey::StaleAfterMinutes => settings::SettingKey::StaleAfterMinutes,
             SettingKey::PollSeconds => settings::SettingKey::PollSeconds,
             SettingKey::PreferredTerminal => settings::SettingKey::PreferredTerminal,
+            SettingKey::ResumeBypassPermissions => settings::SettingKey::ResumeBypassPermissions,
             SettingKey::ShowWaiting => settings::SettingKey::ShowWaiting,
             SettingKey::ShowWorking => settings::SettingKey::ShowWorking,
             SettingKey::ShowRecent => settings::SettingKey::ShowRecent,
@@ -2106,8 +2109,17 @@ impl Perch {
     }
 
     /// `claude --resume <session_id>` in `cwd`, as a ready-to-run shell line.
+    ///
+    /// `resume_bypass_permissions` is read from the settings file here, at the
+    /// moment of launch, for the same reason [`Perch::preferred_terminal`] is:
+    /// a change made in the settings window — or hand-edited into
+    /// `config.toml` — takes effect on the very next Resume, and a shell that
+    /// cached it could hand a user the flag they just turned off.
     pub fn resume_command(&self, session_id: String, cwd: String) -> TerminalCommand {
-        perch_core::actions::TerminalCommand::resume(&session_id, &cwd).into()
+        let bypass = settings::store::load(&self.config_path)
+            .settings
+            .resume_bypass_permissions;
+        perch_core::actions::TerminalCommand::resume(&session_id, &cwd, bypass).into()
     }
 
     /// A fresh `claude` session in `cwd`, as a ready-to-run shell line.
@@ -2319,7 +2331,7 @@ impl Perch {
 
     /// Put every setting back to its factory value.
     ///
-    /// One write of one whole `Settings`, not twenty-six writes: a reset
+    /// One write of one whole `Settings`, not twenty-seven writes: a reset
     /// that failed halfway would leave a configuration that is neither what
     /// Perch ships nor what the user chose, which is worse than not
     /// resetting at all. Reports the schema that resulted, exactly as
@@ -2705,10 +2717,23 @@ impl Perch {
                         .and_then(|r| r.cwd.map(|cwd| (r.id, cwd)))
                 });
             match newest {
-                Some((id, cwd)) => {
-                    perch_core::actions::TerminalCommand::resume(&id, &cwd).shell_line()
+                Some((id, cwd)) => perch_core::actions::TerminalCommand::resume(
+                    &id,
+                    &cwd,
+                    s.resume_bypass_permissions,
+                )
+                .shell_line(),
+                // No session to name yet, so the id is a placeholder — but the
+                // flag is not, and this preview is how a user checks what they
+                // just turned on.
+                None => {
+                    let mut line = "claude --resume <session>".to_string();
+                    if s.resume_bypass_permissions {
+                        line.push(' ');
+                        line.push_str(perch_core::actions::SKIP_PERMISSIONS_FLAG);
+                    }
+                    line
                 }
-                None => "claude --resume <session>".to_string(),
             }
         });
 
@@ -3098,6 +3123,71 @@ mod tests {
         assert_eq!(c.shell_line, "cd '/a/b' && claude --resume 'abc'");
         let o = perch.open_command("/a/b".into());
         assert_eq!(o.shell_line, "cd '/a/b' && claude");
+    }
+
+    /// The launch path, not the preview: `resume_command` re-reads
+    /// `resume_bypass_permissions` from disk, so turning it on changes the
+    /// very next Resume without the shell being rebuilt.
+    #[test]
+    fn resume_command_carries_the_skip_permissions_flag_once_the_setting_is_on() {
+        let (p, _guard, _data, _claude) = perch_in_temp();
+
+        assert_eq!(
+            p.resume_command("abc".into(), "/a/b".into()).shell_line,
+            "cd '/a/b' && claude --resume 'abc'",
+            "off by default"
+        );
+
+        p.set_setting(
+            SettingKey::ResumeBypassPermissions,
+            SettingValue::Bool { value: true },
+        )
+        .expect("a toggle takes a bool");
+
+        assert_eq!(
+            p.resume_command("abc".into(), "/a/b".into()).shell_line,
+            "cd '/a/b' && claude --resume 'abc' --dangerously-skip-permissions",
+        );
+    }
+
+    /// The "Resume runs" row is how a user verifies what they just turned on,
+    /// so it must show the flag — and stop showing it again when the setting
+    /// goes back off.
+    #[test]
+    fn the_resume_runs_preview_shows_the_flag_exactly_when_the_setting_is_on() {
+        let (p, _guard, _data, _claude) = perch_in_temp();
+        assert!(
+            !p.terminals().is_empty(),
+            "the preview is only composed when a terminal was found"
+        );
+
+        let off = p
+            .set_setting(
+                SettingKey::ResumeBypassPermissions,
+                SettingValue::Bool { value: false },
+            )
+            .unwrap();
+        assert!(
+            !info_value(&off.panes, "Resume runs").contains("skip-permissions"),
+            "got {:?}",
+            info_value(&off.panes, "Resume runs")
+        );
+
+        let on = p
+            .set_setting(
+                SettingKey::ResumeBypassPermissions,
+                SettingValue::Bool { value: true },
+            )
+            .unwrap();
+        let preview = info_value(&on.panes, "Resume runs");
+        assert!(
+            preview.contains("--dangerously-skip-permissions"),
+            "the preview must show the flag the setting just added: {preview:?}"
+        );
+        assert!(
+            preview.starts_with("claude --resume") || preview.contains("&& claude --resume"),
+            "and still be the resume command it was: {preview:?}"
+        );
     }
 
     #[test]
@@ -3621,6 +3711,21 @@ mod tests {
             .clone()
     }
 
+    /// The finished string an `Info` row reports, found by its label — these
+    /// rows carry no key, so there is nothing else to address them by.
+    fn info_value(panes: &[SettingsPane], label: &str) -> String {
+        panes
+            .iter()
+            .flat_map(|p| p.groups.iter())
+            .flat_map(|g| g.rows.iter())
+            .find(|r| r.label == label)
+            .map(|r| match &r.control {
+                Control::Info { value_label } => value_label.clone(),
+                other => panic!("{label:?} is drawn by {other:?}, not an info row"),
+            })
+            .unwrap_or_else(|| panic!("no row is labelled {label:?}"))
+    }
+
     fn stepper_value(panes: &[SettingsPane], key: SettingKey) -> i64 {
         match control_for(panes, key) {
             Control::Stepper { value, .. } => value,
@@ -3993,7 +4098,7 @@ mod tests {
     const UNSEEN_TERMINAL: &str = "Perch Test Terminal";
 
     /// Every key, as the boundary spells them. Taken from core's own list
-    /// rather than restated here, so a twenty-seventh setting joins these
+    /// rather than restated here, so a twenty-eighth setting joins these
     /// tests by existing.
     fn all_keys() -> Vec<SettingKey> {
         settings::SettingKey::ALL
@@ -4224,7 +4329,7 @@ mod tests {
             .unwrap();
     }
 
-    /// **The test that matters most.** Every one of the twenty-six keys,
+    /// **The test that matters most.** Every one of the twenty-seven keys,
     /// written through the FFI with a value of its own shape, read back from
     /// the schema the write returned, and then read again through a *second*
     /// `Perch` built over the same `config.toml` — which shares nothing with
@@ -4279,7 +4384,7 @@ mod tests {
         }
         assert_eq!(
             written.len(),
-            26,
+            27,
             "a key was added without joining this loop"
         );
     }
@@ -4451,7 +4556,7 @@ mod tests {
         let factory_panes = p.reset_all_settings().unwrap().panes;
         let factory = schema_values(&factory_panes);
         let home = pane_of_each_key(&factory_panes);
-        assert_eq!(home.len(), 26, "a key is drawn by no pane");
+        assert_eq!(home.len(), 27, "a key is drawn by no pane");
 
         let drift: Vec<(SettingKey, SettingValue)> = all_keys()
             .into_iter()
@@ -4676,7 +4781,7 @@ mod tests {
         assert_eq!(mine(&p).cost, "$0.00", "the user's model is unpriced again");
     }
 
-    /// Reset-all is about the twenty-six settings and nothing else. The index,
+    /// Reset-all is about the twenty-seven settings and nothing else. The index,
     /// the notes a user typed against their projects and the rates they
     /// entered all live elsewhere and must survive it — a "reset settings"
     /// that quietly emptied the index would be unrecoverable.
