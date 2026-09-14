@@ -42,15 +42,31 @@ Status legend: **now** = next task · **next** = this milestone or the following
   the Claude Code directory.
 - **Usage view** (spec §9.3). Hero stats, 14 days of token-class stacked bars, a top-projects
   ranking, and a per-model breakdown, as a second tab alongside the project list.
-- **Settings window.** A four-tab window (General, Sessions & Menu Bar, Notifications,
-  Diagnostics) reached from the status-item menu's **Settings…**, covering all eight of
-  Perch's settings — launch at login (`SMAppService`), the Claude Code directory override,
-  menu-bar display mode, poll interval, the three notification settings, and preferred
-  terminal — every one wired to real behaviour, not just stored. Settings live in a watched,
-  versioned `config.toml` under Perch's own application-support directory (`PERCH_CONFIG`
-  overrides the path); a hand edit takes effect without a restart, an out-of-range value is
-  clamped rather than rejected, and a file that won't parse falls back to defaults with the
-  reason shown in the window rather than refusing to start.
+- **Settings window.** A sidebar window of nine panes (General, Menu Bar, Popover, Projects,
+  Usage, Prices, Notifications, Diagnostics, Advanced) reached from the status-item menu's
+  **Settings…**, covering twenty-six settings — every one wired to real behaviour, not just
+  stored. The schema is built in Rust (`settings::schema`): panes, groups, rows, controls,
+  bounds, help sentences, search terms, the attention badges, and the per-pane preview of
+  what the current choices produce in the user's own data. Swift renders one SwiftUI control
+  per control variant and composes no caption of its own. A search field narrows every pane
+  to matching rows; a pane that has drifted offers to reset only itself; Advanced resets
+  everything and carries the resolved paths, index counts, and a reindex button; Prices is an
+  editable model-price table. Settings live in a watched, versioned `config.toml` under
+  Perch's own application-support directory (`PERCH_CONFIG` overrides the path); a hand edit
+  takes effect without a restart, an out-of-range value is clamped rather than rejected, and a
+  file that won't parse falls back to defaults with the reason shown in the window rather than
+  refusing to start.
+- **Menu-bar icon variants and stale-data dimming.** Four glyphs to choose from, and the item
+  fades — carrying a finished "last read N minutes ago" sentence as its accessibility label —
+  once the index has gone unread for longer than the configured threshold.
+- **Popover sections, density, and row detail.** The live list splits into Waiting on you and
+  Working, each hideable; Recent is hideable and its length configurable; rows draw at
+  comfortable or compact density and can carry the project folder and the per-session usage.
+  Every one of these reaches the menu on the view-model, never read out of `Settings` by the
+  shell.
+- **Burn-rate line** (spec §9.3). Tokens per hour, cost per hour, cost per day, or "at this
+  pace the window fills in ~1h 50m" — the mode is a setting, and a window too thin to project
+  from honestly shows no line in any mode.
 - **Waiting-on-you notification.** The feature the project started from: a session blocked for
   32 hours with nobody noticing. Turn it on in Settings and Perch tells you, once per episode,
   when a session has been waiting on you longer than N minutes (default 10; background
@@ -71,14 +87,18 @@ Status legend: **now** = next task · **next** = this milestone or the following
 
 ## Next — sessions & projects (Perch's own ground)
 
-- **Preferred-terminal auto-detection.** Resume and Open now use a user-selected preferred
-  terminal (Settings; Terminal.app or iTerm2 today, falling back to Terminal.app for anything
-  else). The design spec's original idea — resolving the terminal by walking the process tree
-  from a live session's pid, rather than asking the user to pick — is still undone.
+- **Preferred-terminal auto-detection.** Settings now lists the terminals it finds installed
+  (`terminals::terminal_choices`), so the picker no longer offers apps that aren't there — but
+  it still asks the user to pick, and only Terminal.app and iTerm2 are actually launched (see
+  the `preferred_terminal` entry under **settings & polish**). The design spec's original idea
+  — resolving the terminal by walking the process tree from a live session's pid, rather than
+  asking at all — is still undone.
 - **Hooks on session events.** Run a user-configured command when a session starts, ends, or
-  starts waiting on you — the natural next step past a notification. Needs its own trust story
-  before it ships: this would be Perch running an arbitrary user-provided executable, which is
-  a different risk profile from anything else in this read-only, no-network app.
+  starts waiting on you — the natural next step past a notification. Considered for the
+  settings redesign and deliberately left out of it: it needs its own trust story before it
+  ships, because this would be Perch running an arbitrary user-provided executable, which is a
+  different risk profile from anything else in this read-only, no-network app. A settings pane
+  is the easy half; deciding what the app is willing to execute is the work.
 - **Jump to session.** The original spec §9.4 and this branch's own spec §6 both call for a
   third action alongside Resume and Open: Jump activates the *application* that owns a live
   session (`NSRunningApplication.activate()`, no special permission needed) rather than
@@ -122,22 +142,22 @@ Status legend: **now** = next task · **next** = this milestone or the following
   count, and count-plus-waiting-glyph already ship as a user-selectable Settings option; the
   percentage modes wait on the same OAuth usage endpoint as the item above.
 - **Tiny usage meter in the icon** — a filled-bar glyph that reads at a glance without text.
-- **Stale-data dimming** — dim the icon when the last successful refresh is older than X.
 - **Approaching-limit notification** at a configurable threshold (default 80 %) once per
   window — the same edge-triggered shape as the waiting-on-you notification. Blocked on the
   OAuth usage endpoint: spec §8 forbids fabricating a percentage from the estimated tier, and
   a threshold alert needs a real one.
-- **Burn-rate projection** — "at this pace the window fills in ~1h 50m" (approved mockup).
-- **Verified price table** with an editable UI — today's numbers are placeholders.
+- **Verified prices.** The editable price table ships; the numbers in it do not come from
+  anywhere authoritative. Someone has to check them against Anthropic's published rates and
+  say, in the repo, where they came from and when.
 - **Reset-time style** options: countdown vs absolute time (CodexBar has this; cheap).
 
 ## Next — settings & polish
 
-- **The settings window redesign is specced and planned, not built.** Nine panes, twenty-six
-  settings, and six new capabilities including the search and per-pane reset that were
-  deferred here while the surface was only four tabs and eight fields. See
-  `docs/superpowers/specs/2026-09-06-settings-window-redesign.md` and
-  `docs/superpowers/plans/2026-09-07-settings-window-redesign.md`.
+- **A settings CLI.** `SettingKey` and the typed get/set beneath it already make
+  `perch settings list`, `perch settings get <key>` and `perch settings set <key> <value>`
+  a thin wrapper over what the window uses — same validation, same clamping, same file. The
+  redesign deliberately scoped it out so the window landed first; it is the cheapest item on
+  this list now that the keys are typed. Fits alongside the CLI parity entry under **Later**.
 - **The four `ui::watcher` tests are wall-clock flaky under compile load.** All four passed
   5/5 on an idle machine and all four failed together on the first run after a checkout,
   when `cargo` was still building other crates' test binaries. They assert against real
@@ -145,10 +165,13 @@ Status legend: **now** = next task · **next** = this milestone or the following
   against an injectable clock rather than raising the timeouts, which only moves the
   threshold. A vacuous test has already hidden in this module once, so any rewrite needs
   proof it still fails when the behaviour it names regresses.
-- **`preferred_terminal` crosses the FFI as a bare string** and `Launcher.swift` compares
-  against its values, unlike `menu_bar_display`'s enum. A hand-edited unknown terminal
-  renders a picker with nothing selected. The redesign's Task 8 fixes the Rust half by
-  supplying detected terminals; the Swift comparison outlives it.
+- **`preferred_terminal` still crosses the FFI as a bare string**, and `Launcher.swift` still
+  compares against its values (`case "iTerm2":`), unlike `menu_bar_display`'s enum. The
+  redesign fixed the Rust half — `terminals::terminal_choices` detects what is installed and
+  already knows each one's bundle identifier — but Swift never asked for it, so choosing
+  Warp, Ghostty, Alacritty, Kitty or WezTerm in Settings silently launches Terminal.app. The
+  fix is to carry the bundle id across on the choice and have `Launcher` use it, which
+  retires the string comparison at the same time.
 - **Light-mode palette** — the popover is dark-only today.
 - **Keyboard**: ⌥-click the tray for the menu; ↑↓ to move between sessions, ⏎ to jump.
 - **First-run state**: "No Claude Code data found at …" with a path picker, instead of an
