@@ -121,7 +121,10 @@ final class Notifier: NSObject, ObservableObject, UNUserNotificationCenterDelega
             let content = UNMutableNotificationContent()
             content.title = item.title
             content.body = item.body
-            content.sound = .default
+            // Rust resolved the "Play a sound" setting when it decided this
+            // alert had been earned; this side only carries the answer out.
+            // `nil` is UserNotifications' own spelling of "silent".
+            content.sound = item.sound ? UNNotificationSound.default : nil
             // Only what a click needs to be routed. `projectId` is omitted
             // entirely when Rust resolved none, so its absence at click time
             // is the same "no project to open" it was at delivery time.
