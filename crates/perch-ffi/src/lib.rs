@@ -297,10 +297,34 @@ pub struct MenuAction {
     pub disabled_reason: Option<String>,
 }
 
+/// Mirrors `perch_core::ui::session_menu::ActivityPoint`. The value crosses
+/// as a number for a shell to scale and draw; its caption crosses finished.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ActivityPoint {
+    pub index: i32,
+    pub tokens: u64,
+    pub label: String,
+}
+
+/// Mirrors `perch_core::ui::session_menu::SessionUsage`. Every string on it
+/// is final, including the headings and the chart's caption; every field is
+/// empty together when the user has hidden row usage.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SessionUsage {
+    pub heading: String,
+    pub classes: Vec<DetailRow>,
+    pub models_heading: String,
+    pub by_model: Vec<DetailRow>,
+    pub chart_caption: String,
+    pub chart: Vec<ActivityPoint>,
+    pub note: Option<String>,
+}
+
 /// Mirrors `perch_core::ui::session_menu::SessionMenu`.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct SessionMenu {
     pub detail: Vec<DetailRow>,
+    pub usage: SessionUsage,
     pub actions: Vec<MenuAction>,
     pub folder_path: String,
     pub session_id: String,
@@ -341,16 +365,56 @@ impl From<core_session_menu::MenuAction> for MenuAction {
     }
 }
 
+impl From<core_session_menu::ActivityPoint> for ActivityPoint {
+    fn from(p: core_session_menu::ActivityPoint) -> Self {
+        let core_session_menu::ActivityPoint {
+            index,
+            tokens,
+            label,
+        } = p;
+        ActivityPoint {
+            index,
+            tokens,
+            label,
+        }
+    }
+}
+
+impl From<core_session_menu::SessionUsage> for SessionUsage {
+    fn from(u: core_session_menu::SessionUsage) -> Self {
+        let core_session_menu::SessionUsage {
+            heading,
+            classes,
+            models_heading,
+            by_model,
+            chart_caption,
+            chart,
+            note,
+        } = u;
+        SessionUsage {
+            heading,
+            classes: classes.into_iter().map(Into::into).collect(),
+            models_heading,
+            by_model: by_model.into_iter().map(Into::into).collect(),
+            chart_caption,
+            chart: chart.into_iter().map(Into::into).collect(),
+            note,
+        }
+    }
+}
+
 impl From<core_session_menu::SessionMenu> for SessionMenu {
     fn from(m: core_session_menu::SessionMenu) -> Self {
         let core_session_menu::SessionMenu {
             detail,
+            usage,
             actions,
             folder_path,
             session_id,
         } = m;
         SessionMenu {
             detail: detail.into_iter().map(Into::into).collect(),
+            usage: usage.into(),
             actions: actions.into_iter().map(Into::into).collect(),
             folder_path,
             session_id,
@@ -2229,18 +2293,28 @@ impl Perch {
         // two surfaces would come to disagree.
         let model = self.core_model_for(sessions);
         let row = model.live.iter().find(|r| r.id == session_id)?;
-        // A branch is nice to know, never worth failing over: an index that
-        // will not open simply leaves the row an em dash.
-        let branch = db::open(&self.db_path)
-            .ok()
-            .and_then(|d| query::session_branch(&d, &session_id).ok())
+        // Opened once and handed on: the branch, and the usage section's own
+        // reads, come from the same index at the same instant. An index that
+        // will not open leaves the branch an em dash and the usage section a
+        // sentence saying so — never a zero.
+        let database = db::open(&self.db_path).ok();
+        let branch = database
+            .as_ref()
+            .and_then(|d| query::session_branch(d, &session_id).ok())
             .flatten();
+        // Loaded fresh here, like every other read of this file (see
+        // `core_model_for`): only `show_row_usage` and `show_cost` are
+        // consulted, and a change made in the settings window must reach the
+        // very next submenu that opens.
+        let settings = settings::store::load(&self.config_path).settings;
         Some(
             core_session_menu::build_session_menu(&core_session_menu::SessionContext {
                 row,
                 cwd: &session.cwd,
                 branch: branch.as_deref(),
                 owning_app: owning_app.as_deref(),
+                db: database.as_ref(),
+                settings: &settings,
             })
             .into(),
         )
@@ -3296,6 +3370,10 @@ mod tests {
                 cwd: &cwd,
                 branch: None,
                 owning_app: None,
+                // No index and default preferences: this is about the Resume
+                // action, which reads neither.
+                db: None,
+                settings: &perch_core::settings::Settings::default(),
             },
         );
         let resume = menu

@@ -2,6 +2,11 @@
 //! to it. Composed here — titles, labels, values and the sentence explaining
 //! a disabled action included — so a shell only lays it out.
 
+use crate::db::Db;
+use crate::model::TurnUsage;
+use crate::query::{self, SessionActivity};
+use crate::settings::Settings;
+use crate::ui::format::{human_cost, human_elapsed, human_tokens};
 use crate::ui::model::SessionRow;
 
 /// One labelled fact. Both halves are final strings; a shell puts them side
@@ -34,9 +39,52 @@ pub struct MenuAction {
     pub disabled_reason: Option<String>,
 }
 
+/// One bar of the session's own activity chart. The value crosses as a
+/// number — a shell scales and draws it — and its label crosses finished, the
+/// same division `ui::usage`'s daily chart and the project sparkline already
+/// make.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ActivityPoint {
+    pub index: i32,
+    pub tokens: u64,
+    /// Where in the session's life this slice falls — "Start", "15m in".
+    pub label: String,
+}
+
+/// What this session has actually spent: the four billable token classes
+/// broken out, the total, the models that spent it when there was more than
+/// one, and the shape of it over the session's own lifetime.
+///
+/// Every field is empty together when the user has turned row usage off. That
+/// is the "you asked not to see this" state, and it is deliberately *not* the
+/// same as `note` — a sentence is what "there is nothing to show" looks like,
+/// and a user who hid these numbers is not being told the index is empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SessionUsage {
+    /// "Usage", or empty when the whole section is hidden.
+    pub heading: String,
+    /// Input, Output, Cache read, Cache write, Total — values already
+    /// formatted, the total carrying the cost when the user shows costs.
+    pub classes: Vec<DetailRow>,
+    /// "By model", or empty when there are no per-model rows to head.
+    pub models_heading: String,
+    /// One row per model, heaviest first — and present only when this session
+    /// used more than one. With a single model these rows restate the total,
+    /// and a menu is the wrong place for a line that says nothing.
+    pub by_model: Vec<DetailRow>,
+    /// "Activity over 3h", or empty when there is no chart to caption.
+    pub chart_caption: String,
+    pub chart: Vec<ActivityPoint>,
+    /// The sentence shown in place of all of the above when there is nothing
+    /// to show — no turns recorded, or no index to read them from. `None`
+    /// whenever there is.
+    pub note: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SessionMenu {
     pub detail: Vec<DetailRow>,
+    pub usage: SessionUsage,
     pub actions: Vec<MenuAction>,
     /// Never drawn: the directory [`MenuActionKind::Resume`] runs in and
     /// [`MenuActionKind::RevealFolder`] selects. The *drawn* folder is a
@@ -65,6 +113,17 @@ pub struct SessionContext<'a> {
     /// fact in this menu, so the shell does it and Rust phrases the result.
     /// `None` when nothing could be resolved, which is what disables Focus.
     pub owning_app: Option<&'a str>,
+    /// The index, when it opened. `None` — or a query that fails against it —
+    /// is a different fact from "this session has no turns yet", and the
+    /// usage section says which of the two it is rather than drawing zeroes
+    /// for either.
+    pub db: Option<&'a Db>,
+    /// Read for `show_row_usage` and `show_cost` alone, and only by the usage
+    /// section: a four-way token breakdown cannot be carried on the row's two
+    /// finished strings the way `Tokens` and `Cost` are. Every other fact in
+    /// this menu still reaches it by way of `ctx.row`, and the two are held
+    /// together by a test that hiding usage empties both at once.
+    pub settings: &'a Settings,
 }
 
 const DASH: &str = "—";
@@ -94,19 +153,154 @@ fn or_dash(s: &str) -> &str {
     }
 }
 
-/// The detail rows and the actions for one live session.
+/// How many bars the activity chart is drawn from. Enough to show a shape —
+/// a warm-up, a long quiet stretch, a burst at the end — and few enough that
+/// each one is still a readable bar inside a menu.
+const ACTIVITY_BUCKETS: usize = 16;
+
+/// The detail rows, the usage section and the actions for one live session.
 ///
-/// Nothing here reads the index or the settings file: every display
-/// preference has already been applied to `ctx.row` by `build_model`, which
-/// is deliberate — the submenu and the row it hangs off can never disagree
-/// about whether the user asked to see a number, because only one of them
-/// ever decided.
+/// Every *metadata* fact reaches this through `ctx.row`, already shaped by the
+/// user's display preferences in `build_model` — which is deliberate: the
+/// submenu and the row it hangs off can never disagree about whether the user
+/// asked to see a number, because only one of them ever decided. The usage
+/// section is the one part that reads the index itself, because a breakdown
+/// into four token classes and a chart cannot be carried on the row's two
+/// finished strings; it applies the very same two preferences, and a test
+/// holds the two readings together.
 pub fn build_session_menu(ctx: &SessionContext) -> SessionMenu {
     SessionMenu {
         detail: detail_rows(ctx),
+        usage: usage_section(ctx),
         actions: actions(ctx),
         folder_path: ctx.cwd.to_string(),
         session_id: ctx.row.id.clone(),
+    }
+}
+
+/// The value for one token-class row. A class that summed to zero across
+/// turns Perch really did read is a *measured* zero, and showing it is honest
+/// — it is a fabricated zero, standing in for something unknown, that this
+/// codebase never emits.
+fn class_rows(usage: &TurnUsage, total_value: String) -> Vec<DetailRow> {
+    let mut out = Vec::new();
+    for (label, n) in [
+        ("Input", usage.input),
+        ("Output", usage.output),
+        ("Cache read", usage.cache_read),
+        ("Cache write", usage.cache_write_total()),
+    ] {
+        push(&mut out, label, &human_tokens(n));
+    }
+    push(&mut out, "Total", &total_value);
+    out
+}
+
+/// "2.0M" on its own, or "2.0M · $3.10" when the user shows costs. The same
+/// separator and the same order the popover row composes its own usage
+/// segment with, because they are the same two numbers.
+fn tokens_and_cost(tokens: u64, cost_usd: f64, show_cost: bool) -> String {
+    let tokens = human_tokens(tokens);
+    if show_cost {
+        format!("{tokens} · {}", human_cost(cost_usd))
+    } else {
+        tokens
+    }
+}
+
+fn activity_points(activity: &SessionActivity) -> (String, Vec<ActivityPoint>) {
+    let span = activity.last_ts - activity.first_ts;
+    // Nothing to plot across: a session whose turns share one instant has no
+    // shape, and fifteen empty bars beside one full one would invent one.
+    if span <= 0 {
+        return (String::new(), Vec::new());
+    }
+    let n = activity.buckets.len();
+    let points = activity
+        .buckets
+        .iter()
+        .enumerate()
+        .map(|(i, u)| ActivityPoint {
+            index: i as i32,
+            tokens: u.total_tokens(),
+            // Where in the session's own life this slice falls — not a wall
+            // clock, which would need a timezone this layer does not have,
+            // and not "ago", which the popover row's `Time in status`
+            // already means.
+            label: if i == 0 {
+                "Start".to_string()
+            } else {
+                format!("{} in", human_elapsed(span * i as i64 / n as i64))
+            },
+        })
+        .collect();
+    (format!("Activity over {}", human_elapsed(span)), points)
+}
+
+/// The usage section: the class breakdown, the per-model rows when they say
+/// something the total does not, and the session's own activity chart.
+fn usage_section(ctx: &SessionContext) -> SessionUsage {
+    // Hidden means every field empty and *no* sentence. "You asked not to see
+    // this" is not something to explain back to the user who asked for it.
+    if !ctx.settings.show_row_usage {
+        return SessionUsage::default();
+    }
+    let heading = "Usage".to_string();
+    let nothing = |note: &str| SessionUsage {
+        heading: heading.clone(),
+        note: Some(note.to_string()),
+        ..SessionUsage::default()
+    };
+
+    let Some(db) = ctx.db else {
+        return nothing("Perch could not read its index, so this session's usage is unknown.");
+    };
+    let id = &ctx.row.id;
+    let (Ok((totals, cost)), Ok(by_model), Ok(activity)) = (
+        query::session_usage(db, id),
+        query::session_usage_by_model(db, id),
+        query::session_activity(db, id, ACTIVITY_BUCKETS),
+    ) else {
+        return nothing("Perch could not read its index, so this session's usage is unknown.");
+    };
+    // `session_activity` is `None` for a session the index has never seen a
+    // turn for — which is the one case that deserves a sentence rather than a
+    // breakdown of zeroes.
+    let Some(activity) = activity.filter(|_| totals.total_tokens() > 0) else {
+        return nothing("No turns recorded for this session yet.");
+    };
+
+    let show_cost = ctx.settings.show_cost;
+    let (chart_caption, chart) = activity_points(&activity);
+    // One model restates the total; the rows only earn their space when there
+    // is something to compare.
+    let by_model: Vec<DetailRow> = if by_model.len() > 1 {
+        by_model
+            .iter()
+            .map(|(model, u, c)| DetailRow {
+                label: model.clone(),
+                value: tokens_and_cost(u.total_tokens(), *c, show_cost),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    SessionUsage {
+        heading,
+        classes: class_rows(
+            &totals,
+            tokens_and_cost(totals.total_tokens(), cost, show_cost),
+        ),
+        models_heading: if by_model.is_empty() {
+            String::new()
+        } else {
+            "By model".to_string()
+        },
+        by_model,
+        chart_caption,
+        chart,
+        note: None,
     }
 }
 
@@ -253,18 +447,43 @@ mod tests {
     /// so every display preference reaches the submenu by the only route it
     /// can: the row itself.
     fn row_for(session: &LiveSession, settings: &Settings) -> SessionRow {
-        build_model(None, std::slice::from_ref(session), 65_000, None, settings)
+        row_from(None, session, settings)
+    }
+
+    fn row_from(db: Option<&Db>, session: &LiveSession, settings: &Settings) -> SessionRow {
+        build_model(db, std::slice::from_ref(session), 65_000, None, settings)
             .live
             .remove(0)
     }
 
     fn menu(row: &SessionRow, cwd: &str, branch: Option<&str>, app: Option<&str>) -> SessionMenu {
+        menu_in(None, &Settings::default(), row, cwd, branch, app)
+    }
+
+    fn menu_in(
+        db: Option<&Db>,
+        settings: &Settings,
+        row: &SessionRow,
+        cwd: &str,
+        branch: Option<&str>,
+        app: Option<&str>,
+    ) -> SessionMenu {
         build_session_menu(&SessionContext {
             row,
             cwd,
             branch,
             owning_app: app,
+            db,
+            settings,
         })
+    }
+
+    /// The row and the menu built from one index and one `Settings` — the
+    /// only combination the app ever builds, since a tick hands both
+    /// `build_model` and `build_session_menu` the same pair.
+    fn menu_for(db: Option<&Db>, settings: &Settings, session: &LiveSession) -> SessionMenu {
+        let row = row_from(db, session, settings);
+        menu_in(db, settings, &row, &session.cwd, None, None)
     }
 
     fn value(m: &SessionMenu, label: &str) -> Option<String> {
@@ -328,7 +547,7 @@ mod tests {
             show_row_usage: false,
             ..Settings::default()
         };
-        let m = menu(&row_for(&s, &settings), &s.cwd, None, None);
+        let m = menu_in(None, &settings, &row_for(&s, &settings), &s.cwd, None, None);
 
         assert_eq!(value(&m, "Tokens"), None);
         assert_eq!(value(&m, "Cost"), None);
@@ -345,7 +564,7 @@ mod tests {
             show_cost: false,
             ..Settings::default()
         };
-        let m = menu(&row_for(&s, &settings), &s.cwd, None, None);
+        let m = menu_in(None, &settings, &row_for(&s, &settings), &s.cwd, None, None);
 
         assert_eq!(
             value(&m, "Tokens").as_deref(),
@@ -560,5 +779,332 @@ mod tests {
         let m = menu(&row_for(&s, &Settings::default()), &s.cwd, None, None);
         assert_eq!(m.session_id, "0f2c-9a11");
         assert_eq!(m.folder_path, "/Users/a/proj");
+    }
+
+    // ---- the usage section -------------------------------------------------
+
+    use crate::db::open_in_memory;
+    use crate::model::{SessionRecord, Turn};
+    use crate::pricing::seed_default_prices;
+
+    /// An index holding the given turns for the very session `live()` builds,
+    /// so the row and its usage section are talking about the same work.
+    fn indexed(turns: &[(i64, &str, TurnUsage)]) -> Db {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let pid = db
+            .upsert_project("-Users-a-proj", "/Users/a/proj", false)
+            .unwrap();
+        db.upsert_session(&SessionRecord {
+            id: "0f2c-9a11".into(),
+            project_id: pid,
+            file_path: "/tmp/0f2c-9a11.jsonl".into(),
+            file_size: 0,
+            indexed_offset: 0,
+            started_at: turns.first().map(|t| t.0),
+            last_activity_at: turns.last().map(|t| t.0),
+            cwd: Some("/Users/a/proj".into()),
+            git_branch: None,
+            cc_version: None,
+            title: None,
+            message_count: turns.len() as u64,
+        })
+        .unwrap();
+        let turns: Vec<Turn> = turns
+            .iter()
+            .map(|(ts, model, usage)| Turn {
+                ts: *ts,
+                model: (*model).into(),
+                usage: *usage,
+            })
+            .collect();
+        db.insert_turns("0f2c-9a11", &turns).unwrap();
+        db
+    }
+
+    fn spread(input: u64, output: u64, cache_read: u64, cache_write_5m: u64) -> TurnUsage {
+        TurnUsage {
+            input,
+            output,
+            cache_read,
+            cache_write_5m,
+            ..Default::default()
+        }
+    }
+
+    fn class(u: &SessionUsage, label: &str) -> Option<String> {
+        u.classes
+            .iter()
+            .find(|d| d.label == label)
+            .map(|d| d.value.clone())
+    }
+
+    /// Every user-visible string the usage section carries, in one list — so
+    /// a rule about what may never appear can be checked against all of them
+    /// rather than against the handful a test remembered to name.
+    fn every_string(u: &SessionUsage) -> Vec<String> {
+        let mut out = vec![
+            u.heading.clone(),
+            u.models_heading.clone(),
+            u.chart_caption.clone(),
+        ];
+        out.extend(u.note.clone());
+        for d in u.classes.iter().chain(u.by_model.iter()) {
+            out.push(d.label.clone());
+            out.push(d.value.clone());
+        }
+        out.extend(u.chart.iter().map(|p| p.label.clone()));
+        out
+    }
+
+    #[test]
+    fn a_session_with_no_recorded_turns_gets_a_sentence_and_never_a_row_of_zeroes() {
+        let s = live("/Users/a/proj", None);
+        let db = indexed(&[]);
+        let m = menu_for(Some(&db), &Settings::default(), &s);
+
+        assert_eq!(
+            m.usage.note.as_deref(),
+            Some("No turns recorded for this session yet."),
+            "a session Perch has seen no turns for says so in words"
+        );
+        assert!(
+            m.usage.classes.is_empty() && m.usage.chart.is_empty(),
+            "a breakdown of zeroes would claim four measurements Perch never made"
+        );
+        for s in every_string(&m.usage) {
+            assert!(
+                !s.contains('0') && !s.contains('$'),
+                "nothing in the empty state may read as a measured number: {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_index_that_cannot_be_read_says_so_rather_than_claiming_nothing_happened() {
+        let s = live("/Users/a/proj", None);
+        let m = menu_for(None, &Settings::default(), &s);
+
+        let note = m.usage.note.expect("no index is a fact worth a sentence");
+        assert!(
+            note.contains("index"),
+            "\"could not read\" and \"nothing recorded\" are different facts: {note:?}"
+        );
+        assert_ne!(
+            note, "No turns recorded for this session yet.",
+            "an unreadable index must not be reported as a quiet session"
+        );
+    }
+
+    #[test]
+    fn the_four_classes_are_broken_out_and_add_up_to_the_total() {
+        let s = live("/Users/a/proj", None);
+        // Four deliberately different magnitudes: a breakdown that read the
+        // wrong column, or repeated one, cannot produce all four of these.
+        let db = indexed(&[
+            (
+                1_000,
+                "claude-fable-5",
+                spread(1_000_000, 2_000_000, 3_000_000, 4_000_000),
+            ),
+            (
+                2_000,
+                "claude-fable-5",
+                spread(1_000_000, 0, 1_000_000, 1_000_000),
+            ),
+        ]);
+        let m = menu_for(Some(&db), &Settings::default(), &s);
+        let u = &m.usage;
+
+        assert_eq!(class(u, "Input").as_deref(), Some("2.0M"));
+        assert_eq!(class(u, "Output").as_deref(), Some("2.0M"));
+        assert_eq!(class(u, "Cache read").as_deref(), Some("4.0M"));
+        assert_eq!(class(u, "Cache write").as_deref(), Some("5.0M"));
+        // 13M in total, and the row carries the cost beside it.
+        let total = class(u, "Total").expect("a breakdown needs its total");
+        assert!(
+            total.starts_with("13.0M · $"),
+            "the total is the four classes summed, with the cost beside it: {total:?}"
+        );
+        // The same string the popover row shows, composed once: the submenu
+        // and the row it hangs off must not disagree about this session.
+        assert_eq!(
+            total,
+            format!("{} · {}", m.detail_value("Tokens"), m.detail_value("Cost")),
+        );
+    }
+
+    #[test]
+    fn one_model_gets_no_per_model_rows_because_they_would_only_restate_the_total() {
+        let s = live("/Users/a/proj", None);
+        let db = indexed(&[
+            (1_000, "claude-fable-5", spread(1_000_000, 0, 0, 0)),
+            (2_000, "claude-fable-5", spread(1_000_000, 0, 0, 0)),
+        ]);
+        let m = menu_for(Some(&db), &Settings::default(), &s);
+
+        assert!(
+            m.usage.by_model.is_empty(),
+            "one model's row is the total again, in a menu with no room to spare"
+        );
+        assert_eq!(m.usage.models_heading, "", "and nothing to head it with");
+        assert!(
+            !m.usage.classes.is_empty(),
+            "the breakdown itself still stands"
+        );
+    }
+
+    #[test]
+    fn several_models_each_get_a_row_heaviest_first() {
+        let s = live("/Users/a/proj", None);
+        // Sonnet inserted first and lighter, so ordering by row order or by
+        // name would both put it in front of fable.
+        let db = indexed(&[
+            (1_000, "claude-sonnet-5", spread(1_000_000, 0, 0, 0)),
+            (2_000, "claude-fable-5", spread(2_000_000, 0, 0, 0)),
+        ]);
+        let m = menu_for(Some(&db), &Settings::default(), &s);
+
+        let labels: Vec<&str> = m.usage.by_model.iter().map(|d| d.label.as_str()).collect();
+        assert_eq!(labels, vec!["claude-fable-5", "claude-sonnet-5"]);
+        assert_eq!(m.usage.models_heading, "By model");
+        // Priced at each model's own rate: fable's 2 MTok at $15.0/MTok and
+        // sonnet's 1 MTok at $3.0/MTok. Pooling them under either rate — the
+        // bug this guards — gives neither of these.
+        assert_eq!(m.usage.by_model[0].value, "2.0M · $30.00");
+        assert_eq!(m.usage.by_model[1].value, "1.0M · $3.00");
+    }
+
+    #[test]
+    fn the_chart_crosses_as_numbers_with_finished_labels_and_spans_the_session() {
+        let s = live("/Users/a/proj", None);
+        // An hour of work, quiet in the middle: the shape is the point.
+        let db = indexed(&[
+            (0, "claude-fable-5", spread(1_000, 0, 0, 0)),
+            (3_600_000, "claude-fable-5", spread(3_000, 0, 0, 0)),
+        ]);
+        let m = menu_for(Some(&db), &Settings::default(), &s);
+        let u = &m.usage;
+
+        assert_eq!(u.chart.len(), ACTIVITY_BUCKETS);
+        assert_eq!(u.chart_caption, "Activity over 1h");
+        assert_eq!(u.chart[0].label, "Start");
+        assert_eq!(
+            u.chart[8].label, "30m in",
+            "a bar's caption is finished here, never assembled from its index in a shell"
+        );
+        assert_eq!(u.chart[0].tokens, 1_000, "values cross as numbers");
+        assert_eq!(u.chart[ACTIVITY_BUCKETS - 1].tokens, 3_000);
+        assert_eq!(
+            u.chart.iter().map(|p| p.tokens).sum::<u64>(),
+            4_000,
+            "every turn is somewhere on the chart"
+        );
+        let indices: Vec<i32> = u.chart.iter().map(|p| p.index).collect();
+        assert_eq!(indices, (0..ACTIVITY_BUCKETS as i32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_session_that_lived_for_one_instant_gets_no_chart_rather_than_an_invented_shape() {
+        let s = live("/Users/a/proj", None);
+        let db = indexed(&[(7_000, "claude-fable-5", spread(5_000, 0, 0, 0))]);
+        let m = menu_for(Some(&db), &Settings::default(), &s);
+
+        assert!(
+            m.usage.chart.is_empty() && m.usage.chart_caption.is_empty(),
+            "one full bar beside fifteen empty ones is a shape the session never had"
+        );
+        assert!(
+            !m.usage.classes.is_empty(),
+            "the breakdown of what it did spend is still known"
+        );
+    }
+
+    #[test]
+    fn hiding_cost_leaves_no_dollars_anywhere_in_the_section() {
+        let s = live("/Users/a/proj", None);
+        let db = indexed(&[
+            (0, "claude-sonnet-5", spread(1_000_000, 0, 0, 0)),
+            (3_600_000, "claude-fable-5", spread(2_000_000, 0, 0, 0)),
+        ]);
+        let settings = Settings {
+            show_cost: false,
+            ..Settings::default()
+        };
+        let m = menu_for(Some(&db), &settings, &s);
+
+        // Everything is still on show — the breakdown, both models, the whole
+        // chart — so this cannot pass by the section being empty.
+        assert_eq!(m.usage.by_model.len(), 2);
+        assert_eq!(m.usage.chart.len(), ACTIVITY_BUCKETS);
+        assert_eq!(class(&m.usage, "Total").as_deref(), Some("3.0M"));
+        for s in every_string(&m.usage) {
+            assert!(
+                !s.contains('$'),
+                "a user who turned cost off must not find dollars here: {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hiding_row_usage_empties_the_whole_section_and_says_nothing_about_it() {
+        let s = live("/Users/a/proj", None);
+        let db = indexed(&[
+            (0, "claude-sonnet-5", spread(1_000_000, 0, 0, 0)),
+            (3_600_000, "claude-fable-5", spread(2_000_000, 0, 0, 0)),
+        ]);
+        let shown = menu_for(Some(&db), &Settings::default(), &s);
+        assert!(
+            !shown.usage.classes.is_empty()
+                && !shown.usage.by_model.is_empty()
+                && !shown.usage.chart.is_empty(),
+            "the fixture must have something to hide for this test to mean anything"
+        );
+
+        let settings = Settings {
+            show_row_usage: false,
+            ..Settings::default()
+        };
+        let m = menu_for(Some(&db), &settings, &s);
+
+        assert_eq!(
+            m.usage,
+            SessionUsage::default(),
+            "every heading, row, caption and bar goes when the user hides usage"
+        );
+        assert_eq!(
+            m.usage.note, None,
+            "\"you asked not to see this\" is not explained back to the user who asked"
+        );
+        // And the section agrees with the row it hangs under: one preference,
+        // two readings of it, never in disagreement.
+        assert_eq!(
+            m.detail.iter().find(|d| d.label == "Tokens"),
+            None,
+            "the Tokens row and the usage section hide together or not at all"
+        );
+    }
+
+    /// The `Tokens`/`Cost` rows the submenu has always pushed really do reach
+    /// it when the index has the numbers — the fact the rest of this section
+    /// is built on top of.
+    #[test]
+    fn the_tokens_and_cost_rows_reach_the_submenu_from_a_real_index() {
+        let s = live("/Users/a/proj", None);
+        let db = indexed(&[(1_000, "claude-fable-5", spread(2_000_000, 0, 0, 0))]);
+        let m = menu_for(Some(&db), &Settings::default(), &s);
+
+        assert_eq!(value(&m, "Tokens").as_deref(), Some("2.0M"));
+        assert_eq!(value(&m, "Cost").as_deref(), Some("$30.00"));
+    }
+
+    impl SessionMenu {
+        fn detail_value(&self, label: &str) -> String {
+            self.detail
+                .iter()
+                .find(|d| d.label == label)
+                .map(|d| d.value.clone())
+                .unwrap_or_default()
+        }
     }
 }
