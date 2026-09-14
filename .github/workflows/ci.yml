@@ -42,8 +42,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # No `version:` here — package.json's `packageManager` field pins pnpm,
+      # and giving both makes the action refuse with "Multiple versions of
+      # pnpm specified".
       - uses: pnpm/action-setup@v4
-        with: { version: 10 }
       - uses: actions/setup-node@v4
         with: { node-version: 24, cache: pnpm }
       - run: pnpm install --frozen-lockfile
@@ -422,7 +424,11 @@ jobs:
           mkdir -p "$SELFTEST_ROOT/src/nested"
           printf 'new WebSocket("wss://example.com")\n' > "$SELFTEST_ROOT/src/nested/x.tsx"
           printf '<script src="https://cdn.example/x.js"></script>\n' > "$SELFTEST_ROOT/index.html"
-          selftest_hits=$( cd "$SELFTEST_ROOT" && frontend_hits )
+          # `|| true` because GitHub runs these steps under `bash -e`, where a
+          # grep that matches nothing returns 1 and kills the step before it
+          # can report anything. A clean tree is the normal case, so without
+          # this the guard fails exactly when it should pass.
+          selftest_hits=$( cd "$SELFTEST_ROOT" && frontend_hits || true )
           if ! printf '%s\n' "$selftest_hits" | grep -q 'src/nested/x.tsx'; then
             echo "::error::Guard self-test failed: the frontend scan no longer reaches nested src/*.tsx."
             exit 1
@@ -433,7 +439,7 @@ jobs:
           fi
           rm -rf "$SELFTEST_ROOT"
 
-          hits=$(frontend_hits)
+          hits=$(frontend_hits || true)
           if [ -n "$hits" ]; then
             printf '%s\n' "$hits"
             echo "::error::The frontend gained an outbound network call or an absolute URL. The popover talks only to the Tauri backend."
@@ -493,7 +499,7 @@ jobs:
           fi
           rm -rf "$SELFTEST_ROOT"
 
-          hits=$(swift_hits)
+          hits=$(swift_hits || true)
           if [ -n "$hits" ]; then
             printf '%s\n' "$hits"
             echo "::error::The native macOS app gained an outbound network call or an absolute URL. It talks only to perch-ffi."
