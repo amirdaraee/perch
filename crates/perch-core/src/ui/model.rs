@@ -201,12 +201,21 @@ pub fn tray_title(live: &[LiveSession], display: MenuBarDisplay) -> String {
 
 /// Shared with `main_window`, which needs the same "nothing yet" `Stats` for
 /// its own no-data states — hence `pub(crate)` rather than private.
-pub(crate) fn dashed_stats() -> Stats {
+///
+/// `show_cost` is honoured here too: the tokens are genuinely unknown, so
+/// they get the dash, but a cost the user hid is blank — the same
+/// blank-means-hidden, dash-means-unknown rule every other row follows. The
+/// two would otherwise be confused precisely where there is nothing to show.
+pub(crate) fn dashed_stats(show_cost: bool) -> Stats {
     Stats {
         window_tokens: DASH.into(),
         week_tokens: DASH.into(),
         day_tokens: DASH.into(),
-        day_cost: DASH.into(),
+        day_cost: if show_cost {
+            DASH.into()
+        } else {
+            String::new()
+        },
         estimated: true,
         has_data: false,
     }
@@ -221,7 +230,7 @@ impl PopoverModel {
         // second set of them here.
         let defaults = Settings::default();
         PopoverModel {
-            stats: dashed_stats(),
+            stats: dashed_stats(defaults.show_cost),
             live: Vec::new(),
             recent: Vec::new(),
             tray_title: String::new(),
@@ -242,7 +251,7 @@ impl PopoverModel {
 fn stats_from(db: &Db, now_ms: i64, show_cost: bool) -> anyhow::Result<Stats> {
     use crate::query::usage_since;
     if db.turn_count()? == 0 {
-        return Ok(dashed_stats());
+        return Ok(dashed_stats(show_cost));
     }
     let (w, _) = usage_since(db, now_ms - FIVE_HOURS_MS)?;
     let (k, _) = usage_since(db, now_ms - WEEK_MS)?;
@@ -294,9 +303,9 @@ pub fn build_model(
         Some(Ok(s)) => s,
         Some(Err(e)) => {
             error = Some(format!("index unavailable: {e}"));
-            dashed_stats()
+            dashed_stats(settings.show_cost)
         }
-        None => dashed_stats(),
+        None => dashed_stats(settings.show_cost),
     };
 
     // Looked up once for the whole tick rather than per row. A failure here
@@ -1299,6 +1308,32 @@ mod tests {
             hidden.recent[0].ended_line, "ended 1s ago",
             "and the composed line drops the segment without a dangling separator"
         );
+    }
+
+    /// The no-data states are the one place the two sentinels could be
+    /// confused: an index with no turns yet genuinely does not know the
+    /// tokens, but it does know the user asked not to see cost.
+    #[test]
+    fn a_hidden_cost_is_blank_even_when_there_is_nothing_to_show() {
+        let s = Settings {
+            show_cost: false,
+            ..count_and_waiting()
+        };
+        let empty_index = open_in_memory().unwrap();
+        seed_default_prices(&empty_index).unwrap();
+        for (what, m) in [
+            (
+                "an index with no turns yet",
+                build_model(Some(&empty_index), &[], 10_000, None, &s),
+            ),
+            ("no index at all", build_model(None, &[], 10_000, None, &s)),
+        ] {
+            assert_eq!(m.stats.day_tokens, DASH, "{what}: tokens are unknown");
+            assert_eq!(
+                m.stats.day_cost, "",
+                "{what}: but a hidden cost is blank, not a \"Perch does not know\" dash"
+            );
+        }
     }
 
     #[test]
