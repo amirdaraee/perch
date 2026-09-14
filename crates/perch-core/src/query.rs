@@ -239,6 +239,109 @@ pub fn session_usage(db: &Db, session_id: &str) -> Result<(TurnUsage, f64)> {
     priced_usage(db, &per_model)
 }
 
+/// The same turns [`session_usage`] totals, split by the model that spent
+/// them and priced at that model's own rate — heaviest first, ties broken by
+/// name so the order never depends on SQLite's row order.
+///
+/// `session_usage` is the sum of exactly this list, and the two share the
+/// query and the pricing helper for that reason: a session's per-model rows
+/// can never add up to something other than its own total.
+pub fn session_usage_by_model(db: &Db, session_id: &str) -> Result<Vec<(String, TurnUsage, f64)>> {
+    let args: [&dyn rusqlite::ToSql; 1] = [&session_id];
+    let per_model = usage_rows(
+        db,
+        &format!("SELECT model, {SUMS} FROM turns WHERE session_id = ?1 GROUP BY model"),
+        &args,
+    )?;
+    let mut out = Vec::new();
+    for (model, u) in per_model {
+        let c = cost_of(db, &model, &u)?;
+        out.push((model, u, c));
+    }
+    out.sort_by(|a, b| {
+        b.1.total_tokens()
+            .cmp(&a.1.total_tokens())
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    Ok(out)
+}
+
+/// One session's own activity over its own lifetime: its turns bucketed into
+/// `buckets` equal slices of the span between its first turn and its last,
+/// oldest first, quiet slices present and zeroed.
+///
+/// Deliberately *not* the calendar days [`daily_usage_for_project`] uses. A
+/// session lives for minutes or hours far more often than for days, and a
+/// day-per-bar chart of one would be a single bar — which says nothing about
+/// the shape of the session, which is the whole reason to draw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionActivity {
+    pub first_ts: i64,
+    pub last_ts: i64,
+    /// Exactly `buckets` entries.
+    pub buckets: Vec<TurnUsage>,
+}
+
+/// `None` when the index holds no turns for this session at all — which a
+/// caller must say in words rather than draw as a flat line at zero.
+pub fn session_activity(
+    db: &Db,
+    session_id: &str,
+    buckets: usize,
+) -> Result<Option<SessionActivity>> {
+    let buckets = buckets.max(1);
+    let bounds: Option<(Option<i64>, Option<i64>)> = db
+        .conn()
+        .query_row(
+            "SELECT MIN(ts), MAX(ts) FROM turns WHERE session_id = ?1",
+            params![session_id],
+            |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?;
+    let Some((Some(first_ts), Some(last_ts))) = bounds else {
+        return Ok(None);
+    };
+
+    let mut stmt = db.conn().prepare(&format!(
+        "SELECT ts, {SUMS} FROM turns WHERE session_id = ?1 GROUP BY ts ORDER BY ts"
+    ))?;
+    let rows = stmt
+        .query_map(params![session_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                TurnUsage {
+                    input: r.get::<_, i64>(1)? as u64,
+                    output: r.get::<_, i64>(2)? as u64,
+                    cache_read: r.get::<_, i64>(3)? as u64,
+                    cache_write_5m: r.get::<_, i64>(4)? as u64,
+                    cache_write_1h: r.get::<_, i64>(5)? as u64,
+                    thinking: r.get::<_, i64>(6)? as u64,
+                },
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let span = last_ts - first_ts;
+    let mut out = vec![TurnUsage::default(); buckets];
+    for (ts, u) in rows {
+        // A session whose turns all share one timestamp has no span to divide;
+        // everything it did belongs to the one slice there is.
+        let i = if span <= 0 {
+            0
+        } else {
+            // The last turn lands in the last bucket rather than one past it.
+            (((ts - first_ts) as i128 * buckets as i128) / span as i128).min(buckets as i128 - 1)
+                as usize
+        };
+        out[i] = out[i].plus(&u);
+    }
+    Ok(Some(SessionActivity {
+        first_ts,
+        last_ts,
+        buckets: out,
+    }))
+}
+
 /// The most recently active sessions that are NOT currently live, newest first.
 pub fn recent_sessions(
     db: &Db,
@@ -782,6 +885,165 @@ mod tests {
         assert!(
             (cost - 33.0).abs() < 1e-9,
             "fable 2 MTok @ 15.0 + sonnet 1 MTok @ 3.0 = 33.00"
+        );
+    }
+
+    /// A session with turns at `ts`, each one model's, so the two new
+    /// per-session queries have something with real shape to read.
+    fn seed_session_turns(db: &Db, id: &str, turns: &[(i64, &str, TurnUsage)]) {
+        let pid = db
+            .upsert_project("-Users-a-one", "/Users/a/one", false)
+            .unwrap();
+        db.upsert_session(&SessionRecord {
+            id: id.into(),
+            project_id: pid,
+            file_path: format!("/tmp/{id}.jsonl"),
+            file_size: 0,
+            indexed_offset: 0,
+            started_at: turns.first().map(|t| t.0),
+            last_activity_at: turns.last().map(|t| t.0),
+            cwd: Some("/Users/a/one".into()),
+            git_branch: None,
+            cc_version: None,
+            title: None,
+            message_count: turns.len() as u64,
+        })
+        .unwrap();
+        let turns: Vec<Turn> = turns
+            .iter()
+            .map(|(ts, model, usage)| Turn {
+                ts: *ts,
+                model: (*model).into(),
+                usage: *usage,
+            })
+            .collect();
+        db.insert_turns(id, &turns).unwrap();
+    }
+
+    fn input(n: u64) -> TurnUsage {
+        TurnUsage {
+            input: n,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn session_usage_by_model_is_heaviest_first_and_priced_per_model() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        // Inserted lightest-first so a query that simply echoed SQLite's row
+        // order would come back the wrong way round.
+        seed_session_turns(
+            &db,
+            "s-m",
+            &[
+                (1_000, "claude-sonnet-5", input(1_000_000)),
+                (2_000, "claude-fable-5", input(2_000_000)),
+            ],
+        );
+        let rows = session_usage_by_model(&db, "s-m").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "claude-fable-5", "heaviest model first");
+        assert_eq!(rows[1].0, "claude-sonnet-5");
+        // Fable at $15.0/MTok, sonnet at its own $3.0/MTok — pooling both
+        // under either rate would give different numbers here.
+        assert!((rows[0].2 - 30.0).abs() < 1e-9, "2 MTok @ 15.0");
+        assert!((rows[1].2 - 3.0).abs() < 1e-9, "1 MTok @ 3.0");
+        // The split must add up to exactly what the session's own total says.
+        let (total, cost) = session_usage(&db, "s-m").unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.1.total_tokens()).sum::<u64>(),
+            total.total_tokens()
+        );
+        assert!((rows.iter().map(|r| r.2).sum::<f64>() - cost).abs() < 1e-9);
+    }
+
+    #[test]
+    fn session_usage_by_model_for_an_unknown_session_is_empty_not_error() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        assert!(session_usage_by_model(&db, "nope").unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_activity_spreads_turns_across_its_own_lifetime() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        // First, middle and last of a 100-second life. With four buckets the
+        // 25-second mark belongs to bucket 1 and the 50-second mark to bucket
+        // 2; the last turn must land in the last bucket, not one past it.
+        seed_session_turns(
+            &db,
+            "s-t",
+            &[
+                (100_000, "claude-fable-5", input(10)),
+                (125_000, "claude-fable-5", input(20)),
+                (150_000, "claude-fable-5", input(40)),
+                (200_000, "claude-fable-5", input(80)),
+            ],
+        );
+        let a = session_activity(&db, "s-t", 4).unwrap().unwrap();
+        assert_eq!(a.first_ts, 100_000);
+        assert_eq!(a.last_ts, 200_000);
+        assert_eq!(a.buckets.len(), 4);
+        let tokens: Vec<u64> = a.buckets.iter().map(|u| u.total_tokens()).collect();
+        assert_eq!(
+            tokens,
+            vec![10, 20, 40, 80],
+            "each turn belongs to the slice of the session's life it happened in"
+        );
+    }
+
+    #[test]
+    fn session_activity_keeps_quiet_slices_and_sums_the_whole_session() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        seed_session_turns(
+            &db,
+            "s-q",
+            &[
+                (0, "claude-fable-5", input(100)),
+                (1_000_000, "claude-fable-5", input(300)),
+            ],
+        );
+        let a = session_activity(&db, "s-q", 5).unwrap().unwrap();
+        let tokens: Vec<u64> = a.buckets.iter().map(|u| u.total_tokens()).collect();
+        assert_eq!(
+            tokens,
+            vec![100, 0, 0, 0, 300],
+            "a quiet stretch is a zero in place, not a missing bucket"
+        );
+        // Nothing may be dropped on the way into the buckets.
+        let (total, _) = session_usage(&db, "s-q").unwrap();
+        assert_eq!(
+            a.buckets.iter().map(|u| u.total_tokens()).sum::<u64>(),
+            total.total_tokens()
+        );
+    }
+
+    #[test]
+    fn session_activity_of_a_session_with_one_instant_does_not_divide_by_zero() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        seed_session_turns(&db, "s-1", &[(7_000, "claude-fable-5", input(55))]);
+        let a = session_activity(&db, "s-1", 6).unwrap().unwrap();
+        assert_eq!(a.first_ts, a.last_ts);
+        assert_eq!(a.buckets.len(), 6);
+        assert_eq!(a.buckets[0].total_tokens(), 55);
+        assert_eq!(
+            a.buckets[1..].iter().map(|u| u.total_tokens()).sum::<u64>(),
+            0
+        );
+    }
+
+    #[test]
+    fn session_activity_of_a_session_with_no_turns_is_nothing_not_zeroes() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        assert!(
+            session_activity(&db, "never-indexed", 8).unwrap().is_none(),
+            "a session with nothing recorded must be distinguishable from one \
+             that was recorded as quiet"
         );
     }
 
