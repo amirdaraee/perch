@@ -5,7 +5,8 @@ use perch_core::db::Db;
 use perch_core::platform::RealProcessProbe;
 use perch_core::ui::{
     advanced as core_advanced, diagnostics as core_diagnostics, main_window, model as core_model,
-    prices as core_prices, settings as core_ui_settings, usage as core_usage, watcher,
+    prices as core_prices, session_menu as core_session_menu, settings as core_ui_settings,
+    usage as core_usage, watcher,
 };
 use perch_core::{config, db, discovery, index, live, notify, pricing, query, settings, terminals};
 use std::collections::{HashMap, HashSet};
@@ -265,6 +266,94 @@ impl From<core_model::PopoverModel> for PopoverModel {
             show_recent,
             row_density: row_density.into(),
             menu_bar_icon: menu_bar_icon.into(),
+        }
+    }
+}
+
+/// Mirrors `perch_core::ui::session_menu::DetailRow`. Two finished strings.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DetailRow {
+    pub label: String,
+    pub value: String,
+}
+
+/// Mirrors `perch_core::ui::session_menu::MenuActionKind`. The variant is all
+/// that crosses: what the item *says* rides along on `MenuAction::title`, and
+/// only what it *does* is the shell's to know.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum MenuActionKind {
+    Resume,
+    Focus,
+    RevealFolder,
+    CopySessionId,
+}
+
+/// Mirrors `perch_core::ui::session_menu::MenuAction`.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MenuAction {
+    pub kind: MenuActionKind,
+    pub title: String,
+    pub enabled: bool,
+    pub disabled_reason: Option<String>,
+}
+
+/// Mirrors `perch_core::ui::session_menu::SessionMenu`.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SessionMenu {
+    pub detail: Vec<DetailRow>,
+    pub actions: Vec<MenuAction>,
+    pub folder_path: String,
+    pub session_id: String,
+}
+
+impl From<core_session_menu::DetailRow> for DetailRow {
+    fn from(d: core_session_menu::DetailRow) -> Self {
+        let core_session_menu::DetailRow { label, value } = d;
+        DetailRow { label, value }
+    }
+}
+
+impl From<core_session_menu::MenuActionKind> for MenuActionKind {
+    fn from(k: core_session_menu::MenuActionKind) -> Self {
+        match k {
+            core_session_menu::MenuActionKind::Resume => MenuActionKind::Resume,
+            core_session_menu::MenuActionKind::Focus => MenuActionKind::Focus,
+            core_session_menu::MenuActionKind::RevealFolder => MenuActionKind::RevealFolder,
+            core_session_menu::MenuActionKind::CopySessionId => MenuActionKind::CopySessionId,
+        }
+    }
+}
+
+impl From<core_session_menu::MenuAction> for MenuAction {
+    fn from(a: core_session_menu::MenuAction) -> Self {
+        let core_session_menu::MenuAction {
+            kind,
+            title,
+            enabled,
+            disabled_reason,
+        } = a;
+        MenuAction {
+            kind: kind.into(),
+            title,
+            enabled,
+            disabled_reason,
+        }
+    }
+}
+
+impl From<core_session_menu::SessionMenu> for SessionMenu {
+    fn from(m: core_session_menu::SessionMenu) -> Self {
+        let core_session_menu::SessionMenu {
+            detail,
+            actions,
+            folder_path,
+            session_id,
+        } = m;
+        SessionMenu {
+            detail: detail.into_iter().map(Into::into).collect(),
+            actions: actions.into_iter().map(Into::into).collect(),
+            folder_path,
+            session_id,
         }
     }
 }
@@ -2108,6 +2197,55 @@ impl Perch {
         self.detail(&database, project_id)
     }
 
+    /// One live session's own menu: its facts, and the four things a user can
+    /// do to it. `None` when that session is no longer live — a row can go
+    /// away between the popover drawing it and the pointer reaching it, and
+    /// an empty submenu is a better answer than a stale one.
+    ///
+    /// `owning_app` is the application the shell resolved `pid` to, or `None`
+    /// when it could resolve nothing: walking a process tree up to something
+    /// the window server calls an application is the one genuinely
+    /// platform-specific step in this menu, so the shell takes it and Rust
+    /// phrases the outcome (see `ui::session_menu::SessionContext`).
+    ///
+    /// Everything is re-read here rather than remembered from the last tick:
+    /// the point of hovering a row is to see what is true now, and the
+    /// session's folder may have been deleted since the popover opened.
+    pub fn session_menu(
+        &self,
+        session_id: String,
+        owning_app: Option<String>,
+    ) -> Option<SessionMenu> {
+        let sessions =
+            live::live_sessions(&config::sessions_dir(&self.config_dir()), &RealProcessProbe);
+        let session = sessions
+            .iter()
+            .find(|s| s.session_id == session_id)?
+            .clone();
+        // Through the very same builder the popover row came from, so the
+        // submenu's tokens, cost and status are the row's own strings and
+        // every display preference has already been applied to them exactly
+        // once. Re-deriving them here from `Settings` is precisely how the
+        // two surfaces would come to disagree.
+        let model = self.core_model_for(sessions);
+        let row = model.live.iter().find(|r| r.id == session_id)?;
+        // A branch is nice to know, never worth failing over: an index that
+        // will not open simply leaves the row an em dash.
+        let branch = db::open(&self.db_path)
+            .ok()
+            .and_then(|d| query::session_branch(&d, &session_id).ok())
+            .flatten();
+        Some(
+            core_session_menu::build_session_menu(&core_session_menu::SessionContext {
+                row,
+                cwd: &session.cwd,
+                branch: branch.as_deref(),
+                owning_app: owning_app.as_deref(),
+            })
+            .into(),
+        )
+    }
+
     /// `claude --resume <session_id>` in `cwd`, as a ready-to-run shell line.
     ///
     /// `resume_bypass_permissions` is read from the settings file here, at the
@@ -3125,6 +3263,69 @@ mod tests {
         assert_eq!(o.shell_line, "cd '/a/b' && claude");
     }
 
+    /// A session that is not live has no menu. A popover row can go away
+    /// between being drawn and the pointer reaching it, and an empty submenu
+    /// is a better answer than a menu of facts about a session that ended.
+    #[test]
+    fn a_session_that_is_not_live_has_no_submenu() {
+        let (p, _guard, _data, _claude) = perch_in_temp();
+        assert!(p.session_menu("never-existed".into(), None).is_none());
+        assert!(
+            p.session_menu("never-existed".into(), Some("Terminal".into()))
+                .is_none(),
+            "a resolvable application does not conjure a session"
+        );
+    }
+
+    /// Resume from the submenu is the same launch path every other Resume
+    /// takes: the shell hands `SessionMenu`'s `session_id` and `folder_path`
+    /// straight to `resume_command`, which re-reads
+    /// `resume_bypass_permissions` from disk at that moment. So turning the
+    /// setting on changes the very next Resume from a submenu too, and
+    /// nothing about the menu is cached in between.
+    #[test]
+    fn the_submenu_resume_honours_resume_bypass_permissions() {
+        let (p, _guard, _data, _claude) = perch_in_temp();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_string_lossy().into_owned();
+
+        // The action is available for a folder that is really there.
+        let menu = perch_core::ui::session_menu::build_session_menu(
+            &perch_core::ui::session_menu::SessionContext {
+                row: &sample_row(&cwd),
+                cwd: &cwd,
+                branch: None,
+                owning_app: None,
+            },
+        );
+        let resume = menu
+            .actions
+            .iter()
+            .find(|a| a.kind == perch_core::ui::session_menu::MenuActionKind::Resume)
+            .expect("a Resume action");
+        assert!(resume.enabled, "{resume:?}");
+
+        assert!(
+            !p.resume_command(menu.session_id.clone(), menu.folder_path.clone())
+                .shell_line
+                .contains("skip-permissions"),
+            "off by default"
+        );
+
+        p.set_setting(
+            SettingKey::ResumeBypassPermissions,
+            SettingValue::Bool { value: true },
+        )
+        .expect("a toggle takes a bool");
+
+        assert!(
+            p.resume_command(menu.session_id, menu.folder_path)
+                .shell_line
+                .ends_with("--dangerously-skip-permissions"),
+            "the submenu's Resume reaches the same setting every other Resume does"
+        );
+    }
+
     /// The launch path, not the preview: `resume_command` re-reads
     /// `resume_bypass_permissions` from disk, so turning it on changes the
     /// very next Resume without the shell being rebuilt.
@@ -3681,6 +3882,34 @@ mod tests {
         let claude = tempfile::tempdir().unwrap();
         let perch = Perch::new(Some(claude.path().to_string_lossy().into_owned())).unwrap();
         (perch, guard, data, claude)
+    }
+
+    /// One popover row, built the way the popover builds it, for the submenu
+    /// tests below. `build_model` (not a hand-written literal) because the
+    /// point of the submenu taking a finished row is that the row's display
+    /// preferences have already been applied to it exactly once.
+    fn sample_row(cwd: &str) -> core_model::SessionRow {
+        let session = live::LiveSession {
+            pid: 4242,
+            session_id: "s-live".into(),
+            cwd: cwd.into(),
+            name: "perch-s-liv".into(),
+            kind: "interactive".into(),
+            status: live::SessionStatus::Working,
+            started_at: 1_000,
+            status_updated_at: 5_000,
+            cc_version: Some("2.1.251".into()),
+            socket_path: None,
+        };
+        core_model::build_model(
+            None,
+            &[session],
+            65_000,
+            None,
+            &settings::Settings::default(),
+        )
+        .live
+        .remove(0)
     }
 
     /// A `Perch` whose `config.toml` path is occupied by a *directory*, so
