@@ -13,6 +13,17 @@ enum Arg {
     Value(String),
 }
 
+/// The flag that turns Claude Code's permission prompts off for a session.
+/// Public because the settings schema previews the composed command and must
+/// name the same literal this module emits rather than a second spelling of
+/// it.
+pub const SKIP_PERMISSIONS_FLAG: &str = "--dangerously-skip-permissions";
+
+/// Every literal Perch itself puts on the command line. Membership here is
+/// what makes an argument a [`Arg::Flag`]; nothing else in this module gets
+/// to decide that a string "looks like" a flag.
+const KNOWN_FLAGS: [&str; 2] = ["--resume", SKIP_PERMISSIONS_FLAG];
+
 /// A command to hand to the user's terminal: `cd <cwd> && <program> <args...>`.
 /// perch-core only composes this string; Task 9's Swift layer writes it into
 /// a one-shot script and the user's terminal runs it.
@@ -34,10 +45,20 @@ fn sq(s: &str) -> String {
 
 impl TerminalCommand {
     /// `claude --resume <session_id>` in `cwd`.
-    pub fn resume(session_id: &str, cwd: &str) -> Self {
+    ///
+    /// With `bypass_permissions`, [`SKIP_PERMISSIONS_FLAG`] is appended, so
+    /// the resumed session never stops to ask before running a command or
+    /// editing a file. That is the `resume_bypass_permissions` setting, read
+    /// at the moment of launch rather than baked in here — this function only
+    /// composes what it is told.
+    pub fn resume(session_id: &str, cwd: &str, bypass_permissions: bool) -> Self {
+        let mut args = vec!["--resume".to_string(), session_id.to_string()];
+        if bypass_permissions {
+            args.push(SKIP_PERMISSIONS_FLAG.to_string());
+        }
         TerminalCommand {
             program: "claude".into(),
-            args: vec!["--resume".into(), session_id.into()],
+            args,
             cwd: cwd.into(),
         }
     }
@@ -51,36 +72,37 @@ impl TerminalCommand {
         }
     }
 
-    /// The typed view of `args`, distinguishing the literal `--resume` flag
-    /// from the value that follows it. Kept as a derivation over the plain
-    /// `Vec<String>` (rather than a stored field) so the public shape stays
-    /// exactly what the brief and Task 6's UniFFI mirror expect.
+    /// The typed view of `args`, distinguishing the literals Perch put there
+    /// from the values that travel beside them. Kept as a derivation over the
+    /// plain `Vec<String>` (rather than a stored field) so the public shape
+    /// stays exactly what the brief and Task 6's UniFFI mirror expect.
     ///
-    /// Matching by exact string equality (rather than a `--` prefix guess)
-    /// means a value that merely *looks* like a flag still gets quoted. The
-    /// one case this can't distinguish is a session id that is *exactly*
-    /// `--resume`, which then renders unquoted like the real flag — but that
-    /// collision is safe specifically because the literal `--resume` holds no
-    /// shell-meaningful characters (no quote, no `$`, no backtick, no `;`),
-    /// so whether it is emitted quoted or bare, the shell parses it to the
-    /// same argv. See `a_session_id_that_collides_with_the_flag_literal_...`
-    /// below for the regression this relies on.
+    /// Matching by exact string equality against [`KNOWN_FLAGS`] (rather than
+    /// a `--` prefix guess) means a value that merely *looks* like a flag
+    /// still gets quoted. The one case this can't distinguish is a session id
+    /// that is *exactly* one of those literals, which then renders unquoted
+    /// like the real flag — but that collision is safe specifically because
+    /// every literal in `KNOWN_FLAGS` holds no shell-meaningful characters
+    /// (no quote, no `$`, no backtick, no `;`), so whether it is emitted
+    /// quoted or bare, the shell parses it to the same argv. See
+    /// `a_session_id_that_collides_with_the_flag_literal_...` below for the
+    /// regression this relies on.
     fn typed_args(&self) -> Vec<Arg> {
         self.args
             .iter()
-            .map(|a| {
-                if a == "--resume" {
-                    Arg::Flag("--resume")
-                } else {
-                    Arg::Value(a.clone())
-                }
-            })
+            .map(
+                |a| match KNOWN_FLAGS.into_iter().find(|f| *f == a.as_str()) {
+                    Some(flag) => Arg::Flag(flag),
+                    None => Arg::Value(a.clone()),
+                },
+            )
             .collect()
     }
 
     /// A single shell line the caller can hand to a terminal. Every value
     /// (the cwd, the session id, anything that isn't a known literal flag) is
-    /// POSIX single-quoted; only the `--resume` flag itself is emitted bare.
+    /// POSIX single-quoted; only the [`KNOWN_FLAGS`] themselves are emitted
+    /// bare.
     pub fn shell_line(&self) -> String {
         let mut line = format!("cd {} && {}", sq(&self.cwd), self.program);
         for a in self.typed_args() {
@@ -100,13 +122,50 @@ mod tests {
 
     #[test]
     fn resume_builds_the_documented_command() {
-        let c = TerminalCommand::resume("abc-123", "/Users/a/proj");
+        let c = TerminalCommand::resume("abc-123", "/Users/a/proj", false);
         assert_eq!(c.program, "claude");
         assert_eq!(c.args, vec!["--resume", "abc-123"]);
         assert_eq!(c.cwd, "/Users/a/proj");
         assert_eq!(
             c.shell_line(),
             "cd '/Users/a/proj' && claude --resume 'abc-123'"
+        );
+    }
+
+    #[test]
+    fn resume_appends_the_skip_permissions_flag_when_the_setting_is_on() {
+        let c = TerminalCommand::resume("abc-123", "/Users/a/proj", true);
+        assert_eq!(
+            c.args,
+            vec!["--resume", "abc-123", "--dangerously-skip-permissions"],
+            "the flag is appended after the session id, not spliced before it"
+        );
+        assert_eq!(
+            c.shell_line(),
+            "cd '/Users/a/proj' && claude --resume 'abc-123' --dangerously-skip-permissions",
+            "the flag is a literal, so it renders bare while the session id stays quoted"
+        );
+    }
+
+    #[test]
+    fn resume_omits_the_skip_permissions_flag_when_the_setting_is_off() {
+        let c = TerminalCommand::resume("abc-123", "/Users/a/proj", false);
+        assert_eq!(c.args, vec!["--resume", "abc-123"]);
+        assert!(
+            !c.shell_line().contains("skip-permissions"),
+            "off must mean the flag is absent, not merely inert: {}",
+            c.shell_line()
+        );
+    }
+
+    #[test]
+    fn a_session_id_is_still_quoted_with_the_flag_on() {
+        // The flag changes what `claude` is allowed to do; it must not change
+        // what the shell is allowed to parse out of a session id.
+        let c = TerminalCommand::resume("a'; rm -rf /", "/tmp", true);
+        assert_eq!(
+            c.shell_line(),
+            r#"cd '/tmp' && claude --resume 'a'\''; rm -rf /' --dangerously-skip-permissions"#
         );
     }
 
@@ -136,7 +195,7 @@ mod tests {
 
     #[test]
     fn a_session_id_is_quoted_too() {
-        let c = TerminalCommand::resume("a'; rm -rf /", "/tmp");
+        let c = TerminalCommand::resume("a'; rm -rf /", "/tmp", false);
         assert_eq!(
             c.shell_line(),
             r#"cd '/tmp' && claude --resume 'a'\''; rm -rf /'"#
@@ -151,7 +210,7 @@ mod tests {
     // argv, `["--resume", "--resume"]`.
     #[test]
     fn a_session_id_that_collides_with_the_flag_literal_still_renders_safely() {
-        let c = TerminalCommand::resume("--resume", "/tmp");
+        let c = TerminalCommand::resume("--resume", "/tmp", false);
         assert_eq!(c.shell_line(), "cd '/tmp' && claude --resume --resume");
     }
 

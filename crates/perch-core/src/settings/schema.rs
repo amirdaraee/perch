@@ -301,7 +301,7 @@ pub fn build_schema(s: &Settings, cx: &SchemaContext) -> Vec<SettingsPane> {
 /// The keys come from the schema rather than from a list written beside it,
 /// and each one is restored by reading [`Settings::default`] through
 /// [`Settings::get`] and writing it back through [`Settings::set`] — never by
-/// assigning a field. That is what keeps this correct when a twenty-seventh
+/// assigning a field. That is what keeps this correct when a twenty-eighth
 /// setting is added: `set` is exhaustive over [`SettingKey`], and
 /// `every_setting_key_appears_in_exactly_one_pane` guarantees the new key is
 /// in some pane, so the new setting resets with its pane without anyone
@@ -395,6 +395,24 @@ fn general_pane(s: &Settings, cx: &SchemaContext) -> SettingsPane {
                     },
                 )
                 .searchable(&["iTerm", "Ghostty", "Warp", "shell", "resume", "open"]),
+                row(
+                    s,
+                    SettingKey::ResumeBypassPermissions,
+                    "Resume without permission prompts",
+                    "Adds --dangerously-skip-permissions when Resume launches a session, so \
+                     Claude Code never stops to ask before running a command or editing a \
+                     file. Only turn this on for projects you would let run unattended.",
+                    Control::Toggle {
+                        on: s.resume_bypass_permissions,
+                    },
+                )
+                .searchable(&[
+                    "dangerously-skip-permissions",
+                    "permissions",
+                    "prompts",
+                    "yolo",
+                    "unattended",
+                ]),
                 info_row("Resume runs", resume_label(cx)),
             ],
         ),
