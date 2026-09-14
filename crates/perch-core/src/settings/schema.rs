@@ -1398,9 +1398,18 @@ mod tests {
                     "{:?} left its caption to the shell",
                     row.key
                 );
+                // Not "does not end in ` 1 minutes`" — `plural` cannot
+                // produce that, so the check could never fail. What can go
+                // wrong is a caption that ignores the value it is captioning,
+                // which is how a stepper comes to read the same at every
+                // setting.
+                let Control::Stepper { value, .. } = &row.control else {
+                    unreachable!("just matched a stepper")
+                };
                 assert!(
-                    !value_label.ends_with(" 1 minutes"),
-                    "caption is not pluralized"
+                    value_label.contains(&value.to_string()),
+                    "{:?} captions {value} as {value_label:?}, which does not name it",
+                    row.key
                 );
             }
         }
