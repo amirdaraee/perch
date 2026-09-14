@@ -28,7 +28,7 @@ struct StatsCard: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .perchCard(verticalPadding: 10)
+        .perchCard(.stats)
     }
 
     private func stat(_ label: String, _ value: String) -> some View {
