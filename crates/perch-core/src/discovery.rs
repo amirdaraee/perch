@@ -63,6 +63,77 @@ fn session_files_in(project_dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Why one attempt to reach the user's Claude Code session data failed.
+///
+/// Carries its own finished sentence rather than an `io::Error` for a shell
+/// to phrase: this is a user-facing reason, and the rule everywhere else here
+/// is that Rust owns the words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnreadableSessions {
+    /// The Claude Code directory itself is not there. Perch is read-only with
+    /// respect to it, so there is nothing to create and nothing to retry: the
+    /// user moved, renamed or deleted it, or `claude_config_dir` points
+    /// somewhere that no longer exists.
+    ConfigDirMissing { path: PathBuf },
+    /// The directory is there but `projects/` could not be listed — a
+    /// permission change, a broken mount, a file sitting where the directory
+    /// should be.
+    ProjectsUnreadable { path: PathBuf, reason: String },
+}
+
+impl std::fmt::Display for UnreadableSessions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UnreadableSessions::ConfigDirMissing { path } => {
+                write!(f, "Claude Code directory not found: {}", path.display())
+            }
+            UnreadableSessions::ProjectsUnreadable { path, reason } => {
+                write!(f, "could not read {}: {reason}", path.display())
+            }
+        }
+    }
+}
+
+/// Can Perch reach the user's session data *right now*?
+///
+/// This is the staleness signal, and it is deliberately not "did our own
+/// SQLite file open" — that file is ours, `db::open` creates it, and it
+/// therefore opens successfully whether or not Claude Code's directory is
+/// still there. It is also deliberately not "did the last pass yield any
+/// records": a healthy install that has simply never run a session has no
+/// records, and dimming it forever would be a false alarm worse than the one
+/// this replaces.
+///
+/// So: a listable `projects/` is a successful read, empty or not. A
+/// `projects/` that is merely absent under a Claude Code directory that *is*
+/// there is a fresh install, which is also fine — Perch never creates it.
+/// Only a Claude Code directory that has gone away, or a `projects/` that
+/// exists and cannot be listed, counts as a failed read.
+///
+/// One `read_dir` on a directory Perch is about to walk anyway, cheap enough
+/// to run on every tick.
+pub fn check_readable(config_dir: &Path) -> Result<(), UnreadableSessions> {
+    let projects_root = crate::config::projects_dir(config_dir);
+    match fs::read_dir(&projects_root) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if config_dir.is_dir() {
+                // Fresh install: Claude Code is there, it has just never
+                // written a project. Nothing is stale about that.
+                Ok(())
+            } else {
+                Err(UnreadableSessions::ConfigDirMissing {
+                    path: config_dir.to_path_buf(),
+                })
+            }
+        }
+        Err(e) => Err(UnreadableSessions::ProjectsUnreadable {
+            path: projects_root,
+            reason: e.to_string(),
+        }),
+    }
+}
+
 pub fn discover(projects_root: &Path) -> std::io::Result<Vec<DiscoveredProject>> {
     let entries = match fs::read_dir(projects_root) {
         Ok(e) => e,
