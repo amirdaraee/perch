@@ -42,10 +42,9 @@ struct MainWindowRoot: View {
             List(selection: $selection) {
                 Label("Now", systemImage: "dot.radiowaves.left.and.right").tag(Selection.now)
                 if let model {
-                    section("Pinned", .pinned, model)
-                    section("Active", .active, model)
-                    section("Recent", .recent, model)
-                    section("Archived", .archived, model)
+                    ForEach(ProjectGroups.ordered, id: \.title) { entry in
+                        section(entry.title, entry.group, model)
+                    }
                 } else if !hasLoaded {
                     ProgressView().frame(maxWidth: .infinity, alignment: .center)
                 } else if let reason = engine.startupError {
@@ -102,7 +101,9 @@ struct MainWindowRoot: View {
     private var overviewPane: some View {
         switch selection {
         case .now, .none:
-            NowPane(engine: engine)
+            NowPane(engine: engine, projects: model?.projects ?? []) { id in
+                selection = .project(id)
+            }
         case .project(let id):
             ProjectDetailPane(engine: engine, projectId: id, onChanged: { await reload() })
                 .id(id)
@@ -154,6 +155,11 @@ struct ProjectRowView: View {
 /// showing a session start, finish, or block while the window stays open.
 struct NowPane: View {
     @ObservedObject var engine: PerchEngine
+    /// The pull-loaded project list from `MainWindowRoot.reload()`, drawn as
+    /// cards under whatever is running right now.
+    let projects: [ProjectRow]
+    let onOpenProject: (Int64) -> Void
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
@@ -172,11 +178,23 @@ struct NowPane: View {
                     if let banner = model.waitingBanner {
                         Text(banner).font(.headline).foregroundStyle(Color.perchWaiting)
                     }
+                    // Running sessions sit above the cards only while there
+                    // are some: the cards already say, per project, that
+                    // nothing runs, so an empty-state sentence would repeat it.
                     if !model.live.isEmpty {
-                        ForEach(model.live, id: \.id) { SessionRowView(row: $0) }
-                    } else {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Running now")
+                                .font(.caption)
+                                .fontWeight(.semibold)
+                                .foregroundStyle(.secondary)
+                                .textCase(.uppercase)
+                            ForEach(model.live, id: \.id) { SessionRowView(row: $0) }
+                        }
+                        .padding(.bottom, 8)
+                    } else if projects.isEmpty {
                         Text("No sessions running").foregroundStyle(.secondary)
                     }
+                    ProjectCardGrid(projects: projects, onOpen: onOpenProject)
                 } else {
                     // Before the engine's first emit lands — distinct from a
                     // genuinely empty "no sessions running".
