@@ -178,20 +178,9 @@ struct NowPane: View {
                     if let banner = model.waitingBanner {
                         Text(banner).font(.headline).foregroundStyle(Color.perchWaiting)
                     }
-                    // Running sessions sit above the cards only while there
-                    // are some: the cards already say, per project, that
-                    // nothing runs, so an empty-state sentence would repeat it.
-                    if !model.live.isEmpty {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Running now")
-                                .font(.caption)
-                                .fontWeight(.semibold)
-                                .foregroundStyle(.secondary)
-                                .textCase(.uppercase)
-                            ForEach(model.live, id: \.id) { SessionRowView(row: $0) }
-                        }
-                        .padding(.bottom, 8)
-                    } else if projects.isEmpty {
+                    // Each card already says what runs in its project, so the
+                    // live sessions are not listed a second time above them.
+                    if projects.isEmpty {
                         Text("No sessions running").foregroundStyle(.secondary)
                     }
                     ProjectCardGrid(projects: projects, onOpen: onOpenProject)
