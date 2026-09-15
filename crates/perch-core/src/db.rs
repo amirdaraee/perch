@@ -157,6 +157,33 @@ pub fn open(path: &Path) -> Result<Db> {
     init(conn)
 }
 
+/// Open an existing index without the ability to change it — no schema
+/// creation, no migration, and SQLite itself refuses every write. For readers
+/// outside the app (`perch-mcp`) that must never race or alter the index the
+/// app maintains.
+///
+/// A missing file is an error, not an empty database: creating one would be a
+/// write, and an empty index would read as "no projects" rather than "Perch
+/// has not run yet".
+pub fn open_read_only(path: &Path) -> Result<Db> {
+    if !path.is_file() {
+        anyhow::bail!("no index at {}", path.display());
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.execute_batch("PRAGMA query_only = ON;")?;
+    let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version != SCHEMA_VERSION {
+        anyhow::bail!(
+            "the index is schema version {version}, this build reads {SCHEMA_VERSION}; open Perch once to update it"
+        );
+    }
+    Ok(Db { conn })
+}
+
 pub fn open_in_memory() -> Result<Db> {
     init(Connection::open_in_memory()?)
 }
@@ -568,6 +595,37 @@ fn delete_turns_on(conn: &Connection, session_id: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::model::TurnUsage;
+
+    #[test]
+    fn a_read_only_index_reads_but_refuses_every_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let db = open(&path).unwrap();
+            db.upsert_project("-a", "/a", false).unwrap();
+        }
+        let ro = open_read_only(&path).unwrap();
+        let n: i64 = ro
+            .conn()
+            .query_row("SELECT COUNT(*) FROM projects", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        assert!(
+            ro.upsert_project("-b", "/b", false).is_err(),
+            "a write through a read-only index must fail"
+        );
+    }
+
+    #[test]
+    fn a_missing_index_is_an_error_and_is_not_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        assert!(open_read_only(&path).is_err());
+        assert!(
+            !path.exists(),
+            "opening read-only must never create the file"
+        );
+    }
 
     fn session(id: &str, project_id: i64, offset: u64) -> SessionRecord {
         SessionRecord {
