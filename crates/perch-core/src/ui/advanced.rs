@@ -25,6 +25,10 @@ pub struct FactRow {
     pub label: String,
     pub value: String,
     pub reveal_path: Option<String>,
+    /// Set where the value is something to paste elsewhere — a command — so a
+    /// shell offers Copy exactly there, and copies this rather than whatever
+    /// truncated form it drew.
+    pub copy_value: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -60,6 +64,7 @@ pub fn build_advanced(
     config_path: &Path,
     db_path: &Path,
     claude_dir: &Path,
+    mcp_binary: Option<&Path>,
     now_ms: i64,
 ) -> AdvancedModel {
     let files = FactGroup {
@@ -78,21 +83,25 @@ pub fn build_advanced(
                 label: "Index size".to_string(),
                 value: file_size(db_path),
                 reveal_path: None,
+                copy_value: None,
             },
             FactRow {
                 label: "Sessions indexed".to_string(),
                 value: count_or_dash(db.map(|d| d.session_count())),
                 reveal_path: None,
+                copy_value: None,
             },
             FactRow {
                 label: "Turns indexed".to_string(),
                 value: count_or_dash(db.map(|d| d.turn_count())),
                 reveal_path: None,
+                copy_value: None,
             },
             FactRow {
                 label: "Index last written".to_string(),
                 value: modified_ago(db_path, now_ms),
                 reveal_path: None,
+                copy_value: None,
             },
             FactRow {
                 label: "Newest session activity".to_string(),
@@ -101,6 +110,7 @@ pub fn build_advanced(
                     .flatten()
                     .map_or_else(|| DASH.to_string(), |ts| ago(now_ms, ts)),
                 reveal_path: None,
+                copy_value: None,
             },
         ],
     };
@@ -112,22 +122,25 @@ pub fn build_advanced(
                 label: "Version".to_string(),
                 value: env!("CARGO_PKG_VERSION").to_string(),
                 reveal_path: None,
+                copy_value: None,
             },
             FactRow {
                 label: "Build".to_string(),
                 value: build_label(),
                 reveal_path: None,
+                copy_value: None,
             },
             FactRow {
                 label: "Licence".to_string(),
                 value: env!("CARGO_PKG_LICENSE").to_string(),
                 reveal_path: None,
+                copy_value: None,
             },
         ],
     };
 
     AdvancedModel {
-        groups: vec![files, index, about],
+        groups: vec![files, index, mcp_group(mcp_binary), about],
         links: links(),
         reindex_help: "Re-reads every session file Claude Code has written and rebuilds the \
                        index from scratch. Perch only ever reads your Claude Code folder; \
@@ -139,6 +152,47 @@ pub fn build_advanced(
              your model prices are left alone.",
             config_path.display()
         ),
+    }
+}
+
+/// The MCP server that ships beside the app, and the one command that registers
+/// it with Claude Code for every project. `None` (a build run outside the app
+/// bundle) is a dash with nothing to copy, not a command pointing nowhere.
+fn mcp_group(binary: Option<&Path>) -> FactGroup {
+    let binary = binary.filter(|b| b.is_file());
+    let command = binary.map(|b| {
+        format!(
+            "claude mcp add --scope user perch -- {}",
+            shell_quote(&b.display().to_string())
+        )
+    });
+    FactGroup {
+        heading: "MCP server".to_string(),
+        rows: vec![
+            FactRow {
+                label: "Server".to_string(),
+                value: binary.map_or_else(|| DASH.to_string(), |b| b.display().to_string()),
+                reveal_path: binary.map(|b| b.display().to_string()),
+                copy_value: None,
+            },
+            FactRow {
+                label: "Add to Claude Code".to_string(),
+                value: command.clone().unwrap_or_else(|| DASH.to_string()),
+                reveal_path: None,
+                copy_value: command,
+            },
+        ],
+    }
+}
+
+/// A path as one shell word: bare when it is only safe characters, otherwise
+/// single-quoted with any single quote spelled `'\''`.
+fn shell_quote(s: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "/._-+:@%".contains(c);
+    if !s.is_empty() && s.chars().all(safe) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
     }
 }
 
@@ -181,6 +235,7 @@ fn path_row(label: &str, path: &Path) -> FactRow {
         label: label.to_string(),
         value: path.display().to_string(),
         reveal_path: path.exists().then(|| path.display().to_string()),
+        copy_value: None,
     }
 }
 
@@ -243,6 +298,49 @@ mod tests {
     }
 
     #[test]
+    fn the_mcp_command_is_offered_to_copy_only_when_the_server_is_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let db_path = dir.path().join("x.db");
+        let bin = dir.path().join("perch-mcp");
+
+        let missing = build_advanced(None, &config, &db_path, dir.path(), Some(&bin), 0);
+        let rows_missing = rows(&missing, "MCP server");
+        assert!(rows_missing
+            .iter()
+            .all(|r| r.value == DASH && r.copy_value.is_none()));
+
+        std::fs::write(&bin, "").unwrap();
+        let present = build_advanced(None, &config, &db_path, dir.path(), Some(&bin), 0);
+        let command = rows(&present, "MCP server")
+            .iter()
+            .find(|r| r.label == "Add to Claude Code")
+            .unwrap()
+            .clone();
+        assert!(command
+            .value
+            .starts_with("claude mcp add --scope user perch -- "));
+        assert_eq!(command.copy_value.as_deref(), Some(command.value.as_str()));
+        assert_eq!(
+            value(&present, "MCP server", "Server"),
+            bin.display().to_string()
+        );
+    }
+
+    #[test]
+    fn paths_are_quoted_only_when_the_shell_needs_it() {
+        assert_eq!(
+            shell_quote("/Applications/Perch.app/Contents/MacOS/perch-mcp"),
+            "/Applications/Perch.app/Contents/MacOS/perch-mcp"
+        );
+        assert_eq!(
+            shell_quote("/Users/a b/perch-mcp"),
+            "'/Users/a b/perch-mcp'"
+        );
+        assert_eq!(shell_quote("/it's/x"), "'/it'\\''s/x'");
+    }
+
+    #[test]
     fn a_real_index_reports_its_own_counts_and_size() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("perch-index.db");
@@ -259,7 +357,7 @@ mod tests {
 
         let config = dir.path().join("config.toml");
         std::fs::write(&config, "").unwrap();
-        let m = build_advanced(Some(&database), &config, &db_path, dir.path(), 2_000);
+        let m = build_advanced(Some(&database), &config, &db_path, dir.path(), None, 2_000);
 
         assert_eq!(value(&m, "Index", "Sessions indexed"), "1");
         assert_eq!(value(&m, "Index", "Turns indexed"), "1");
@@ -277,7 +375,7 @@ mod tests {
         let config = dir.path().join("config.toml");
         let db_path = dir.path().join("missing.db");
 
-        let m = build_advanced(None, &config, &db_path, dir.path(), 2_000);
+        let m = build_advanced(None, &config, &db_path, dir.path(), None, 2_000);
 
         assert_eq!(value(&m, "Index", "Sessions indexed"), DASH);
         assert_eq!(value(&m, "Index", "Turns indexed"), DASH);
@@ -294,7 +392,7 @@ mod tests {
     fn reveal_is_offered_only_where_something_is_there_to_reveal() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
-        let m = build_advanced(None, &config, &dir.path().join("x.db"), dir.path(), 0);
+        let m = build_advanced(None, &config, &dir.path().join("x.db"), dir.path(), None, 0);
 
         let settings_row = rows(&m, "Files")
             .iter()
@@ -306,7 +404,7 @@ mod tests {
         );
 
         std::fs::write(&config, "").unwrap();
-        let m = build_advanced(None, &config, &dir.path().join("x.db"), dir.path(), 0);
+        let m = build_advanced(None, &config, &dir.path().join("x.db"), dir.path(), None, 0);
         let settings_row = rows(&m, "Files")
             .iter()
             .find(|r| r.label == "Settings file")
@@ -322,6 +420,7 @@ mod tests {
             &dir.path().join("c.toml"),
             &dir.path().join("x.db"),
             dir.path(),
+            None,
             0,
         );
         assert_eq!(value(&m, "About", "Version"), env!("CARGO_PKG_VERSION"));
@@ -333,7 +432,7 @@ mod tests {
     fn the_reset_warning_names_the_file_it_will_rewrite() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("config.toml");
-        let m = build_advanced(None, &config, &dir.path().join("x.db"), dir.path(), 0);
+        let m = build_advanced(None, &config, &dir.path().join("x.db"), dir.path(), None, 0);
         assert!(m.reset_warning.contains(&config.display().to_string()));
     }
 }

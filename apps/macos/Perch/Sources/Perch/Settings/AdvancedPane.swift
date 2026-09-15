@@ -137,6 +137,13 @@ struct AdvancedPane: View {
                     .buttonStyle(.link)
                     .accessibilityLabel("Reveal \(row.label) in Finder")
             }
+            // Copies Rust's own `copyValue`, never the drawn text, which the
+            // row may have truncated in the middle.
+            if let text = row.copyValue {
+                Button("Copy") { copy(text) }
+                    .buttonStyle(.link)
+                    .accessibilityLabel("Copy \(row.label)")
+            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
@@ -145,6 +152,11 @@ struct AdvancedPane: View {
     /// The URLs are Rust's: the app's own Swift may not contain an absolute
     /// URL at all, which is the rule that keeps it unable to reach anything
     /// but this library.
+    private func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
     private func linkRow(_ links: [LinkRow]) -> some View {
         HStack(spacing: 14) {
             Text("Links")

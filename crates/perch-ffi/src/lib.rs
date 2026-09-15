@@ -1621,6 +1621,7 @@ pub struct FactRow {
     pub label: String,
     pub value: String,
     pub reveal_path: Option<String>,
+    pub copy_value: Option<String>,
 }
 
 impl From<core_advanced::FactRow> for FactRow {
@@ -1629,11 +1630,13 @@ impl From<core_advanced::FactRow> for FactRow {
             label,
             value,
             reveal_path,
+            copy_value,
         } = r;
         FactRow {
             label,
             value,
             reveal_path,
+            copy_value,
         }
     }
 }
@@ -1803,6 +1806,14 @@ fn setting_err(message: String) -> PerchError {
 /// `perch_core::settings::store::app_data_dir` (moved there in the settings
 /// task, which needed the identical directory for `config.toml`) — this
 /// just appends this file's own name to it.
+/// `perch-mcp`, which the bundle carries beside the app's own executable. This
+/// library is linked into that executable, so its own path is the anchor.
+fn mcp_binary() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("perch-mcp")))
+}
+
 fn app_data_db() -> Result<PathBuf, PerchError> {
     let dir = settings::store::app_data_dir().map_err(|e| PerchError::Io {
         message: e.to_string(),
@@ -2538,6 +2549,7 @@ impl Perch {
             &self.config_path,
             &self.db_path,
             &self.config_dir(),
+            mcp_binary().as_deref(),
             now_ms(),
         )
         .into()
