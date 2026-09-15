@@ -2627,6 +2627,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "perch-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "perch-core",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "phf"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
