@@ -1,4 +1,4 @@
-.PHONY: framework build run bundle clean
+.PHONY: framework build mcp run bundle clean
 
 framework:
 	../../../scripts/build-xcframework.sh
@@ -6,14 +6,20 @@ framework:
 build:
 	swift build -c release
 
+# The MCP server ships inside the bundle, beside the app, so Settings can
+# point Claude Code at it.
+mcp:
+	cargo build --release -p perch-mcp --manifest-path ../../../Cargo.toml
+
 run: build
 	./.build/release/Perch
 
 # A minimal .app so LSUIElement and the bundle id apply.
-bundle: build
+bundle: build mcp
 	rm -rf build/Perch.app
 	mkdir -p build/Perch.app/Contents/MacOS build/Perch.app/Contents/Resources
 	cp .build/release/Perch build/Perch.app/Contents/MacOS/Perch
+	cp ../../../target/release/perch-mcp build/Perch.app/Contents/MacOS/perch-mcp
 	cp Resources/Info.plist build/Perch.app/Contents/Info.plist
 	cp Resources/Perch.icns build/Perch.app/Contents/Resources/Perch.icns
 	# Ad-hoc sign *after* the Info.plist is in place, so the signature is
