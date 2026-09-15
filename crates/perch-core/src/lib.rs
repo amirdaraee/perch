@@ -11,6 +11,7 @@ pub mod notify;
 pub mod platform;
 pub mod pricing;
 pub mod query;
+pub mod readme;
 pub mod scan;
 pub mod settings;
 pub mod terminals;

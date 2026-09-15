@@ -442,6 +442,12 @@ pub struct ProjectRow {
     pub last_active: String,
     pub live_session_count: u32,
     pub subtitle: String,
+    pub description: Option<String>,
+    pub sparkline: Vec<SparkPoint>,
+    pub live_label: Option<String>,
+    pub waiting_label: Option<String>,
+    pub stats_line: String,
+    pub activity_line: String,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -575,6 +581,12 @@ impl From<main_window::ProjectRow> for ProjectRow {
             last_active,
             live_session_count,
             subtitle,
+            description,
+            sparkline,
+            live_label,
+            waiting_label,
+            stats_line,
+            activity_line,
         } = r;
         ProjectRow {
             id,
@@ -587,6 +599,12 @@ impl From<main_window::ProjectRow> for ProjectRow {
             last_active,
             live_session_count,
             subtitle,
+            description,
+            sparkline: sparkline.into_iter().map(Into::into).collect(),
+            live_label,
+            waiting_label,
+            stats_line,
+            activity_line,
         }
     }
 }
