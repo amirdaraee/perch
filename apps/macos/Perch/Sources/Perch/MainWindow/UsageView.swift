@@ -37,10 +37,10 @@ struct UsageView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         // Plain `.task {}`, not `.task(id:)`: this view is torn down and
-        // rebuilt whenever the Overview/Usage control switches away and
+        // rebuilt whenever the sidebar selection moves away from Usage and
         // back (Sidebar.swift's detail pane renders a different view type
-        // per tab), so a fresh instance — and a fresh load — is exactly
-        // what re-selecting the tab should do.
+        // per selection), so a fresh instance — and a fresh load — is exactly
+        // what re-selecting Usage should do.
         .task { await load() }
     }
 

@@ -1,7 +1,7 @@
 import SwiftUI
 import PerchFFI
 
-/// The main window's content: a `Now` pane plus every project, grouped.
+/// The main window's content: Overview and Usage, then every project, grouped.
 ///
 /// `refreshToken` is bumped by `MainWindowController.show()` each time the
 /// window is (re)shown, so `.task(id:)` re-runs even though the hosting view
@@ -26,21 +26,20 @@ struct MainWindowRoot: View {
     /// Distinguishes "still loading" from "loaded and empty" — both render
     /// `model == nil` otherwise, and would be indistinguishable in the list.
     @State private var hasLoaded = false
-    @State private var selection: Selection? = .now
-    @State private var tab: DetailTab = .overview
+    @State private var selection: Selection? = .overview
+    /// Every place the user has been, in order, and where in that list the
+    /// window is now — a browser's history, so Back and Forward retrace
+    /// whatever mix of sidebar clicks and card clicks got here.
+    @State private var history: [Selection] = [.overview]
+    @State private var cursor = 0
 
-    enum Selection: Hashable { case now, project(Int64) }
-
-    /// The detail pane's top-level control (spec §9.2). Independent of
-    /// `selection`: switching to Usage and back to Overview keeps whichever
-    /// sidebar row was selected, since Usage shows account-wide totals
-    /// rather than anything scoped to one project.
-    enum DetailTab: Hashable { case overview, usage }
+    enum Selection: Hashable { case overview, usage, project(Int64) }
 
     var body: some View {
         NavigationSplitView {
             List(selection: $selection) {
-                Label("Now", systemImage: "dot.radiowaves.left.and.right").tag(Selection.now)
+                Label("Overview", systemImage: "square.grid.2x2").tag(Selection.overview)
+                Label("Usage", systemImage: "chart.bar").tag(Selection.usage)
                 if let model {
                     ForEach(ProjectGroups.ordered, id: \.title) { entry in
                         section(entry.title, entry.group, model)
@@ -57,9 +56,49 @@ struct MainWindowRoot: View {
             .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 360)
         } detail: {
             detailPane
+                .toolbar {
+                    ToolbarItemGroup(placement: .navigation) {
+                        Button(action: goBack) {
+                            Label("Back", systemImage: "chevron.left")
+                        }
+                        .keyboardShortcut("[", modifiers: .command)
+                        .disabled(cursor == 0)
+                        .help("Back")
+
+                        Button(action: goForward) {
+                            Label("Forward", systemImage: "chevron.right")
+                        }
+                        .keyboardShortcut("]", modifiers: .command)
+                        .disabled(cursor >= history.count - 1)
+                        .help("Forward")
+                    }
+                }
         }
+        .onChange(of: selection) { _, new in record(new) }
         .task(id: refreshToken) { await reload() }
         .frame(minWidth: 820, minHeight: 520)
+    }
+
+    /// A step through history sets `selection` to the entry already under the
+    /// cursor, which is how this tells it apart from a fresh visit: only a
+    /// fresh visit drops the forward entries and appends.
+    private func record(_ new: Selection?) {
+        guard let new, new != history[cursor] else { return }
+        history.removeSubrange((cursor + 1)...)
+        history.append(new)
+        cursor = history.count - 1
+    }
+
+    private func goBack() {
+        guard cursor > 0 else { return }
+        cursor -= 1
+        selection = history[cursor]
+    }
+
+    private func goForward() {
+        guard cursor < history.count - 1 else { return }
+        cursor += 1
+        selection = history[cursor]
     }
 
     @ViewBuilder
@@ -76,34 +115,13 @@ struct MainWindowRoot: View {
 
     @ViewBuilder
     private var detailPane: some View {
-        VStack(spacing: 0) {
-            Picker("View", selection: $tab) {
-                Text("Overview").tag(DetailTab.overview)
-                Text("Usage").tag(DetailTab.usage)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(maxWidth: 220)
-            .padding(.horizontal, 20)
-            .padding(.top, 16)
-            .padding(.bottom, 8)
-
-            switch tab {
-            case .overview:
-                overviewPane
-            case .usage:
-                UsageView(engine: engine)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var overviewPane: some View {
         switch selection {
-        case .now, .none:
+        case .overview, .none:
             NowPane(engine: engine, projects: model?.projects ?? []) { id in
                 selection = .project(id)
             }
+        case .usage:
+            UsageView(engine: engine)
         case .project(let id):
             ProjectDetailPane(engine: engine, projectId: id, onChanged: { await reload() })
                 .id(id)
