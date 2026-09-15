@@ -157,6 +157,21 @@ pub fn oldest_turn_since(db: &Db, since_ms: i64) -> Result<Option<i64>> {
     Ok(ts)
 }
 
+/// [`usage_by_model`] restricted to turns at or after `since_ms`.
+pub fn usage_by_model_since(db: &Db, since_ms: i64) -> Result<Vec<(String, TurnUsage, f64)>> {
+    let per_model = usage_rows(
+        db,
+        &format!("SELECT model, {SUMS} FROM turns WHERE ts >= ?1 GROUP BY model"),
+        &[&since_ms],
+    )?;
+    let mut out = Vec::new();
+    for (model, u) in per_model {
+        let c = cost_of(db, &model, &u)?;
+        out.push((model, u, c));
+    }
+    Ok(out)
+}
+
 pub fn usage_by_model(db: &Db) -> Result<Vec<(String, TurnUsage, f64)>> {
     let per_model = usage_rows(
         db,

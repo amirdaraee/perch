@@ -162,7 +162,6 @@ pub fn build_main_window(
             error: Some("index unavailable".into()),
         };
     };
-    let active_window_ms = i64::from(settings.active_within_days) * query::DAY_MS;
     let chart_days = settings.chart_days as usize;
     // All three are read up front, so a card's sparkline and branch cost one
     // query each for the whole grid rather than one per project. A failure in
@@ -203,18 +202,13 @@ pub fn build_main_window(
                 return None;
             }
             let pinned = meta.as_ref().is_some_and(|m| m.pinned);
-            let group = if archived {
-                ProjectGroup::Archived
-            } else if pinned {
-                ProjectGroup::Pinned
-            } else if s
-                .last_activity_at
-                .is_some_and(|t| now_ms - t <= active_window_ms)
-            {
-                ProjectGroup::Active
-            } else {
-                ProjectGroup::Recent
-            };
+            let group = project_group(
+                archived,
+                pinned,
+                s.last_activity_at,
+                now_ms,
+                settings.active_within_days,
+            );
             let name = meta
                 .as_ref()
                 .and_then(|m| m.display_name.clone())
@@ -328,6 +322,29 @@ fn spark_points(tokens_per_day: &[u64]) -> Vec<SparkPoint> {
             }
         })
         .collect()
+}
+
+/// Which sidebar group a project belongs to: Archived beats Pinned, and an
+/// unpinned project is Active while its last turn is within
+/// `active_within_days`. Public so every reader of the index — the main window
+/// and `perch-mcp` — groups a project the same way.
+pub fn project_group(
+    archived: bool,
+    pinned: bool,
+    last_activity_at: Option<i64>,
+    now_ms: i64,
+    active_within_days: u32,
+) -> ProjectGroup {
+    let active_window_ms = i64::from(active_within_days) * query::DAY_MS;
+    if archived {
+        ProjectGroup::Archived
+    } else if pinned {
+        ProjectGroup::Pinned
+    } else if last_activity_at.is_some_and(|t| now_ms - t <= active_window_ms) {
+        ProjectGroup::Active
+    } else {
+        ProjectGroup::Recent
+    }
 }
 
 fn group_rank(g: ProjectGroup) -> u8 {
