@@ -544,6 +544,72 @@ pub fn daily_usage_for_project(
     daily_usage_grouped(db, days, now_ms, Some(project_id))
 }
 
+/// Every project's tokens per day over the same window `daily_usage_for_project`
+/// covers — one grouped query rather than one per project, for the overview's
+/// cards. Each vector is `days` long, oldest first, quiet days zeroed; a project
+/// with no turns in the window is simply absent from the map.
+pub fn daily_tokens_by_project(
+    db: &Db,
+    days: usize,
+    now_ms: i64,
+) -> Result<std::collections::HashMap<i64, Vec<u64>>> {
+    let last = day_start(now_ms);
+    let first = last - (days as i64 - 1).max(0) * DAY_MS;
+    let upper = last + DAY_MS;
+    let mut stmt = db.conn().prepare(&format!(
+        "SELECT (t.ts - (t.ts % {DAY_MS} + {DAY_MS}) % {DAY_MS}) AS day, s.project_id, {SUMS}
+         FROM turns t JOIN sessions s ON s.id = t.session_id
+         WHERE t.ts >= ?1 AND t.ts < ?2
+         GROUP BY day, s.project_id"
+    ))?;
+    let rows = stmt
+        .query_map(params![first, upper], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                TurnUsage {
+                    input: r.get::<_, i64>(2)? as u64,
+                    output: r.get::<_, i64>(3)? as u64,
+                    cache_read: r.get::<_, i64>(4)? as u64,
+                    cache_write_5m: r.get::<_, i64>(5)? as u64,
+                    cache_write_1h: r.get::<_, i64>(6)? as u64,
+                    thinking: r.get::<_, i64>(7)? as u64,
+                },
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut out: std::collections::HashMap<i64, Vec<u64>> = std::collections::HashMap::new();
+    for (day, project_id, usage) in rows {
+        let slot = ((day - first) / DAY_MS) as usize;
+        if slot < days {
+            // `total_tokens` is the one definition of a token total, so these
+            // bars can never disagree with the project page's sparkline.
+            out.entry(project_id).or_insert_with(|| vec![0; days])[slot] += usage.total_tokens();
+        }
+    }
+    Ok(out)
+}
+
+/// Each project's branch, from its most recently active session that recorded
+/// a non-blank one. A project that never ran inside a git checkout is absent.
+pub fn latest_branches(db: &Db) -> Result<std::collections::HashMap<i64, String>> {
+    let mut stmt = db.conn().prepare(
+        "SELECT project_id, git_branch FROM sessions
+         WHERE git_branch IS NOT NULL AND TRIM(git_branch) <> ''
+         ORDER BY last_activity_at IS NULL, last_activity_at DESC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut out = std::collections::HashMap::new();
+    for (project_id, branch) in rows {
+        // Rows arrive newest first, so the first branch seen per project wins.
+        out.entry(project_id).or_insert(branch);
+    }
+    Ok(out)
+}
+
 /// Projects ranked by tokens since `since_ms`. The label is the directory name,
 /// which is what the user recognises — not the slug and not the whole path.
 pub fn top_projects(db: &Db, since_ms: i64, limit: usize) -> Result<Vec<(String, TurnUsage, f64)>> {
@@ -1241,6 +1307,69 @@ mod tests {
         // are not accidentally the same query.
         let workspace = daily_usage(&db, 3, now).unwrap();
         assert_eq!(workspace[2].usage.input, 10_000_000);
+    }
+
+    #[test]
+    fn daily_tokens_by_project_agrees_with_each_projects_own_sparkline() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let a = db.upsert_project("-a-a", "/a/a", false).unwrap();
+        let b = db.upsert_project("-a-b", "/a/b", false).unwrap();
+        let quiet = db.upsert_project("-a-q", "/a/q", false).unwrap();
+        let now = 10 * DAY + 3_600_000;
+        seed_session(&db, a, "sa1", "/a/a", 10 * DAY + 1, 1_000);
+        seed_session(&db, a, "sa2", "/a/a", 8 * DAY + 5, 700);
+        seed_session(&db, b, "sb", "/a/b", 9 * DAY + 1, 9_000);
+        // Outside the window: must not be folded into day 0.
+        seed_session(&db, quiet, "sq", "/a/q", 2 * DAY, 5_000);
+
+        let all = daily_tokens_by_project(&db, 3, now).unwrap();
+        for pid in [a, b] {
+            let own: Vec<u64> = daily_usage_for_project(&db, pid, 3, now)
+                .unwrap()
+                .iter()
+                .map(|d| d.usage.total_tokens())
+                .collect();
+            assert_eq!(all[&pid], own, "project {pid}");
+        }
+        assert_eq!(all[&a], vec![700, 0, 1_000]);
+        assert!(
+            !all.contains_key(&quiet),
+            "no turns in the window, no entry"
+        );
+    }
+
+    #[test]
+    fn latest_branches_take_the_newest_session_that_recorded_one() {
+        let db = open_in_memory().unwrap();
+        let p = db.upsert_project("-a-p", "/a/p", false).unwrap();
+        let bare = db.upsert_project("-a-bare", "/a/bare", false).unwrap();
+        for (id, pid, last, branch) in [
+            ("old", p, 1_000, Some("main")),
+            ("mid", p, 2_000, Some("feature")),
+            ("new-blank", p, 3_000, Some("  ")),
+            ("new-none", p, 4_000, None),
+            ("bare", bare, 5_000, None),
+        ] {
+            db.upsert_session(&SessionRecord {
+                id: id.into(),
+                project_id: pid,
+                file_path: format!("/tmp/{id}.jsonl"),
+                file_size: 0,
+                indexed_offset: 0,
+                started_at: Some(last - 10),
+                last_activity_at: Some(last),
+                cwd: None,
+                git_branch: branch.map(str::to_string),
+                cc_version: None,
+                title: None,
+                message_count: 1,
+            })
+            .unwrap();
+        }
+        let branches = latest_branches(&db).unwrap();
+        assert_eq!(branches.get(&p).map(String::as_str), Some("feature"));
+        assert!(!branches.contains_key(&bare));
     }
 
     #[test]

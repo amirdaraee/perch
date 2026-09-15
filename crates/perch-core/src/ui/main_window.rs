@@ -2,8 +2,9 @@
 //! project's full history. Same rule as the popover — every string is final here.
 
 use crate::db::{Db, NotifyOverride};
-use crate::live::LiveSession;
+use crate::live::{LiveSession, SessionStatus};
 use crate::query;
+use crate::readme;
 use crate::settings::Settings;
 use crate::ui::format::{elapsed_or_dash, human_cost, human_elapsed, human_tokens, plural};
 use crate::ui::model::PopoverModel;
@@ -29,6 +30,20 @@ pub struct ProjectRow {
     pub live_session_count: u32,
     /// "N sessions · 2.0M · $30.00 · 1h" — composed here so no shell rebuilds it.
     pub subtitle: String,
+    /// The overview card's opening paragraph from the project's own README or
+    /// CLAUDE.md; `None` when neither says anything or the folder is gone.
+    pub description: Option<String>,
+    /// Tokens per day over `settings.chart_days`, oldest first — the same
+    /// window and labels as the project page's sparkline.
+    pub sparkline: Vec<SparkPoint>,
+    /// "2 running", or `None` when nothing runs in this project.
+    pub live_label: Option<String>,
+    /// "1 waiting", or `None` when no session here is waiting on the user.
+    pub waiting_label: Option<String>,
+    /// "12 sessions · 2.0M · $30.00" — the subtitle without its recency.
+    pub stats_line: String,
+    /// "main · 3h" — the latest branch, when one was recorded, then recency.
+    pub activity_line: String,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -148,7 +163,18 @@ pub fn build_main_window(
         };
     };
     let active_window_ms = i64::from(settings.active_within_days) * query::DAY_MS;
-    let summaries = match query::project_summaries(db) {
+    let chart_days = settings.chart_days as usize;
+    // All three are read up front, so a card's sparkline and branch cost one
+    // query each for the whole grid rather than one per project. A failure in
+    // any of them fails the list: zero bars would be a fabricated "quiet".
+    let loaded = query::project_summaries(db).and_then(|s| {
+        Ok((
+            s,
+            query::daily_tokens_by_project(db, chart_days, now_ms)?,
+            query::latest_branches(db)?,
+        ))
+    });
+    let (summaries, daily, branches) = match loaded {
         Ok(s) => s,
         Err(e) => {
             return MainWindowModel {
@@ -204,7 +230,30 @@ pub fn build_main_window(
                 String::new()
             };
             let last_active = since(now_ms, s.last_activity_at);
-            let live_session_count = live.iter().filter(|l| l.cwd == s.real_path).count() as u32;
+            let here: Vec<&LiveSession> = live.iter().filter(|l| l.cwd == s.real_path).collect();
+            let live_session_count = here.len() as u32;
+            let waiting = here
+                .iter()
+                .filter(|l| matches!(l.status, SessionStatus::Waiting { .. }))
+                .count();
+            let stats_line = [
+                Some(session_count.clone()),
+                Some(tokens.clone()),
+                (!cost.is_empty()).then(|| cost.clone()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
+            let activity_line = [branches.get(&s.id).cloned(), Some(last_active.clone())]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let tokens_per_day = daily
+                .get(&s.id)
+                .cloned()
+                .unwrap_or_else(|| vec![0; chart_days]);
             // Composed as optional fragments, not a fixed-arity `format!`, so
             // a hidden cost drops cleanly instead of leaving a stray " · ".
             let subtitle = [
@@ -228,6 +277,13 @@ pub fn build_main_window(
                 cost,
                 last_active,
                 live_session_count,
+                description: readme::project_description(std::path::Path::new(&s.real_path)),
+                sparkline: spark_points(&tokens_per_day),
+                live_label: (live_session_count > 0)
+                    .then(|| format!("{live_session_count} running")),
+                waiting_label: (waiting > 0).then(|| format!("{waiting} waiting")),
+                stats_line,
+                activity_line,
             };
             Some((row, s.last_activity_at))
         })
@@ -248,6 +304,30 @@ pub fn build_main_window(
         projects: projects.into_iter().map(|(row, _)| row).collect(),
         error: None,
     }
+}
+
+/// One bar per day, oldest first, labelled with the same scheme as
+/// `ui::usage`'s daily chart over the identical window — "Today", "1d" … — not
+/// `human_elapsed`, which caps at hours and would read "313h ago" for day 0.
+/// Shared by the overview card and the project page so the two never disagree.
+fn spark_points(tokens_per_day: &[u64]) -> Vec<SparkPoint> {
+    let n = tokens_per_day.len();
+    tokens_per_day
+        .iter()
+        .enumerate()
+        .map(|(i, &tokens)| {
+            let days_ago = n - 1 - i;
+            SparkPoint {
+                day_index: i as i32,
+                tokens,
+                label: if days_ago == 0 {
+                    "Today".to_string()
+                } else {
+                    format!("{days_ago}d")
+                },
+            }
+        })
+        .collect()
 }
 
 fn group_rank(g: ProjectGroup) -> u8 {
@@ -294,25 +374,12 @@ pub fn build_project_detail(
 
     let chart_days = settings.chart_days as usize;
     let days = query::daily_usage_for_project(db, project_id, chart_days, now_ms)?;
-    let sparkline = days
-        .iter()
-        .enumerate()
-        .map(|(i, d)| {
-            let days_ago = chart_days - 1 - i;
-            SparkPoint {
-                day_index: i as i32,
-                tokens: d.usage.total_tokens(),
-                // Same scheme as `ui::usage`'s daily chart over the identical
-                // window — "Today", "1d" … — not `human_elapsed`, which caps
-                // at hours and would read "313h ago" for day 0.
-                label: if days_ago == 0 {
-                    "Today".to_string()
-                } else {
-                    format!("{days_ago}d")
-                },
-            }
-        })
-        .collect();
+    let sparkline = spark_points(
+        &days
+            .iter()
+            .map(|d| d.usage.total_tokens())
+            .collect::<Vec<_>>(),
+    );
 
     let sessions = query::session_history(db, project_id)?
         .into_iter()
@@ -1028,6 +1095,143 @@ mod tests {
         assert_eq!(d.cost, "$30.00");
         assert_eq!(d.sessions[0].cost, "$30.00");
         assert!(d.sessions[0].detail_line.contains("$30.00"));
+    }
+
+    fn live_at(cwd: &str, id: &str, status: SessionStatus) -> LiveSession {
+        LiveSession {
+            pid: 1,
+            session_id: id.into(),
+            cwd: cwd.into(),
+            name: "n".into(),
+            kind: "interactive".into(),
+            status,
+            started_at: 1,
+            status_updated_at: 1,
+            cc_version: None,
+            socket_path: None,
+        }
+    }
+
+    #[test]
+    fn a_card_carries_its_readme_sparkline_branch_and_live_labels() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("README.md"), "# X\n\nDoes a useful thing.").unwrap();
+        let path = dir.path().to_string_lossy().into_owned();
+        let now = 100 * DAY + 3_600_000;
+        let pid = project_with_session(&db, "-x", &path, "s1", now - 60_000, 2_000);
+        let quiet = project_with_session(&db, "-q", "/gone/perch/quiet", "s2", now - 60 * DAY, 5);
+
+        let live = vec![
+            live_at(&path, "l1", SessionStatus::Working),
+            live_at(
+                &path,
+                "l2",
+                SessionStatus::Waiting {
+                    reason: None,
+                    since_ms: 1,
+                },
+            ),
+        ];
+        let m = build_main_window(
+            Some(&db),
+            PopoverModel::empty(),
+            &live,
+            now,
+            &Settings::default(),
+        );
+        let card = m.projects.iter().find(|p| p.id == pid).unwrap();
+
+        assert_eq!(card.description.as_deref(), Some("Does a useful thing."));
+        assert_eq!(
+            card.sparkline.len(),
+            Settings::default().chart_days as usize
+        );
+        assert_eq!(card.sparkline.last().unwrap().tokens, 2_000);
+        assert_eq!(card.sparkline.last().unwrap().label, "Today");
+        assert_eq!(card.live_label.as_deref(), Some("2 running"));
+        assert_eq!(card.waiting_label.as_deref(), Some("1 waiting"));
+        assert!(
+            card.activity_line.starts_with("main · "),
+            "{}",
+            card.activity_line
+        );
+        assert!(
+            card.stats_line.starts_with("1 session · "),
+            "{}",
+            card.stats_line
+        );
+
+        let q = m.projects.iter().find(|p| p.id == quiet).unwrap();
+        assert_eq!(
+            q.description, None,
+            "a folder that is gone has no description"
+        );
+        assert_eq!(q.live_label, None);
+        assert_eq!(q.waiting_label, None);
+        assert!(
+            !q.sparkline.is_empty(),
+            "quiet is drawn as zero bars, not nothing"
+        );
+        assert!(q.sparkline.iter().all(|p| p.tokens == 0));
+    }
+
+    #[test]
+    fn a_card_with_cost_hidden_has_no_dollars_and_no_stray_separator() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let now = 100 * DAY;
+        project_with_session(&db, "-a", "/a/a", "s1", now - DAY, 1_000_000);
+        let hidden = Settings {
+            show_cost: false,
+            ..Settings::default()
+        };
+        let m = build_main_window(Some(&db), PopoverModel::empty(), &[], now, &hidden);
+        assert!(
+            !m.projects.is_empty(),
+            "the fixture must produce a card to inspect"
+        );
+        for card in &m.projects {
+            assert!(!card.stats_line.contains('$'), "{}", card.stats_line);
+            assert!(!card.stats_line.ends_with(" · "), "{}", card.stats_line);
+            assert!(!card.stats_line.contains(" ·  · "), "{}", card.stats_line);
+        }
+
+        let shown = build_main_window(
+            Some(&db),
+            PopoverModel::empty(),
+            &[],
+            now,
+            &Settings::default(),
+        );
+        assert!(
+            shown.projects[0].stats_line.contains('$'),
+            "cost is there when not hidden"
+        );
+    }
+
+    #[test]
+    fn a_project_that_never_ran_in_git_drops_the_branch_cleanly() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let now = 100 * DAY;
+        let pid = project_with_session(&db, "-a", "/a/a", "s1", now - DAY, 10);
+        db.conn()
+            .execute("UPDATE sessions SET git_branch = NULL", [])
+            .unwrap();
+        let m = build_main_window(
+            Some(&db),
+            PopoverModel::empty(),
+            &[],
+            now,
+            &Settings::default(),
+        );
+        let card = m.projects.iter().find(|p| p.id == pid).unwrap();
+        assert_eq!(
+            card.activity_line, card.last_active,
+            "recency alone, no separator"
+        );
     }
 }
 
