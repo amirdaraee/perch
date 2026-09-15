@@ -228,14 +228,17 @@ struct ProjectDetailPane: View {
         if !detail.sparkline.isEmpty {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Last 14 days").font(.caption2).foregroundStyle(.secondary).textCase(.uppercase)
-                Chart(detail.sparkline, id: \.dayIndex) { point in
-                    BarMark(
-                        x: .value("Day", point.dayIndex),
-                        y: .value("Tokens", point.tokens)
-                    )
-                    .foregroundStyle(Color.perchWorking)
-                    // `label` is Rust's already-final day label — never formatted here.
-                    .accessibilityLabel(point.label)
+                Chart {
+                    ForEach(detail.sparkline, id: \.dayIndex) { point in
+                        BarMark(
+                            x: .value("Day", point.dayIndex),
+                            y: .value("Tokens", point.tokens)
+                        )
+                        .foregroundStyle(Color.perchWorking)
+                        // `label` is Rust's already-final day label — never formatted here.
+                        .accessibilityLabel(point.label)
+                    }
+                    PerchChartBaseline()
                 }
                 .chartXAxis {
                     // A handful of labelled ticks give the bars a day, without

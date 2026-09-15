@@ -1,3 +1,4 @@
+import Charts
 import SwiftUI
 import PerchFFI
 
@@ -63,6 +64,16 @@ enum PerchChartPalette {
         ("Cache read", .cacheRead, cacheRead),
         ("Cache write", .cacheWrite, cacheWrite),
     ]
+}
+
+/// A hairline along a bar chart's floor, so an empty slice still reads as a
+/// slice with nothing in it rather than as a gap in the chart.
+struct PerchChartBaseline: ChartContent {
+    var body: some ChartContent {
+        RuleMark(y: .value("Tokens", 0))
+            .lineStyle(StrokeStyle(lineWidth: 0.5))
+            .foregroundStyle(Color.secondary.opacity(0.6))
+    }
 }
 
 private enum PerchCardMetrics {

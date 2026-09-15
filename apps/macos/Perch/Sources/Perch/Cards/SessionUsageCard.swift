@@ -60,15 +60,18 @@ struct SessionUsageCard: View {
     }
 
     private var chart: some View {
-        Chart(usage.chart, id: \.index) { point in
-            BarMark(
-                x: .value("Slice", point.index),
-                y: .value("Tokens", point.tokens)
-            )
-            .foregroundStyle(Color.perchWorking)
-            // `label` is Rust's already-final caption for where in the
-            // session's life this slice falls — never formatted here.
-            .accessibilityLabel(point.label)
+        Chart {
+            ForEach(usage.chart, id: \.index) { point in
+                BarMark(
+                    x: .value("Slice", point.index),
+                    y: .value("Tokens", point.tokens)
+                )
+                .foregroundStyle(Color.perchWorking)
+                // `label` is Rust's already-final caption for where in the
+                // session's life this slice falls — never formatted here.
+                .accessibilityLabel(point.label)
+            }
+            PerchChartBaseline()
         }
         .chartXAxis {
             // First, middle and last only: sixteen captions would not fit
