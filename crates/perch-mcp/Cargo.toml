@@ -1,0 +1,16 @@
+[package]
+name = "perch-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A local, read-only MCP server over Perch's project index"
+
+[dependencies]
+perch-core = { path = "../perch-core" }
+anyhow.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
