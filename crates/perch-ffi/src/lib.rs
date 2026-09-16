@@ -2585,6 +2585,17 @@ impl Perch {
     /// The terminals this machine has, plus whatever the settings file names
     /// even when it was not detected — the same union the Preferred terminal
     /// picker offers, with the bundle identifiers a launcher may prefer.
+    /// The bundle identifier for the terminal the settings currently name —
+    /// read fresh, like `preferred_terminal` itself, so a change takes effect
+    /// on the very next launch. A shell passes this straight to the OS rather
+    /// than translating the name itself.
+    pub fn preferred_terminal_bundle_id(&self) -> String {
+        let configured = settings::store::load(&self.config_path)
+            .settings
+            .preferred_terminal;
+        terminals::bundle_id_for(&configured)
+    }
+
     pub fn terminals(&self) -> Vec<TerminalChoice> {
         let configured = settings::store::load(&self.config_path)
             .settings

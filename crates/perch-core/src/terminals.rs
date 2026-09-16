@@ -168,6 +168,26 @@ pub fn terminal_choices(detected: &[&str], configured: &str) -> Vec<TerminalChoi
     out
 }
 
+/// Terminal.app: the fallback whenever the configured terminal is one Perch
+/// has no bundle identifier for, and the one macOS is guaranteed to have.
+const FALLBACK: &str = "com.apple.Terminal";
+
+/// The bundle identifier a launcher should ask macOS for, given whatever the
+/// config holds. A name Perch does not know — a hand-edited value, or a
+/// terminal newer than this build — falls back to Terminal.app, because a
+/// launch that goes nowhere is worse than one that goes somewhere ordinary.
+///
+/// This mapping lives here, beside the table it reads, so a terminal added to
+/// `KNOWN` is launchable the moment it is offered. A shell that kept its own
+/// name-to-identifier switch would silently send every terminal it had not
+/// heard of to Terminal.app — which is exactly what happened to Warp.
+pub fn bundle_id_for(configured: &str) -> String {
+    KNOWN
+        .iter()
+        .find(|t| t.id == configured)
+        .map_or_else(|| FALLBACK.to_string(), |t| t.bundle_id.to_string())
+}
+
 /// What this machine has, plus what the config chose. The one call a caller
 /// building the Preferred terminal row needs.
 pub fn terminal_picker(configured: &str) -> Vec<TerminalChoice> {
@@ -183,6 +203,28 @@ mod tests {
 
     fn ids(choices: &[TerminalChoice]) -> Vec<&str> {
         choices.iter().map(|c| c.id.as_str()).collect()
+    }
+
+    #[test]
+    fn every_offered_terminal_has_a_bundle_id_to_launch_it_by() {
+        // The picker and the launcher read one table. Before this, Swift kept
+        // its own switch with two entries in it, so choosing Warp opened
+        // Terminal.app — the whole point of naming a terminal, undone.
+        for t in KNOWN {
+            assert_eq!(
+                bundle_id_for(t.id),
+                t.bundle_id,
+                "{} is offered but would launch something else",
+                t.id
+            );
+        }
+        assert_eq!(bundle_id_for("Warp"), "dev.warp.Warp-Stable");
+    }
+
+    #[test]
+    fn an_unknown_terminal_falls_back_to_the_one_macos_always_has() {
+        assert_eq!(bundle_id_for("Hyper"), FALLBACK);
+        assert_eq!(bundle_id_for(""), FALLBACK);
     }
 
     #[test]

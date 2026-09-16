@@ -25,15 +25,18 @@ enum LauncherError: LocalizedError {
 /// POSIX-single-quoted for every value it embeds; it is used verbatim here,
 /// with no additional escaping or interpolation.
 enum Launcher {
-    /// `terminal` is the `preferredTerminal` setting's value ("Terminal",
-    /// "iTerm2", ...) — the caller reads it fresh at the moment of launch
-    /// (see `ProjectDetailPane.launch`), so a hand-edited or just-saved
-    /// change always takes effect on the very next launch, with no
-    /// caching or restart involved. Unrecognized here, or recognized but not
-    /// actually installed, both fall back to Terminal.app (see `bundleId`
-    /// and the `??` below) rather than failing outright — the setting is a
-    /// preference, not a hard requirement.
-    static func run(_ command: TerminalCommand, terminal: String = "Terminal") throws {
+    /// `bundleId` is the identifier Rust resolved for the `preferredTerminal`
+    /// setting (`terminals::bundle_id_for`), read fresh at the moment of
+    /// launch, so a just-saved or hand-edited change takes effect on the very
+    /// next launch with no caching or restart involved. Rust has already
+    /// turned a name it does not know into Terminal.app's identifier; a
+    /// terminal that is named but not installed falls back here too (the `??`
+    /// below), since the setting is a preference, not a hard requirement.
+    ///
+    /// Nothing in this file maps a terminal's name to an identifier. That
+    /// mapping lives once, beside the table the picker is built from — a copy
+    /// of it here went stale the moment a terminal was added to that table.
+    static func run(_ command: TerminalCommand, bundleId: String) throws {
         let dir = try scriptDirectory()
         sweep(dir)
 
@@ -55,25 +58,16 @@ enum Launcher {
 
         let config = NSWorkspace.OpenConfiguration()
         guard
-            let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId(for: terminal))
-                ?? NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal")
+            let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleId)
+                ?? NSWorkspace.shared.urlForApplication(withBundleIdentifier: fallbackBundleId)
         else { throw LauncherError.noTerminal }
         NSWorkspace.shared.open([script], withApplicationAt: app, configuration: config)
     }
 
-    /// Maps a `preferredTerminal` setting value to the bundle identifier
-    /// `NSWorkspace` needs to launch it. Anything this switch doesn't
-    /// recognize falls through to `"com.apple.Terminal"` here too — `run`'s
-    /// own `??` fallback above only catches a *recognized* app that isn't
-    /// actually installed; an unrecognized name (a future terminal Perch
-    /// doesn't know yet, or a stale hand-typed value) needs the same
-    /// fallback one step earlier.
-    private static func bundleId(for name: String) -> String {
-        switch name {
-        case "iTerm2": return "com.googlecode.iterm2"
-        default: return "com.apple.Terminal"
-        }
-    }
+    /// The one identifier this file still names: the app macOS is guaranteed
+    /// to have, for a chosen terminal that turns out not to be installed.
+    /// Rust uses the same one for a name it does not recognize.
+    private static let fallbackBundleId = "com.apple.Terminal"
 
     /// Perch's own directory — the read-only promise about ~/.claude is unaffected.
     private static func scriptDirectory() throws -> URL {
