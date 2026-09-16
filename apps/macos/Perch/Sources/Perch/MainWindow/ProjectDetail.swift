@@ -389,9 +389,12 @@ struct ProjectDetailPane: View {
         // view first loaded — a `preferredTerminal` change (from this
         // window, or a hand-edited config.toml) is picked up on the very
         // next launch with no extra plumbing.
-        let terminal = await engine.preferredTerminal() ?? "Terminal"
+        guard let bundleId = await engine.preferredTerminalBundleId() else {
+            actionError = EngineUnavailable().localizedDescription
+            return
+        }
         do {
-            try Launcher.run(command, terminal: terminal)
+            try Launcher.run(command, bundleId: bundleId)
         } catch {
             self.actionError = error.localizedDescription
         }

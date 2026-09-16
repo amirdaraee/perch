@@ -144,6 +144,15 @@ final class PerchEngine: ObservableObject {
         return await Task.detached(priority: .userInitiated) { perch.preferredTerminal() }.value
     }
 
+    /// The bundle identifier of that same terminal, resolved in Rust beside
+    /// the table the picker is built from. Swift never maps a terminal's name
+    /// to an identifier itself: a second mapping here is one that drifts, and
+    /// did — every terminal but iTerm2 used to open Terminal.app.
+    func preferredTerminalBundleId() async -> String? {
+        guard let perch else { return nil }
+        return await Task.detached(priority: .userInitiated) { perch.preferredTerminalBundleId() }.value
+    }
+
     // MARK: - The settings schema
     //
     // The whole settings window is built on these: Rust owns the panes, the

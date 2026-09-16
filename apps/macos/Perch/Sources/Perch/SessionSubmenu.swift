@@ -164,9 +164,9 @@ final class SessionSubmenu: NSObject, NSMenuDelegate {
                     let command = await engine.resumeCommand(
                         sessionId: model.sessionId, cwd: model.folderPath
                     ),
-                    let terminal = await engine.preferredTerminal()
+                    let bundleId = await engine.preferredTerminalBundleId()
                 else { return }
-                try? Launcher.run(command, terminal: terminal)
+                try? Launcher.run(command, bundleId: bundleId)
             }
         case .focus:
             // Re-resolved rather than reusing the application found while
