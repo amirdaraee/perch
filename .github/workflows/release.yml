@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+# Needed to create the release and upload the artefact. Nothing else.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Assert the tag matches the version in the source
+        run: |
+          set -uo pipefail
+          TAG="${GITHUB_REF_NAME#v}"
+          CARGO=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          PLIST=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+                    apps/macos/Perch/Resources/Info.plist)
+          echo "tag=$TAG cargo=$CARGO plist=$PLIST"
+          if [ "$TAG" != "$CARGO" ] || [ "$TAG" != "$PLIST" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME disagrees with Cargo.toml ($CARGO) or Info.plist ($PLIST). Bump both, then retag."
+            exit 1
+          fi
+
+      - run: scripts/build-xcframework.sh
+
+      - name: Build the universal bundle and zip it
+        working-directory: apps/macos/Perch
+        run: make release
+
+      # `make release` prints the architectures; this makes shipping the wrong
+      # ones a build failure rather than a line in a log nobody reads. GitHub's
+      # macOS runners are Apple Silicon, so an arm64-only slip here would
+      # produce an artefact that simply fails to launch on every Intel Mac —
+      # and it would not be noticed until a user reported it.
+      - name: Assert both binaries are universal
+        working-directory: apps/macos/Perch
+        run: |
+          set -uo pipefail
+          for bin in Perch perch-mcp; do
+            info=$(lipo -info "build/Perch.app/Contents/MacOS/$bin")
+            echo "$info"
+            for arch in arm64 x86_64; do
+              if ! printf '%s' "$info" | grep -qw "$arch"; then
+                echo "::error::$bin is missing the $arch slice."
+                exit 1
+              fi
+            done
+          done
+          codesign --verify --deep --strict build/Perch.app
+
+      - name: Publish the release
+        working-directory: apps/macos/Perch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          ZIP="build/Perch-$VERSION-macos.zip"
+          SHA=$(shasum -a 256 "$ZIP" | cut -d' ' -f1)
+
+          cat > notes.md <<EOF
+          ## Install
+
+          Requires macOS 15 or later. Universal (Apple Silicon and Intel).
+
+          Download \`$(basename "$ZIP")\`, unzip it, and drag \`Perch.app\` to
+          \`/Applications\`.
+
+          **The first launch will be blocked.** Perch is signed, but with an
+          ad-hoc signature rather than a paid Apple Developer ID, so macOS
+          treats it as coming from an unidentified developer. To open it:
+
+          > **System Settings → Privacy & Security**, scroll to the bottom, and
+          > click **"Open Anyway"** next to the message about Perch.
+
+          On macOS 15 this is the only route — the old right-click → Open trick
+          no longer works for unsigned apps.
+
+          If you would rather not run an unidentified binary at all, that is a
+          reasonable instinct for an app that reads your transcripts. Building
+          from source is two commands; see the README.
+
+          ## Verify the download
+
+          \`\`\`
+          shasum -a 256 $(basename "$ZIP")
+          $SHA
+          \`\`\`
+
+          ## Changes
+          EOF
+
+          gh release create "$GITHUB_REF_NAME" "$ZIP" \
+            --title "Perch $VERSION" \
+            --notes-file notes.md \
+            --generate-notes
