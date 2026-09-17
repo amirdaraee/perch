@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/perch-core", "crates/perch-cli", "crates/perch-ffi", "crates/perch-mcp", "src-tauri"]
+members = ["crates/perch-core", "crates/perch-cli", "crates/perch-ffi", "crates/perch-mcp"]
 
 [workspace.package]
 version = "0.1.0"

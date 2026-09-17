@@ -9,22 +9,13 @@ jobs:
   test:
     strategy:
       fail-fast: false
+      # Every crate in the workspace is portable, so both runners build all of
+      # it. macOS is where the app is shipped from; Linux is what keeps the
+      # data layer honest — perch-core, perch-ffi and perch-mcp must not
+      # quietly grow a macOS-only dependency, because a later Linux or Windows
+      # shell is meant to reuse them.
       matrix:
-        # `src-tauri` (the app crate) links against webkit2gtk and friends, which
-        # only macos-latest has available. ubuntu-latest can't build it, so Linux
-        # is scoped to the portable data-layer crates (perch-core, perch-cli,
-        # perch-ffi) rather than the whole workspace. perch-ffi is included
-        # because it's the UniFFI surface the native macOS app is built on, and
-        # it must keep compiling on Linux for the same reason perch-core does:
-        # so a later Linux/Windows shell can reuse it. macOS keeps proving the
-        # full workspace builds; Linux keeps proving the data layer stays
-        # portable and doesn't quietly grow a dependency on the app crate or its
-        # platform-only deps.
-        include:
-          - os: macos-latest
-            cargo-scope: --workspace
-          - os: ubuntu-latest
-            cargo-scope: -p perch-core -p perch-cli -p perch-ffi -p perch-mcp
+        os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -33,45 +24,15 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
-      - run: cargo clippy ${{ matrix.cargo-scope }} --all-targets -- -D warnings
-      - run: cargo test ${{ matrix.cargo-scope }}
-
-  app:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # No `version:` here — package.json's `packageManager` field pins pnpm,
-      # and giving both makes the action refuse with "Multiple versions of
-      # pnpm specified".
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 24, cache: pnpm }
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm exec tsc --noEmit
-      - run: pnpm build
-      # --features custom-protocol proves the *shippable* artifact (frontend
-      # embedded from dist/, which the pnpm build step above just produced)
-      # compiles, not the dev-server variant a plain cargo build produces.
-      - run: cargo build -p perch-app --features custom-protocol
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
 
   no-network:
     strategy:
       fail-fast: false
+      # Mirrors the `test` job, and for the same reason.
       matrix:
-        # Mirrors the `test` job's split, and for the same reason: the
-        # resolved-graph check below needs an actual Cargo toolchain now, and
-        # `perch-app` (src-tauri) only resolves against the deps its
-        # macOS-only `[target.'cfg(...)']` sections declare when run where
-        # they apply. macOS proves the full workspace graph, including the
-        # app crate, is clean; Linux keeps proving the portable data-layer
-        # crates (including perch-ffi) stay clean on their own.
-        include:
-          - os: macos-latest
-            cargo-scope: --workspace
-          - os: ubuntu-latest
-            cargo-scope: -p perch-core -p perch-cli -p perch-ffi -p perch-mcp
+        os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -84,13 +45,10 @@ jobs:
           HTTP='^(reqwest|hyper|ureq|curl|isahc|surf)\b'
           TELEMETRY='^(sentry|posthog|segment|mixpanel|datadog|analytics)\b'
 
-          # src-tauri is exactly where an HTTP client would plausibly be added
-          # first, so it must be scanned exactly like every other crate's
-          # manifest. Named as its own variable (rather than inlined below) so
-          # the self-test right below reuses the identical path string — a
-          # typo here would otherwise fail silently and the self-test would
-          # never catch it.
-          SRC_TAURI_MANIFEST=src-tauri/Cargo.toml
+          # Named as its own variable (rather than inlined below) so the
+          # self-test right below reuses the identical glob — a typo here would
+          # otherwise fail silently and the self-test would never catch it.
+          CRATE_MANIFESTS='crates/*/Cargo.toml'
 
           # Positive control: the patterns must actually detect a known offender.
           # Without this, a future edit that breaks the regex would pass silently forever —
@@ -100,34 +58,32 @@ jobs:
             echo "::error::Guard self-test failed: the HTTP pattern no longer detects a known offender."
             exit 1
           fi
-          # Positive control for the src-tauri coverage: a fixture placed as if
-          # it were src-tauri/Cargo.toml (never the real file — this lives
-          # entirely under /tmp), scanned through the exact path string the
-          # real check below uses, must trip the guard. This is the gap the
-          # task set out to close: a manifest edit here was previously caught
-          # only indirectly via the Cargo.lock scan, and only while the
-          # committed lockfile was in sync.
+          # Positive control for the per-crate coverage: a fixture placed as if
+          # it were a newly added crate's manifest (never a real file — this
+          # lives entirely under /tmp), scanned through the exact glob the real
+          # check below uses, must trip the guard. A crate added later is
+          # otherwise caught only indirectly via the resolved-graph check.
           SELFTEST_ROOT=/tmp/no-network-selftest-manifest
           rm -rf "$SELFTEST_ROOT"
-          mkdir -p "$(dirname "$SELFTEST_ROOT/$SRC_TAURI_MANIFEST")"
-          printf 'reqwest.workspace = true\n' > "$SELFTEST_ROOT/$SRC_TAURI_MANIFEST"
-          if ! ( cd "$SELFTEST_ROOT" && grep -rEn "$HTTP" "$SRC_TAURI_MANIFEST" ) > /dev/null; then
-            echo "::error::Guard self-test failed: the manifest glob no longer reaches $SRC_TAURI_MANIFEST."
+          mkdir -p "$SELFTEST_ROOT/crates/newcomer"
+          printf 'reqwest.workspace = true\n' > "$SELFTEST_ROOT/crates/newcomer/Cargo.toml"
+          if ! ( cd "$SELFTEST_ROOT" && grep -rEn "$HTTP" $CRATE_MANIFESTS ) > /dev/null; then
+            echo "::error::Guard self-test failed: the manifest glob no longer reaches $CRATE_MANIFESTS."
             exit 1
           fi
           rm -rf "$SELFTEST_ROOT"
 
           # Manifests: matches both `dep = "1"` and `dep.workspace = true`.
-          if grep -rEn "$HTTP" Cargo.toml crates/*/Cargo.toml "$SRC_TAURI_MANIFEST"; then
+          if grep -rEn "$HTTP" Cargo.toml $CRATE_MANIFESTS; then
             echo "::error::An HTTP client was added. The data layer must make no outbound requests."
             exit 1
           fi
-          if grep -rEni "$TELEMETRY" Cargo.toml crates/*/Cargo.toml "$SRC_TAURI_MANIFEST"; then
+          if grep -rEni "$TELEMETRY" Cargo.toml $CRATE_MANIFESTS; then
             echo "::error::Telemetry dependency detected. Perch ships no telemetry."
             exit 1
           fi
 
-          echo "no HTTP client or telemetry dependencies found (manifests, workspace root, and src-tauri)"
+          echo "no HTTP client or telemetry dependencies found (workspace root and $CRATE_MANIFESTS)"
 
       - name: Assert no hand-rolled sockets in the source
         run: |
@@ -138,12 +94,6 @@ jobs:
           # source audit; this is the source half.
           SOCKETS='std::net|TcpStream|UdpSocket|TcpListener'
 
-          # A hand-rolled socket written directly in src-tauri/src is caught by
-          # nothing else in this project — no manifest or lockfile entry would
-          # ever name it. Named as its own variable so the self-test below
-          # scans the identical root the real audit uses.
-          SRC_TAURI_SRC_DIR=src-tauri/src
-
           # Positive control: the pattern must actually detect a known offender.
           printf 'let s = TcpStream::connect("example.com:80")?;\n' > /tmp/socket-selftest.rs
           if ! grep -qE "$SOCKETS" /tmp/socket-selftest.rs; then
@@ -151,43 +101,43 @@ jobs:
             exit 1
           fi
 
-          # Positive control for the src-tauri coverage: a fixture placed as if
-          # it were src-tauri/src/x.rs (never the real source tree — this lives
-          # entirely under /tmp), discovered through the exact `find` root the
-          # real audit below uses, must trip the guard.
+          # Positive control for the coverage: a fixture placed as if it were a
+          # deeply nested module in a crate added later (never the real source
+          # tree — this lives entirely under /tmp), discovered through the exact
+          # `find` expression the real audit below uses, must trip the guard.
+          # Nested because `-path 'crates/*/src/*'` is easy to tighten by
+          # accident into something that only reaches the top level.
           SELFTEST_ROOT=/tmp/no-network-selftest-socket
           rm -rf "$SELFTEST_ROOT"
-          mkdir -p "$SELFTEST_ROOT/$SRC_TAURI_SRC_DIR"
+          mkdir -p "$SELFTEST_ROOT/crates/newcomer/src/deep/nested"
           printf 'fn x() { let _ = TcpStream::connect("example.com:80"); }\n' \
-            > "$SELFTEST_ROOT/$SRC_TAURI_SRC_DIR/x.rs"
-          if ! ( cd "$SELFTEST_ROOT" && find "$SRC_TAURI_SRC_DIR" -name '*.rs' -print0 \
+            > "$SELFTEST_ROOT/crates/newcomer/src/deep/nested/x.rs"
+          if ! ( cd "$SELFTEST_ROOT" && find crates -path 'crates/*/src/*' -name '*.rs' -print0 \
                  | xargs -0 grep -qE "$SOCKETS" ); then
-            echo "::error::Guard self-test failed: the source-audit root no longer reaches $SRC_TAURI_SRC_DIR."
+            echo "::error::Guard self-test failed: the source-audit root no longer reaches nested crates/*/src files."
             exit 1
           fi
           rm -rf "$SELFTEST_ROOT"
 
-          if { find crates -path 'crates/*/src/*' -name '*.rs' -print0; \
-               find "$SRC_TAURI_SRC_DIR" -name '*.rs' -print0; } \
+          if find crates -path 'crates/*/src/*' -name '*.rs' -print0 \
              | xargs -0 grep -nE "$SOCKETS"; then
             echo "::error::A raw socket appears in the source. The data layer makes no outbound requests."
             exit 1
           fi
 
-          echo "no raw sockets found in crates/*/src or $SRC_TAURI_SRC_DIR"
+          echo "no raw sockets found in crates/*/src"
 
-      - name: Assert perch-core, perch-ffi, perch-mcp, and the app crate never write to the filesystem
+      - name: Assert perch-core, perch-ffi and perch-mcp never write to the filesystem
         run: |
           set -uo pipefail
 
           # The README's other headline promise: Perch never writes to, moves, or
           # deletes anything in your Claude Code directory. perch-core is the only
           # crate that reads that directory; perch-ffi is the UniFFI surface that
-          # now resolves Perch's own data path (app_data_db) and drives indexing
-          # for the native macOS app, so a stray write there would be exactly as
-          # bad; and src-tauri (the app crate) is exactly where a stray write
-          # would plausibly be added first. All three must hold no
-          # filesystem-writing API outside of Perch's own data.
+          # resolves Perch's own data path (app_data_db) and drives indexing for
+          # the native macOS app, so a stray write there would be exactly as
+          # bad; and perch-mcp hands the same data to other tools. All three
+          # must hold no filesystem-writing API outside of Perch's own data.
           #
           # `create_dir_all` is deliberately NOT in this list, and exactly two
           # files under perch-core are deliberately excluded, each for a write
@@ -200,16 +150,14 @@ jobs:
           # 'store.rs'` would silently exclude *any* file with that basename
           # anywhere under the tree, not just these two exact files. Copy this
           # `-path`, not `-name`, if a third file ever needs excluding here.
-          # Nothing under crates/perch-ffi/src or src-tauri/src is excluded —
-          # commands.rs performs no writes of its own (it delegates to
-          # db::open), and it is the file most likely to gain one, so it is
-          # audited like every other module.
+          # Nothing under crates/perch-ffi/src or crates/perch-mcp/src is
+          # excluded — neither performs a write of its own (both delegate to
+          # perch-core), so every module in them is audited alike.
           WRITES='fs::write|fs::remove_file|fs::remove_dir|File::create|OpenOptions'
           FFI_SRC_DIR=crates/perch-ffi/src
           # perch-mcp reads the index read-only and answers on stdout; nothing
           # in it has any business writing a file, so nothing is excluded.
           MCP_SRC_DIR=crates/perch-mcp/src
-          SRC_TAURI_SRC_DIR=src-tauri/src
 
           # Only the production half of each file is audited. Test modules write
           # fixtures into a tempdir, which is legitimate and never ships; `prod`
@@ -229,26 +177,6 @@ jobs:
             echo "::error::Guard self-test failed: the #[cfg(test)] exclusion is not excluding."
             exit 1
           fi
-
-          # Positive control for the src-tauri coverage: a fixture placed as if
-          # it were src-tauri/src/x.rs (never the real source tree — this lives
-          # entirely under /tmp) must trip the guard.
-          SELFTEST_ROOT=/tmp/no-network-selftest-write
-          rm -rf "$SELFTEST_ROOT"
-          mkdir -p "$SELFTEST_ROOT/$SRC_TAURI_SRC_DIR"
-          printf 'fn main() { File::create("/tmp/x").unwrap(); }\n' \
-            > "$SELFTEST_ROOT/$SRC_TAURI_SRC_DIR/x.rs"
-          offending=0
-          for f in $(cd "$SELFTEST_ROOT" && find "$SRC_TAURI_SRC_DIR" -name '*.rs'); do
-            if prod "$SELFTEST_ROOT/$f" | grep -qE "$WRITES"; then
-              offending=1
-            fi
-          done
-          if [ "$offending" -ne 1 ]; then
-            echo "::error::Guard self-test failed: the write guard no longer reaches $SRC_TAURI_SRC_DIR."
-            exit 1
-          fi
-          rm -rf "$SELFTEST_ROOT"
 
           # Positive control for the perch-ffi coverage: a fixture placed as if
           # it were crates/perch-ffi/src/x.rs (never the real source tree — this
@@ -327,156 +255,67 @@ jobs:
                        ! -path 'crates/perch-core/src/db.rs' \
                        ! -path 'crates/perch-core/src/settings/store.rs') \
                    $(find "$FFI_SRC_DIR" -name '*.rs') \
-                   $(find "$MCP_SRC_DIR" -name '*.rs') \
-                   $(find "$SRC_TAURI_SRC_DIR" -name '*.rs'); do
+                   $(find "$MCP_SRC_DIR" -name '*.rs'); do
             if prod "$f" | grep -E "$WRITES"; then
               offenders=1
             fi
           done
           if [ "$offenders" -ne 0 ]; then
-            echo "::error::perch-core, perch-ffi, perch-mcp, or the app crate gained a filesystem-writing call. Perch is read-only with respect to ~/.claude."
+            echo "::error::perch-core, perch-ffi or perch-mcp gained a filesystem-writing call. Perch is read-only with respect to ~/.claude."
             exit 1
           fi
 
-          echo "no filesystem writes found in perch-core (db.rs and settings/store.rs excluded), $FFI_SRC_DIR, $MCP_SRC_DIR, or $SRC_TAURI_SRC_DIR (nothing excluded)"
+          echo "no filesystem writes found in perch-core (db.rs and settings/store.rs excluded), $FFI_SRC_DIR, or $MCP_SRC_DIR (nothing excluded)"
 
       - name: Assert forbidden crates are unreachable in the resolved dependency graph
         run: |
           set -uo pipefail
 
-          # A lockfile lists every platform's dependencies — tauri declares
-          # reqwest/hyper as dependencies of its Android/iOS targets, which we
-          # never build, so a plain `grep Cargo.lock` here produced a false
-          # positive (found by actually running this check by hand). `cargo
-          # tree -i` against the HOST build graph keeps the property we
-          # wanted from the lockfile scan — catching transitive pulls that no
-          # manifest names — while ignoring deps gated to platforms this
-          # workspace never builds.
+          # A lockfile lists every platform's dependencies, including ones
+          # gated to targets this workspace never builds — which produced a
+          # false positive when this was a plain `grep Cargo.lock` (found by
+          # actually running the check by hand). `cargo tree -i` against the
+          # HOST build graph keeps the property we wanted from the lockfile
+          # scan — catching transitive pulls that no manifest names — while
+          # ignoring deps that can never be compiled here.
           FORBIDDEN="reqwest hyper ureq curl isahc surf sentry posthog segment mixpanel datadog"
 
           # `cargo tree -i <crate-absent-from-the-graph>` prints a "nothing to
           # print" warning to stderr and exits 0 (verified by hand: `cargo
-          # tree -i reqwest -p perch-app; echo $?` prints the warning and
+          # tree -i reqwest -p perch-core; echo $?` prints the warning and
           # `0`). So this checks stdout content, never the exit code — trusting
           # the exit code here would make every iteration of the loop below
           # silently "pass" regardless of what is actually in the graph.
           #
           # Positive control: the probe must find a crate that IS present, or
-          # a broken invocation would silently pass everything. Uses the same
-          # ${{ matrix.cargo-scope }} the loop below consumes (not a
-          # hardcoded -p perch-core) — serde is depended on by every
-          # workspace member, so this also proves the scope string itself is
-          # well-formed. A malformed scope (e.g. a typo'd flag) would make
-          # every `cargo tree` call below fail with empty stdout, which reads
-          # as "crate absent" and would let the job report clean; catching
-          # that here is the whole point of a self-test, so it must fail the
-          # same way the real check would.
-          if ! cargo tree -i serde ${{ matrix.cargo-scope }} --edges normal 2>/dev/null | grep -q '^serde '; then
-            echo "::error::Guard self-test failed: cargo tree did not find serde under scope '${{ matrix.cargo-scope }}'."
+          # a broken invocation would silently pass everything. serde is
+          # depended on by every workspace member, so this also proves the
+          # invocation itself is well-formed. A malformed one (e.g. a typo'd
+          # flag) would make every `cargo tree` call below fail with empty
+          # stdout, which reads as "crate absent" and would let the job report
+          # clean; catching that here is the whole point of a self-test.
+          if ! cargo tree -i serde --workspace --edges normal 2>/dev/null | grep -q '^serde '; then
+            echo "::error::Guard self-test failed: cargo tree did not find serde in the workspace graph."
             exit 1
           fi
 
           for crate in $FORBIDDEN; do
-            if cargo tree -i "$crate" ${{ matrix.cargo-scope }} --edges normal 2>/dev/null | grep -q "^$crate "; then
+            if cargo tree -i "$crate" --workspace --edges normal 2>/dev/null | grep -q "^$crate "; then
               echo "::error::Forbidden crate '$crate' is reachable in the resolved dependency graph."
-              cargo tree -i "$crate" ${{ matrix.cargo-scope }} --edges normal
+              cargo tree -i "$crate" --workspace --edges normal
               exit 1
             fi
           done
 
-          echo "resolved-graph check clean (${{ matrix.cargo-scope }})"
-
-      - name: Assert the frontend has no outbound surface
-        run: |
-          set -uo pipefail
-
-          # Every guard above audits Rust. The popover is a web view, and its
-          # only protection until now was the CSP string in tauri.conf.json,
-          # which nothing verified. Two halves: the CSP must still be exactly
-          # `default-src 'self'`, and no frontend source may name a network API
-          # or an absolute http(s) URL.
-          TAURI_CONF=src-tauri/tauri.conf.json
-          CSP_EXPECTED="\"csp\": \"default-src 'self'\""
-          NET='fetch\(|WebSocket|XMLHttpRequest|EventSource|navigator\.sendBeacon|https?://'
-
-          # The exact accepted form must match, or a typo in CSP_EXPECTED would
-          # fail the build for the wrong reason and get "fixed" by weakening it.
-          Q="'"
-          printf '{ "security": { "csp": "default-src %sself%s" } }\n' "$Q" "$Q" > /tmp/csp-selftest-ok.json
-          if ! grep -qF "$CSP_EXPECTED" /tmp/csp-selftest-ok.json; then
-            echo "::error::Guard self-test failed: the CSP pattern no longer matches the accepted policy."
-            exit 1
-          fi
-          # And a widened policy must NOT match: this is the failure the guard exists to catch.
-          printf '{ "security": { "csp": "default-src %sself%s https://evil.example" } }\n' \
-            "$Q" "$Q" > /tmp/csp-selftest-weak.json
-          if grep -qF "$CSP_EXPECTED" /tmp/csp-selftest-weak.json; then
-            echo "::error::Guard self-test failed: a widened CSP still matches the expected policy."
-            exit 1
-          fi
-
-          if ! grep -qF "$CSP_EXPECTED" "$TAURI_CONF"; then
-            echo "::error::$TAURI_CONF no longer sets exactly \"csp\": \"default-src 'self'\"."
-            exit 1
-          fi
-
-          # Scans the frontend sources and the HTML entry point. Deliberately
-          # scoped to src/ and index.html: the $schema URL in
-          # src-tauri/capabilities/default.json is a JSON-schema reference, not
-          # an outbound request, and widening this glob to catch it would only
-          # teach the next person to loosen the pattern.
-          frontend_hits() {
-            { find src \( -name '*.ts' -o -name '*.tsx' \) -print0; printf '%s\0' index.html; } \
-              | xargs -0 grep -nE "$NET"
-          }
-
-          # Positive control: the pattern must detect a known offender.
-          printf 'const r = await fetch("https://example.com/x")\n' > /tmp/net-selftest.ts
-          if ! grep -qE "$NET" /tmp/net-selftest.ts; then
-            echo "::error::Guard self-test failed: the network pattern no longer detects a known offender."
-            exit 1
-          fi
-
-          # Positive control for the coverage: fixtures placed as if they were a
-          # nested src/*.tsx and index.html (never the real tree — these live
-          # entirely under /tmp) must both be found through the exact
-          # frontend_hits path the real check uses.
-          SELFTEST_ROOT=/tmp/no-network-selftest-frontend
-          rm -rf "$SELFTEST_ROOT"
-          mkdir -p "$SELFTEST_ROOT/src/nested"
-          printf 'new WebSocket("wss://example.com")\n' > "$SELFTEST_ROOT/src/nested/x.tsx"
-          printf '<script src="https://cdn.example/x.js"></script>\n' > "$SELFTEST_ROOT/index.html"
-          # `|| true` because GitHub runs these steps under `bash -e`, where a
-          # grep that matches nothing returns 1 and kills the step before it
-          # can report anything. A clean tree is the normal case, so without
-          # this the guard fails exactly when it should pass.
-          selftest_hits=$( cd "$SELFTEST_ROOT" && frontend_hits || true )
-          if ! printf '%s\n' "$selftest_hits" | grep -q 'src/nested/x.tsx'; then
-            echo "::error::Guard self-test failed: the frontend scan no longer reaches nested src/*.tsx."
-            exit 1
-          fi
-          if ! printf '%s\n' "$selftest_hits" | grep -q '^index.html'; then
-            echo "::error::Guard self-test failed: the frontend scan no longer reaches index.html."
-            exit 1
-          fi
-          rm -rf "$SELFTEST_ROOT"
-
-          hits=$(frontend_hits || true)
-          if [ -n "$hits" ]; then
-            printf '%s\n' "$hits"
-            echo "::error::The frontend gained an outbound network call or an absolute URL. The popover talks only to the Tauri backend."
-            exit 1
-          fi
-
-          echo "frontend outbound surface clean (CSP pinned; no network APIs or absolute URLs in src/ or index.html)"
+          echo "resolved-graph check clean (--workspace)"
 
       - name: Assert the native macOS app has no outbound network surface
         run: |
           set -uo pipefail
 
-          # The Swift app is a second UI surface (the native replacement for
-          # the popover), so it gets the same promise as the frontend guard
-          # above: no network APIs, no absolute http(s) URLs. Scoped to
+          # Every guard above audits Rust. The Swift app is the UI surface, and
+          # it gets the same promise the data layer does: no network APIs, no
+          # absolute http(s) URLs. Scoped to
           # Sources/Perch (the hand-written app) and NOT Sources/PerchFFI,
           # which is UniFFI's generated bindings — produced by
           # scripts/build-xcframework.sh, git-ignored, and simply absent on a
