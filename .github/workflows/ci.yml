@@ -619,6 +619,50 @@ jobs:
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
+      - name: Assert the version is stated once
+        run: |
+          set -uo pipefail
+
+          # Cargo.toml and Info.plist each carry the version independently, and
+          # nothing makes them agree. A release whose tag, crate version and
+          # bundle version disagree is confusing in exactly the places a user
+          # looks when reporting a bug, so the disagreement is caught here
+          # rather than at tag time.
+          PLIST=apps/macos/Perch/Resources/Info.plist
+          cargo_version() { sed -n 's/^version = "\(.*\)"/\1/p' "$1" | head -1; }
+          plist_version() { /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$1"; }
+
+          # Positive controls: both readers must actually read, through the
+          # exact functions the real check uses. A reader that silently returns
+          # the empty string would otherwise make every version "agree".
+          SELFTEST=/tmp/version-selftest
+          rm -rf "$SELFTEST"; mkdir -p "$SELFTEST"
+          printf '[workspace.package]\nversion = "9.9.9"\n' > "$SELFTEST/Cargo.toml"
+          if [ "$(cargo_version "$SELFTEST/Cargo.toml")" != "9.9.9" ]; then
+            echo "::error::Guard self-test failed: the Cargo.toml version reader no longer reads a version."
+            exit 1
+          fi
+          /usr/libexec/PlistBuddy -c 'Add :CFBundleShortVersionString string 9.9.9' \
+            "$SELFTEST/Info.plist" >/dev/null
+          if [ "$(plist_version "$SELFTEST/Info.plist")" != "9.9.9" ]; then
+            echo "::error::Guard self-test failed: the Info.plist version reader no longer reads a version."
+            exit 1
+          fi
+          rm -rf "$SELFTEST"
+
+          CARGO=$(cargo_version Cargo.toml)
+          BUNDLE=$(plist_version "$PLIST")
+          echo "Cargo.toml=$CARGO $PLIST=$BUNDLE"
+          if [ -z "$CARGO" ] || [ "$CARGO" != "$BUNDLE" ]; then
+            echo "::error::Cargo.toml says '$CARGO' and $PLIST says '$BUNDLE'. They must agree."
+            exit 1
+          fi
+
       - run: scripts/build-xcframework.sh
-      - run: swift build -c release
+      # `make release`, not `swift build`, so the path a tag will take is
+      # exercised on every run. It builds both architectures and lipos them,
+      # because `swift build --arch arm64 --arch x86_64` in one invocation
+      # cannot resolve the binaryTarget xcframework; a release is not the place
+      # to discover that has regressed.
+      - run: make release
         working-directory: apps/macos/Perch
