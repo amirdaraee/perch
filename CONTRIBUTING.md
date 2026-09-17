@@ -113,9 +113,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-**Known flakes:** four tests in `ui::watcher` depend on wall-clock timing and
-fail under a loaded parallel run. They pass with `--test-threads=1`. If those
-four are your only failures, they are not your fault.
+All of it should pass, every time. If something fails intermittently, that is a
+bug worth reporting rather than something to re-run until it goes green.
 
 ## Tests
 

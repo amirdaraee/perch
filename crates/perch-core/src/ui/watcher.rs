@@ -94,9 +94,10 @@ impl Drop for WatcherHandle {
     }
 }
 
-/// Start watching. Emits the current list immediately, then on every change
-/// (debounced, trailing-edge) and at least every `poll` as a backstop — a session
-/// whose process dies produces no filesystem event, so polling is what removes it.
+/// Start watching. Emits the current list immediately, again once the
+/// filesystem watch is live, then on every change (debounced, trailing-edge)
+/// and at least every `poll` as a backstop — a session whose process dies
+/// produces no filesystem event, so polling is what removes it.
 ///
 /// `on_refresh` runs on the watcher thread, only when an explicit
 /// `WatcherHandle::refresh()` call is processed — never on the initial emit,
@@ -150,13 +151,28 @@ fn run<F, R>(
         }
     };
 
+    // Emit BEFORE registering the watch. The first list is a plain directory
+    // read and does not depend on the watch at all, whereas `watch()` can be
+    // slow: macOS's FSEvents backend serialises registration globally, and a
+    // contended call has been measured here taking seconds against ~20µs
+    // uncontended. Registering first meant the menu had nothing in it until
+    // the OS was ready — for no reason, since the answer was already to hand.
+    emit(&*probe);
+
     // A fresh Claude Code install has no `sessions` directory yet, and notify
     // then fails with `path_not_found`. Fall through to a poll-only loop and
     // retry `watch()` on every tick. The directory is never created here —
     // Perch is strictly read-only with respect to the Claude Code directory.
     let mut watching = try_watch(watcher.as_mut(), &dir, cfg.poll, false);
 
+    // And emit again now the watch is live. A change made while `watch()` was
+    // still registering produced no event for it to catch, so without this the
+    // change would wait for the poll backstop — which the emit above made more
+    // likely, not less, by handing out an answer before the watch existed.
+    // Cheap (one directory read) and idempotent: the list is a value, not a
+    // delta, so a repeat is a repeat and not a lost update.
     emit(&*probe);
+
     let mut last = Instant::now();
     // Set when an event arrives inside the debounce dead window and gets
     // dropped: the next wait ends at the debounce boundary instead of the
@@ -245,6 +261,21 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::Mutex;
 
+    /// macOS's FSEvents backend serialises watch registration globally.
+    /// Measured here, a `watch()` call with three others in flight took
+    /// 2.3-3.7s, against ~20us uncontended. Perch registers exactly one watch
+    /// in production, so that contention exists only because these four tests
+    /// run in parallel with each other. Serialising them removes the artefact,
+    /// rather than inflating every deadline until it is hidden.
+    static WATCH_REGISTRATION: Mutex<()> = Mutex::new(());
+
+    fn serialised() -> std::sync::MutexGuard<'static, ()> {
+        // A panicking test poisons the lock. The guarded data is `()`, so
+        // there is nothing to be left inconsistent and the remaining tests
+        // should still run.
+        WATCH_REGISTRATION.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     struct AllAlive;
     impl ProcessProbe for AllAlive {
         fn is_alive(&self, _pid: i32) -> bool {
@@ -263,7 +294,8 @@ mod tests {
     }
 
     #[test]
-    fn emits_once_on_start_and_again_on_change() {
+    fn emits_immediately_on_start_and_again_on_change() {
+        let _serial = serialised();
         let tmp = tempfile::tempdir().unwrap();
         write_record(tmp.path(), 1, "one");
         let (tx, rx) = mpsc::channel();
@@ -310,6 +342,7 @@ mod tests {
 
     #[test]
     fn missing_directory_falls_back_to_polling_and_never_creates_it() {
+        let _serial = serialised();
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("sessions");
         let (tx, rx) = mpsc::channel();
@@ -370,28 +403,43 @@ mod tests {
         // keep nudging the file (each write distinct, so each is a real
         // filesystem event) until one is observed — deterministic once the
         // watch is truly live, and still bounded well under the poll.
-        let promoted_deadline = Instant::now() + Duration::from_millis(1500);
-        let mut promoted = false;
+        // Count emits over a burst rather than timing a single one. A
+        // poll-only loop emits at most once per `poll`, so at most once in a
+        // 1.2s burst against a 2s poll; a live watch emits once per (debounced)
+        // change. Several emits inside one burst is therefore something the
+        // poll backstop cannot produce — whereas a single fast response can be,
+        // if a poll tick happens to land just after a write, which is why that
+        // is not what this asserts.
+        //
+        // The burst is retried because promotion happens on a poll tick and
+        // `try_watch()` can itself be slow. Retrying costs nothing and removes
+        // the only wall-clock assumption left: how long promotion takes. How
+        // strong the proof is depends on the burst, not on the outer deadline.
+        let overall_deadline = Instant::now() + Duration::from_secs(20);
+        let mut proved = false;
         let mut attempt = 0;
-        while Instant::now() < promoted_deadline {
-            attempt += 1;
-            write_record(&missing, 4, &format!("four-{attempt}"));
-            if let Ok(s) = rx.recv_timeout(Duration::from_millis(100)) {
-                if s.len() == 2 {
-                    promoted = true;
-                    break;
+        while Instant::now() < overall_deadline && !proved {
+            let burst_end = Instant::now() + Duration::from_millis(1200);
+            let mut emits = 0;
+            while Instant::now() < burst_end {
+                attempt += 1;
+                write_record(&missing, 4, &format!("four-{attempt}"));
+                if rx.recv_timeout(Duration::from_millis(150)).is_ok() {
+                    emits += 1;
                 }
             }
+            proved = emits >= 3;
         }
         assert!(
-            promoted,
-            "a change after promotion must surface via the watch, well under the 2s poll interval"
+            proved,
+            "after promotion, repeated changes must produce more emits inside one 1.2s burst than a 2s poll could ever account for"
         );
         h.stop();
     }
 
     #[test]
     fn refresh_forces_an_immediate_emit() {
+        let _serial = serialised();
         let tmp = tempfile::tempdir().unwrap();
         let (tx, rx) = mpsc::channel();
         let h = spawn(
@@ -433,6 +481,7 @@ mod tests {
         // some other platform's self-join genuinely hangs instead of
         // panicking: this test then fails via timeout rather than hanging
         // the test binary itself.
+        let _serial = serialised();
         let tmp = tempfile::tempdir().unwrap();
         let handle_slot: Arc<Mutex<Option<WatcherHandle>>> = Arc::new(Mutex::new(None));
         let slot = handle_slot.clone();
