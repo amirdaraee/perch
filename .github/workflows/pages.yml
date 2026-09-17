@@ -1,0 +1,114 @@
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths: ["site/**", ".github/workflows/pages.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; don't cancel a run that is mid-publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The site makes the same promise the app does, so it gets the same kind
+      # of guard. A landing page that says "no telemetry" while pulling a
+      # typeface from Google contradicts itself in its own network tab, and the
+      # audience for this app is exactly the audience that looks.
+      - name: Assert the site makes no third-party requests
+        run: |
+          set -uo pipefail
+
+          # What the page FETCHES, not what it links to. A plain
+          # <a href="https://github.com/…"> is a navigation the reader chooses;
+          # a <link href>, <script src>, <img src>, @import or CSS url() is a
+          # request the page makes on its own, and those must all be local.
+          #
+          # Deliberately POSIX -E, no -P: a lookahead would be more compact but
+          # BSD grep has no -P at all, so the guard could not be run by hand on
+          # a Mac before pushing — and a guard nobody can run locally is one
+          # that only ever fails in CI.
+          Q='"'"'"'"'
+          FETCH="src=[\"$Q]https?://|<link[^>]*href=[\"$Q]https?://|@import|url\([[:space:]]*[\"$Q]?https?://"
+
+          # Positive controls: the pattern must catch the real offenders,
+          # through the same grep the check below uses.
+          SELFTEST=/tmp/site-selftest
+          rm -rf "$SELFTEST"; mkdir -p "$SELFTEST"
+          printf '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter">\n' \
+            > "$SELFTEST/font.html"
+          printf '<script src="https://cdn.example/analytics.js"></script>\n' \
+            > "$SELFTEST/cdn.html"
+          printf '<img src="https://tracker.example/pixel.gif">\n' > "$SELFTEST/pixel.html"
+          printf '@import url("https://evil.example/x.css");\n' > "$SELFTEST/import.css"
+          printf 'body { background: url(https://evil.example/bg.png); }\n' > "$SELFTEST/bg.css"
+          for f in font.html cdn.html pixel.html import.css bg.css; do
+            if ! grep -qE "$FETCH" "$SELFTEST/$f"; then
+              echo "::error::Guard self-test failed: the pattern no longer catches $f."
+              exit 1
+            fi
+          done
+          # Local references and ordinary outbound links must NOT match, or the
+          # guard fails the build for the wrong reason and gets "fixed" by
+          # weakening it.
+          printf '<link rel="stylesheet" href="style.css">\n<img src="screenshots/a.png">\n<a href="https://github.com/amirdaraee/perch">source</a>\n' \
+            > "$SELFTEST/ok.html"
+          printf 'body { background: url("bg.png"); }\n' > "$SELFTEST/ok.css"
+          for f in ok.html ok.css; do
+            if grep -qE "$FETCH" "$SELFTEST/$f"; then
+              echo "::error::Guard self-test failed: a local reference or plain link matched in $f."
+              grep -nE "$FETCH" "$SELFTEST/$f"
+              exit 1
+            fi
+          done
+          rm -rf "$SELFTEST"
+
+          if grep -rEn "$FETCH" site/ --include='*.html' --include='*.css'; then
+            echo "::error::The site gained a third-party request. It must load nothing but its own files."
+            exit 1
+          fi
+
+          echo "site loads only its own files"
+
+      - name: Assert every referenced file exists
+        run: |
+          set -uo pipefail
+          missing=0
+          # Local src="…" / href="…" values, minus anchors and absolute URLs.
+          refs=$(grep -rhoE '(src|href)="[^"]+"' site/ --include='*.html' \
+                 | sed -E 's/^(src|href)="//; s/"$//' \
+                 | grep -vE '^(https?:|#|mailto:|data:)' | sort -u)
+          for r in $refs; do
+            if [ ! -f "site/$r" ]; then
+              echo "::error::site/index.html references site/$r, which does not exist."
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          echo "every referenced file is present"
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

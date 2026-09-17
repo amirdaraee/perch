@@ -1,0 +1,259 @@
+/* Perch — landing page.
+ *
+ * Hand-written, no framework, no build step, no third-party request. System
+ * fonts only: a page whose headline claim is "this app talks to nothing" has
+ * no business fetching a typeface from Google.
+ */
+
+:root {
+  color-scheme: light dark;
+
+  --bg: #fbfaf8;
+  --bg-band: #f3f1ed;
+  --surface: #ffffff;
+  --ink: #1b1a17;
+  --ink-soft: #55514a;
+  --rule: #e4e0d9;
+  --accent: #b4531a;
+  --accent-ink: #ffffff;
+  --code-bg: #f0ede8;
+
+  --measure: 34rem;
+  --wrap: 60rem;
+  --radius: 10px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #171614;
+    --bg-band: #1f1e1b;
+    --surface: #232220;
+    --ink: #eceae6;
+    --ink-soft: #a9a49b;
+    --rule: #33312d;
+    --accent: #e8813f;
+    --accent-ink: #1b1a17;
+    --code-bg: #121110;
+  }
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
+        Roboto, "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+img { max-width: 100%; height: auto; display: block; }
+
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+a:hover { text-decoration-thickness: 2px; }
+
+code, pre {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.875em;
+}
+
+.wrap {
+  width: 100%;
+  max-width: var(--wrap);
+  margin-inline: auto;
+  padding-inline: 20px;
+}
+
+/* ---- Hero ---------------------------------------------------------------- */
+
+.hero {
+  padding-block: clamp(3rem, 9vw, 6rem);
+  text-align: center;
+  border-bottom: 1px solid var(--rule);
+  background: linear-gradient(to bottom, var(--bg-band), var(--bg));
+}
+
+.hero h1 {
+  margin: 0;
+  font-size: clamp(2.75rem, 9vw, 4.25rem);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1.05;
+}
+
+.tagline {
+  margin: 1rem auto 0;
+  max-width: 28rem;
+  font-size: clamp(1.0625rem, 2.4vw, 1.25rem);
+  color: var(--ink-soft);
+  text-wrap: balance;
+}
+
+.cta {
+  margin-top: 2rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  justify-content: center;
+}
+
+.button {
+  display: inline-block;
+  padding: 0.7rem 1.4rem;
+  border-radius: var(--radius);
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+  text-decoration: none;
+  border: 1px solid transparent;
+}
+
+.button:hover { filter: brightness(1.08); text-decoration: none; }
+
+.button.ghost {
+  background: transparent;
+  color: var(--ink);
+  border-color: var(--rule);
+}
+
+.button.ghost:hover { background: var(--surface); filter: none; }
+
+.fineprint {
+  margin-top: 0.9rem;
+  font-size: 0.8125rem;
+  color: var(--ink-soft);
+}
+
+/* ---- Screenshots --------------------------------------------------------- */
+
+.shot { margin: 0; }
+
+.shot img {
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 0.10);
+}
+
+.hero-shot { margin-top: clamp(2.5rem, 6vw, 4rem); }
+
+/* The menu shot is portrait and much taller than the landscape ones. Left
+   unconstrained it stretches its whole grid row, and the paragraph beside it
+   floats in the middle of an empty half-screen. */
+.shot.tall img {
+  max-height: 30rem;
+  width: auto;
+  margin-inline: auto;
+}
+
+/* ---- Sections ------------------------------------------------------------ */
+
+.band { padding-block: clamp(3rem, 8vw, 5rem); }
+
+/* Tinted bands. They carry `band` too, so the padding comes from there —
+   adding it to .wrap as well would double it. */
+section.privacy, section.install {
+  background: var(--bg-band);
+  border-block: 1px solid var(--rule);
+}
+
+h2 {
+  margin: 0 0 0.75rem;
+  font-size: clamp(1.5rem, 4vw, 2rem);
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  text-wrap: balance;
+}
+
+h3 {
+  margin: 0 0 0.6rem;
+  font-size: 1.25rem;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+}
+
+p { margin: 0 0 1rem; max-width: var(--measure); }
+
+.lede { font-size: 1.0625rem; color: var(--ink-soft); }
+
+.aside { font-size: 0.9375rem; color: var(--ink-soft); }
+
+pre {
+  margin: 1.25rem 0;
+  padding: 1rem 1.1rem;
+  background: var(--code-bg);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  overflow-x: auto;
+}
+
+pre code { white-space: pre; }
+
+/* ---- Feature rows -------------------------------------------------------- */
+
+.features { display: grid; gap: clamp(3rem, 7vw, 4.5rem);
+            padding-block: clamp(2rem, 5vw, 3rem) clamp(3rem, 8vw, 5rem); }
+
+.feature {
+  display: grid;
+  gap: clamp(1.5rem, 4vw, 3rem);
+  align-items: center;
+  grid-template-columns: 1fr;
+}
+
+.feature-text p { margin-bottom: 0; }
+
+@media (min-width: 46rem) {
+  .feature { grid-template-columns: 1fr 1.15fr; }
+  .feature.reverse .feature-text { order: 2; }
+}
+
+/* ---- Privacy ------------------------------------------------------------- */
+
+.promises {
+  list-style: none;
+  margin: 1.75rem 0;
+  padding: 0;
+  display: grid;
+  gap: 1rem;
+}
+
+@media (min-width: 46rem) {
+  .promises { grid-template-columns: 1fr 1fr; gap: 1.25rem; }
+}
+
+.promises li {
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  padding: 1.1rem 1.25rem;
+  font-size: 0.9375rem;
+  color: var(--ink-soft);
+}
+
+.promises strong { display: block; color: var(--ink); margin-bottom: 0.2rem; }
+
+.promises code { background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 4px; }
+
+/* ---- Install ------------------------------------------------------------- */
+
+.steps { max-width: var(--measure); padding-left: 1.2rem; }
+.steps li { margin-bottom: 0.9rem; }
+
+/* ---- Footer -------------------------------------------------------------- */
+
+footer {
+  padding-block: 2.5rem 3.5rem;
+  border-top: 1px solid var(--rule);
+  font-size: 0.875rem;
+  color: var(--ink-soft);
+  text-align: center;
+}
+
+footer p { max-width: none; }
+
+.disclaimer { margin-top: 0.5rem; font-size: 0.8125rem; }

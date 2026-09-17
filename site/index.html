@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Perch — a menu-bar dashboard for Claude Code</title>
+<meta name="description" content="See which Claude Code sessions are working, which are waiting on you, and what they cost. Local, read-only, no network.">
+<link rel="icon" href="favicon.png" type="image/png">
+<link rel="stylesheet" href="style.css">
+
+<!-- No analytics, no fonts, no CDN, no third-party anything. A page that
+     promises "no telemetry" should not contradict itself in its own network
+     tab, and this one doesn't: open devtools and watch. -->
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <h1>Perch</h1>
+    <p class="tagline">
+      A macOS menu-bar dashboard for Claude Code: which sessions are working,
+      which are waiting on&nbsp;you, and what they cost.
+    </p>
+
+    <div class="cta">
+      <a class="button" href="https://github.com/amirdaraee/perch/releases/latest">
+        Download for macOS
+      </a>
+      <a class="button ghost" href="https://github.com/amirdaraee/perch">
+        View source
+      </a>
+    </div>
+    <p class="fineprint">
+      Free and open source (MIT). Requires macOS&nbsp;15+. Universal — Apple
+      Silicon and Intel.
+    </p>
+
+    <figure class="shot hero-shot">
+      <img src="screenshots/main-window.png" alt="Perch's main window, showing a grid of project cards with session counts, token usage and 14-day sparklines." width="1280" height="572">
+    </figure>
+  </div>
+</header>
+
+<main>
+
+<section class="wrap band">
+  <h2>A session waited 32 hours and nobody noticed</h2>
+  <p class="lede">
+    That's the bug Perch was written for. If you run more than one Claude Code
+    session, they scroll off, get buried behind a fullscreen window, and sit
+    quietly on a permission prompt. Perch reads what Claude Code already writes
+    to disk and puts the answer in your menu bar.
+  </p>
+</section>
+
+<section class="wrap features">
+
+  <article class="feature">
+    <div class="feature-text">
+      <h3>Know which session is stuck</h3>
+      <p>
+        Working, idle, or waiting on you — and which terminal owns it. Turn on
+        the notification and Perch tells you once per episode when a session has
+        been waiting longer than you're willing to let it, with a per-project
+        override for the ones that are allowed to sit.
+      </p>
+    </div>
+    <figure class="shot tall">
+      <img src="screenshots/menu.png" alt="The Perch menu open in the macOS menu bar, listing live sessions with their status and project." width="360" height="621" loading="lazy">
+    </figure>
+  </article>
+
+  <article class="feature reverse">
+    <div class="feature-text">
+      <h3>See where the tokens went</h3>
+      <p>
+        Per project and per model, over whatever window you pick. Fourteen days
+        of token-class bars, a top-projects ranking, and a sparkline on every
+        project card. A model with no price contributes its tokens and is named
+        as unpriced — never quietly counted as&nbsp;$0.
+      </p>
+    </div>
+    <figure class="shot">
+      <img src="screenshots/usage.png" alt="Perch's usage view, with hero statistics, a 14-day bar chart of token classes and a per-model breakdown." width="1280" height="660" loading="lazy">
+    </figure>
+  </article>
+
+  <article class="feature">
+    <div class="feature-text">
+      <h3>Pick up where you left off</h3>
+      <p>
+        Every project, with its README description, session history and your own
+        notes. Resume an ended session or start a fresh one in the project's own
+        directory, in your terminal — Terminal, iTerm2, Warp, Ghostty,
+        Alacritty, Kitty and WezTerm.
+      </p>
+    </div>
+    <figure class="shot">
+      <img src="screenshots/project.png" alt="A project detail view in Perch, showing aggregate statistics, a sparkline and the project's session history." width="1280" height="660" loading="lazy">
+    </figure>
+  </article>
+
+</section>
+
+<section class="band privacy">
+  <div class="wrap">
+    <h2>Your transcripts stay yours</h2>
+    <p class="lede">
+      Transcripts contain source code, pasted secrets and client names. An app
+      that reads them owes you more than a promise, so these are enforced by the
+      build:
+    </p>
+
+    <ul class="promises">
+      <li>
+        <strong>No network requests.</strong>
+        No HTTP client in the dependency graph, no socket in the source. CI
+        fails the build if either changes, or if any line of Rust or Swift names
+        an absolute <code>http(s)://</code> URL.
+      </li>
+      <li>
+        <strong>No telemetry, analytics or crash reporting.</strong>
+        Not off by default. Absent.
+      </li>
+      <li>
+        <strong>Read-only.</strong>
+        Perch never writes to, moves or deletes anything in your Claude Code
+        directory. CI fails the build if a filesystem-writing call appears
+        anywhere it shouldn't.
+      </li>
+      <li>
+        <strong>No transcript contents leave the parser.</strong>
+        Perch reads transcripts to count tokens and detect state. No message
+        text reaches a window, a notification, a log line or the MCP server.
+      </li>
+    </ul>
+
+    <p class="aside">
+      153 packages in the dependency graph, all of it MIT-licensed and on
+      GitHub. It's a small enough pile that a suspicious person can check these
+      claims in an afternoon, which is the point.
+    </p>
+  </div>
+</section>
+
+<section class="wrap band">
+  <h2>Claude Code can ask Perch things</h2>
+  <p class="lede">
+    Perch ships a read-only MCP server inside the app bundle, so Claude Code can
+    query your own projects, live sessions and usage.
+  </p>
+<pre><code>claude mcp add --scope user perch -- /Applications/Perch.app/Contents/MacOS/perch-mcp</code></pre>
+  <p>
+    It opens the index read-only at the SQLite level — writes are refused by the
+    connection itself, not merely avoided — and has no network code at all.
+  </p>
+</section>
+
+<section class="band install">
+  <div class="wrap">
+    <h2>Installing</h2>
+    <ol class="steps">
+      <li>
+        <a href="https://github.com/amirdaraee/perch/releases/latest">Download
+        the latest release</a>, unzip it, and drag <strong>Perch.app</strong> to
+        your Applications folder.
+      </li>
+      <li>
+        <strong>The first launch will be blocked.</strong> Perch is signed, but
+        with an ad-hoc signature rather than a paid Apple Developer ID, so macOS
+        treats it as coming from an unidentified developer. Open
+        <strong>System Settings → Privacy &amp; Security</strong>, scroll to the
+        bottom, and click <strong>“Open Anyway”</strong>.
+      </li>
+      <li>
+        That's it. Perch finds your Claude Code directory on its own, and you
+        can correct it in Settings if it guesses wrong.
+      </li>
+    </ol>
+    <p class="aside">
+      On macOS 15 that second step is the only route — the old right-click →
+      Open trick no longer works for unsigned apps. Removing it needs a paid
+      Apple Developer account, which this project doesn't have yet. If you'd
+      rather not run an unidentified binary at all, that's a reasonable instinct
+      for an app that reads your transcripts:
+      <a href="https://github.com/amirdaraee/perch#building-from-source">building
+      from source</a> is two commands.
+    </p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>
+      <a href="https://github.com/amirdaraee/perch">GitHub</a> ·
+      <a href="https://github.com/amirdaraee/perch/releases">Releases</a> ·
+      <a href="https://github.com/amirdaraee/perch/blob/main/LICENSE">MIT</a>
+    </p>
+    <p class="disclaimer">
+      Perch is an independent project. It is not affiliated with, endorsed by,
+      or sponsored by Anthropic.
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>
