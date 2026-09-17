@@ -1,149 +1,133 @@
 # Perch
 
-A macOS menu-bar dashboard for Claude Code: which sessions are working, which
-are waiting on you, and what they cost.
+A menu bar app that tells you when a Claude Code session is waiting on you.
 
-> **Status:** early. It works and I use it daily, but it is pre-1.0 and the
-> numbers below come with caveats I've tried to state plainly rather than bury.
+![Perch's main window, showing a card for each project with its description, session count, token usage and a two week chart](site/screenshots/main-window.png)
 
-Not affiliated with or endorsed by Anthropic.
+> **Status:** early. I use it every day, but it's pre-1.0 and some of the
+> numbers come with caveats. They're listed below rather than buried.
 
-## Why
+Perch is an independent project. It isn't affiliated with Anthropic, or
+endorsed or sponsored by them.
 
-The problem Perch was written to solve: a Claude Code session sat blocked on a
-permission prompt for 32 hours and nobody noticed. If you run more than one
-session, they scroll off, get buried behind a fullscreen window, and quietly
-wait.
+## Why I wrote it
 
-Perch reads the data Claude Code already writes to disk and answers three
-questions:
+I once left a session waiting for 32 hours. It was sitting on a permission
+prompt, behind a fullscreen window, in a terminal tab I'd forgotten about.
 
-- **Which session is stuck waiting on me, and which terminal owns it?**
-- **What was each project doing, and where did I leave off?**
-- **Where did the tokens go?**
+Perch reads the files Claude Code already writes to your disk and keeps a
+summary in your menu bar, so you can glance up and see what's running and
+what's stuck.
 
-## Privacy
+## Nothing leaves your Mac
 
-Your transcripts contain source code, pasted secrets, and client names. So:
+Your transcripts have your source code in them, and probably a few things you
+pasted in without thinking too hard about it. So Perch doesn't send them
+anywhere. It doesn't send anything anywhere.
 
-- **No telemetry, no analytics, no crash reporting.** Ever.
-- **Read-only.** Perch never writes to, moves, or deletes anything in your
-  Claude Code directory. It writes only to its own folder in
-  `~/Library/Application Support/Perch/`.
-- **No network requests.** There is no HTTP client in the dependency graph and
-  no socket in the source. CI fails the build if either changes, if a telemetry
-  crate becomes reachable in the resolved dependency graph, or if any Rust or
-  Swift source names an absolute `http(s)://` URL.
-- **No transcript contents leave the parser.** Perch reads transcripts to count
-  tokens and detect state. No message text reaches a window, a notification, a
-  log line, or the MCP server.
+* **There's no network code.** No HTTP library in the build, no sockets in the
+  source. CI fails if anyone adds one, or writes an `http://` address into the
+  app at all.
+* **No analytics, no crash reports.** There's no setting to turn off. It was
+  never there.
+* **It doesn't write to your Claude Code folder.** Perch only reads it. Its own
+  database and settings live elsewhere, in
+  `~/Library/Application Support/Perch/`. CI fails if a file-writing call shows
+  up where it shouldn't.
+* **It doesn't keep what it reads.** Perch counts tokens and works out what
+  state a session is in. What your conversations actually say never reaches a
+  window, a notification, a log file, or the MCP server.
 
-A planned future release would add exactly one outbound host, `anthropic.com`,
-to read your own rate-limit status from Anthropic's OAuth usage endpoint. It is
-not in the code today, and this section will change before it is.
+A later version may add one outbound host, `anthropic.com`, to read your own
+rate limit status. It isn't in the code today, and this section will change
+before it is.
 
-## Install
+## Installing
 
-Requires **macOS 15 or later**.
+You need macOS 15 or later.
 
 Download the latest `.zip` from
 [Releases](https://github.com/amirdaraee/perch/releases/latest), unzip it, and
-drag `Perch.app` to `/Applications`.
+drag `Perch.app` into your Applications folder.
 
-**The first launch will be blocked**, and you need to know this in advance or it
-looks like the app is broken. Perch is signed, but with an ad-hoc signature
-rather than a paid Apple Developer ID, so macOS treats it as from an
-unidentified developer. To open it:
+**The first time you open it, macOS will stop you.** I haven't paid Apple $99 a
+year for a developer certificate, so as far as your Mac is concerned Perch comes
+from a stranger. To get past it, open **System Settings**, go to **Privacy &
+Security**, scroll to the bottom, and click **Open Anyway**.
 
-> **System Settings → Privacy & Security**, scroll to the bottom, and click
-> **"Open Anyway"** next to the message about Perch.
+On macOS 15 that's the only way in. Right-clicking and choosing Open used to
+work and doesn't any more. If you'd rather not run an unsigned binary you
+downloaded from someone's website, that seems fair enough to me given what this
+thing reads, and [building it yourself](#building-it-yourself) is two commands.
 
-On macOS 15 this is the only way — the old right-click → Open trick no longer
-works for unsigned apps. Notarization, which removes this step, needs a paid
-Apple Developer account and is not something this project has yet.
+## What it does
 
-If you'd rather not run an unidentified binary at all, that's a reasonable
-instinct for an app that reads your transcripts: [build it from
-source](#building-from-source) instead. It's two commands.
+Perch sits in the menu bar with no Dock icon and shows how many sessions are
+live. Clicking it opens a menu with your usage and a row per session. It's a
+real `NSMenu`, which is what keeps it visible when you're in a fullscreen app.
 
-## What you get
+**Open Perch** opens the main window. You get a card per project with its
+README blurb, session count, tokens, spend, a two week chart, and whether
+anything is running or waiting right now. Click through for that project's
+sessions, your own notes, and its totals. There's a separate Usage view with
+everything broken down by day, by project and by model.
 
-Perch lives in the menu bar with no Dock icon, showing your live-session count.
-Clicking it opens a menu of usage stats and session rows — a real, tracked
-`NSMenu`, which is what keeps it visible over a fullscreen app.
+From a project you can pin it, archive it, rename it, resume a session
+(`claude --resume <id>`), or start a new one. Both open in the project's folder,
+in whichever terminal you use. Perch looks for Terminal, iTerm2, Warp, Ghostty,
+Alacritty, Kitty and WezTerm, and launches your choice by writing a one-shot
+script into its own folder and asking `NSWorkspace` to open it. Doing it that
+way avoids the Automation permission prompt an AppleScript approach needs.
 
-**Open Perch** opens the main window: a card for every project with its
-description, session count, tokens, spend, a 14-day sparkline, and whether
-anything is running or waiting right now. Selecting one shows its full session
-history, your own notes, and aggregate stats. A separate Usage view adds hero
-stats, 14 days of token-class bars, a top-projects ranking, and a per-model
-breakdown.
+**The waiting-on-you notification** is the reason the whole thing exists. Turn
+it on and Perch tells you once when a session has been waiting longer than you
+want. Any project can have its own limit, or none at all. macOS asks for
+notification permission at that point rather than at launch, and if you say no
+the toggle says so instead of quietly doing nothing.
 
-From a project you can pin, archive, rename, resume an ended session
-(`claude --resume <id>`), or start a fresh one — both in the project's own
-directory, in your preferred terminal. Perch finds Terminal, iTerm2, Warp,
-Ghostty, Alacritty, Kitty and WezTerm, and launches whichever you choose by
-writing a one-shot script into its *own* folder and asking `NSWorkspace` to open
-it. That is what avoids the Automation permission prompt an AppleScript
-approach would need.
+**Settings** (⌘,) has nine panes and a search box, so you can find a setting by
+what it does instead of guessing which pane it's in. Each pane shows what your
+current settings actually produce in your own data. Settings live in Perch's own
+`config.toml`, which is watched, so editing it by hand works without a restart.
 
-**The waiting-on-you notification** is the original point of the whole thing.
-Turn it on and Perch tells you, once per episode, when a session has been
-waiting longer than N minutes. Any project can override the threshold from its
-own detail pane. macOS asks for notification permission at that moment rather
-than at launch, and if you later deny it the toggle says so instead of silently
-doing nothing.
+**Diagnostics**, in Settings, answers "why isn't my session showing up?". For
+every session record it found, it says whether it was accepted or exactly why it
+wasn't: no such process, that pid isn't `claude`, or the record wouldn't parse.
 
-**Settings** (⌘,) has nine panes and twenty-seven settings, with a search field
-that narrows every pane to matching rows — so a setting can be found by what it
-does rather than by guessing where it lives. Each pane shows what its settings
-produce *in your own data*: the menu-bar title as it will actually read, how
-many projects clear the active threshold. Settings live in Perch's own
-`config.toml`, are watched for hand edits, and take effect without a relaunch.
+### Things worth knowing
 
-**Diagnostics**, a Settings pane, answers "why isn't my session showing up?"
-For every session record found, it names whether the record was accepted or the
-specific reason it wasn't — no such process, that pid isn't `claude`, or the
-record couldn't be parsed.
-
-### Caveats worth knowing
-
-- **Reported totals are a floor, not a total.** Perch indexes the top-level
-  `*.jsonl` transcripts in each project directory. Subagent transcripts, under
-  `<session-id>/subagents/`, are not yet indexed even though that work is billed
-  separately — so your real usage is higher than what Perch reports, sometimes
-  substantially.
-- **Model prices are placeholders.** The shipped numbers are unverified and the
-  Prices pane lets you correct them. A model with no price contributes its
-  tokens but no cost, and is named as unpriced — never silently counted as $0.
-- **The fullscreen behaviour is correct by construction, not by confirmation.**
-  A tracked `NSMenu` is the documented way to stay visible over a fullscreen
-  app, and two spikes confirmed the alternatives don't. Nobody has yet verified
-  it on a real second display.
+* **The totals are a floor, not a total.** Perch indexes the top-level `.jsonl`
+  transcripts in each project folder. Subagent transcripts, under
+  `<session-id>/subagents/`, aren't indexed yet even though that work is billed
+  separately, so your real usage is higher than what Perch shows. Sometimes a
+  lot higher.
+* **The model prices are placeholders.** I haven't verified them. You can edit
+  them in the Prices pane. If a model has no price, Perch counts its tokens and
+  says it doesn't know the cost rather than showing you a zero.
+* **The fullscreen behaviour is right by construction, not by testing.** A
+  tracked `NSMenu` is the documented way to stay visible over a fullscreen app,
+  and two spikes confirmed the alternatives don't work. Nobody has actually
+  confirmed it on a second display yet.
 
 ## MCP server
 
-Perch ships `perch-mcp`, a read-only [MCP](https://modelcontextprotocol.io)
-server, inside the app bundle. It lets Claude Code itself ask about your
-projects, live sessions and usage.
-
-Register it:
+There's a small read-only MCP server inside the app bundle, so Claude Code can
+ask about your own projects and usage.
 
 ```bash
 claude mcp add --scope user perch -- /Applications/Perch.app/Contents/MacOS/perch-mcp
 ```
 
-Settings → Advanced has this line with your actual path, ready to copy.
+Settings → Advanced has that line with your actual path, ready to copy.
 
-Four tools: `list_projects`, `get_project`, `live_sessions`, `usage_summary`.
-It opens Perch's index read-only, at the SQLite level — writes are refused by
-the connection itself, not merely avoided — and has no network code at all.
-Every response carries `index_updated_at` so an answer is never mistaken for
-being fresher than the index it came from.
+Four tools: `list_projects`, `get_project`, `live_sessions`, `usage_summary`. It
+opens the database in read-only mode, so SQLite itself refuses writes rather
+than the code merely avoiding them, and it has no network code in it. Every
+answer carries `index_updated_at`, so you can tell how fresh it is.
 
-## Building from source
+## Building it yourself
 
-Requires macOS 15+, [Rust](https://rustup.rs) and Swift 6.
+You need macOS 15 or later, [Rust](https://rustup.rs) and Swift 6.
 
 ```bash
 scripts/build-xcframework.sh        # builds perch-ffi, emits the xcframework + Swift bindings
@@ -151,14 +135,14 @@ cd apps/macos/Perch && make bundle  # builds and bundles build/Perch.app
 open build/Perch.app
 ```
 
-`apps/macos/Perch` is a SwiftPM executable; there is no Xcode project. The
-xcframework and the generated Swift bindings are build output and git-ignored —
-always regenerate them rather than trusting a checked-in copy, which is a
-classic source of FFI bugs.
+`apps/macos/Perch` is a SwiftPM executable; there's no Xcode project. The
+xcframework and the generated Swift bindings are build output and git-ignored.
+Always regenerate them rather than trusting a copy someone checked in, which is
+a classic way to get very confusing FFI bugs.
 
-## Just the data layer
+## Just the numbers
 
-If you only want the numbers, the CLI needs nothing but Rust:
+If you only want the data, the CLI needs nothing but Rust:
 
 ```bash
 cargo run --release -p perch-cli -- index
@@ -167,42 +151,40 @@ cargo run --release -p perch-cli -- usage
 cargo run --release -p perch-cli -- models
 ```
 
-Perch finds your Claude Code data at `$CLAUDE_CONFIG_DIR`, then
-`$XDG_CONFIG_HOME/claude`, then `~/.claude`. Override with `--config-dir`.
+Perch looks for your Claude Code folder at `$CLAUDE_CONFIG_DIR`, then
+`$XDG_CONFIG_HOME/claude`, then `~/.claude`. `--config-dir` overrides it.
 
 ## How it works
 
-Transcripts are append-only, so Perch stores a byte offset per file and
-re-parses only new bytes on each pass. A full re-index of 120 MB happens once;
-every pass after that costs microseconds per active session.
+Transcripts only ever get appended to, so Perch remembers a byte offset per file
+and only re-reads what's new. Indexing 120 MB happens once; after that each pass
+costs microseconds per active session.
 
-Project paths come from the `cwd` field inside transcripts, never from decoding
-the directory name. That encoding flattens both `/` and `.` into `-`, so
-`-Users-me-projects-foo-github-io` is ambiguous, and decoding it picks the wrong
-directory.
+Project paths come from the `cwd` field inside the transcripts, never from
+decoding the folder name. That encoding flattens both `/` and `.` into `-`, so
+`-Users-me-code-someone-github-io` is ambiguous and decoding it picks the wrong
+folder about as often as the right one.
 
-The whole view-model — every string the UI shows, including the em dash that
-means "not known" and the pluralised "N sessions are waiting on you" — is built
-in Rust (`perch-core`) and exposed to Swift through
-[UniFFI](https://github.com/mozilla/uniffi-rs). Swift draws; it never formats a
-number. CI fails the build if a Swift `Text` ever does. The point is that a
-later Linux or Windows shell can reuse the whole thing instead of
-reimplementing every caption, and every reimplemented caption is one that can
-disagree.
+Everything the UI displays is built in Rust (`perch-core`) and handed to Swift
+through [UniFFI](https://github.com/mozilla/uniffi-rs), including the em dash
+that means "I don't know" and the "N sessions are waiting on you" line. Swift
+draws; it doesn't format numbers. CI fails if a Swift `Text` ever does. The
+reason is that a Linux or Windows version later on should be able to reuse all
+of it, and anything reimplemented is something that can disagree.
 
 ```
-crates/perch-core   parsing, index, settings, and every user-visible string
+crates/perch-core   parsing, index, settings, and every string the UI shows
 crates/perch-cli    the data layer on its own
 crates/perch-ffi    the UniFFI surface the macOS app is built on
 crates/perch-mcp    the read-only MCP server
-apps/macos/Perch    the SwiftUI/AppKit shell
+apps/macos/Perch    the SwiftUI/AppKit app
 ```
 
 ## Contributing
 
-Please read [CONTRIBUTING.md](CONTRIBUTING.md) first — it lists the invariants
-(read-only, no network, no new dependencies, Rust owns every string) that CI
-enforces and that aren't guessable from the source.
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) first. It lists the rules CI
+enforces — read-only, no network, no new dependencies, Rust owns every string —
+and you can't guess them from reading the source.
 
 ## License
 

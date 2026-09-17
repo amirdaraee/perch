@@ -193,7 +193,10 @@ mod tests {
     #[test]
     fn reads_real_path_from_cwd_not_from_slug() {
         let tmp = tempfile::tempdir().unwrap();
-        // This slug is genuinely ambiguous: the true path contains a dot.
+        // This slug is genuinely ambiguous: the encoding flattens both `/` and
+        // `.` to `-`, so "someone-github-io" could decode to the directory
+        // `someone/github/io` just as readily as to `someone.github.io`.
+        // Reading `cwd` is what settles it.
         let dir = make_project(
             tmp.path(),
             "-Users-a-code-someone-github-io",
