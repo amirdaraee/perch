@@ -1,0 +1,35 @@
+name: Feature request
+description: Suggest something Perch should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's the problem?
+      description: >
+        What are you trying to find out or get done, and what makes it awkward
+        today? Describe the situation rather than the feature — it's often
+        solvable in a way neither of us has thought of yet.
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What did you have in mind?
+      description: Optional. If you already have a shape in mind, describe it.
+
+  - type: checkboxes
+    id: invariants
+    attributes:
+      label: Does this fit what Perch is?
+      description: >
+        These are promises Perch makes to the people who install it, not style
+        preferences. A request that needs one of them broken isn't an automatic
+        no, but it's a bigger conversation — please say so up front rather than
+        letting it surface later. See CONTRIBUTING.md.
+      options:
+        - label: This needs no network request
+        - label: This needs no write to the user's Claude Code directory
+        - label: This needs no new dependency
+        - label: This exposes no transcript contents
