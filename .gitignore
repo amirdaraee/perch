@@ -17,3 +17,4 @@ build/
 apps/macos/Perch/Frameworks/
 apps/macos/Perch/Sources/PerchFFI/
 apps/macos/Perch/.build/
+.serena/
