@@ -260,16 +260,10 @@ mod tests {
     #[test]
     fn detects_worktree_parent_path() {
         assert_eq!(
-            parent_path_of(
-                "/Users/a/code/notes-api/.claude/worktrees/search-cursor"
-            )
-            .as_deref(),
+            parent_path_of("/Users/a/code/notes-api/.claude/worktrees/search-cursor").as_deref(),
             Some("/Users/a/code/notes-api")
         );
-        assert_eq!(
-            parent_path_of("/Users/a/code/notes-api"),
-            None
-        );
+        assert_eq!(parent_path_of("/Users/a/code/notes-api"), None);
     }
 
     #[test]
