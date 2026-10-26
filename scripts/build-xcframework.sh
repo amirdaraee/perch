@@ -14,6 +14,12 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PROFILE=release
+
+# The oldest macOS Perch supports (Package.swift and LSMinimumSystemVersion
+# say the same). Without it, C code compiled by build scripts -- the bundled
+# SQLite, chiefly -- targets whatever macOS the build machine runs, and can
+# call functions macOS 15 doesn't have. The linker only warns.
+export MACOSX_DEPLOYMENT_TARGET=15.0
 ALL_TARGETS=(aarch64-apple-darwin x86_64-apple-darwin)
 OUT=apps/macos/Perch
 FW="$OUT/Frameworks/PerchCore.xcframework"

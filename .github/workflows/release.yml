@@ -1,8 +1,43 @@
+# Builds the universal Perch.app and publishes it to GitHub Releases.
+#
+# Two modes, chosen by which secrets exist -- no code change between them:
+#
+#   ad-hoc     No signing secrets. The app is ad-hoc signed and users have to
+#              click "Open Anyway" in System Settings on first launch.
+#
+#   notarized  All five secrets below are set. The app is signed with the
+#              Developer ID certificate, notarized by Apple and stapled, so it
+#              opens like any other downloaded app.
+#
+# Some-but-not-all of the secrets is an error, not a quiet fall back to ad-hoc:
+# a release that was meant to be notarized and silently wasn't is exactly the
+# mistake nobody notices until users do.
+#
+# Setting up the secrets, once there is an Apple Developer account
+# (Settings -> Secrets and variables -> Actions -> New repository secret):
+#
+#   MACOS_CERT_P12        Create a "Developer ID Application" certificate at
+#                         developer.apple.com, install it, export it from
+#                         Keychain Access as a .p12 with a password, then:
+#                           base64 -i cert.p12 | pbcopy
+#   MACOS_CERT_PASSWORD   The password you exported the .p12 with.
+#   NOTARY_KEY_P8         App Store Connect -> Users and Access -> Integrations
+#                         -> Team Keys: create a key with the Developer role and
+#                         download AuthKey_XXXXXXXXXX.p8 (it can only be
+#                         downloaded once). Paste the file's contents as-is.
+#   NOTARY_KEY_ID         The key's ID, the XXXXXXXXXX in the file name.
+#   NOTARY_ISSUER_ID      The Issuer ID shown above the list of keys.
+#
+# To try the setup without publishing anything, run this workflow by hand
+# (Actions -> Release -> Run workflow). It does everything except create the
+# release, and attaches the zip to the run instead.
+
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 # Needed to create the release and upload the artefact. Nothing else.
 permissions:
@@ -18,36 +53,144 @@ jobs:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
 
-      - name: Assert the tag matches the version in the source
+      - name: Work out the version
         run: |
           set -uo pipefail
-          TAG="${GITHUB_REF_NAME#v}"
           CARGO=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           PLIST=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
                     apps/macos/Perch/Resources/Info.plist)
-          echo "tag=$TAG cargo=$CARGO plist=$PLIST"
-          if [ "$TAG" != "$CARGO" ] || [ "$TAG" != "$PLIST" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME disagrees with Cargo.toml ($CARGO) or Info.plist ($PLIST). Bump both, then retag."
+          echo "cargo=$CARGO plist=$PLIST ref=$GITHUB_REF_NAME"
+          if [ "$CARGO" != "$PLIST" ]; then
+            echo "::error::Cargo.toml ($CARGO) and Info.plist ($PLIST) disagree. Bump both."
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "${GITHUB_REF_NAME#v}" != "$CARGO" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME disagrees with the source ($CARGO). Bump both, then retag."
+            exit 1
+          fi
+          echo "VERSION=$CARGO" >> "$GITHUB_ENV"
+
+      # Secrets are handed only to the steps that use them, never to the
+      # build, where every dependency's build script runs.
+      - name: Choose ad-hoc or notarized
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          set -uo pipefail
+          set_count=0
+          missing=()
+          for name in MACOS_CERT_P12 MACOS_CERT_PASSWORD NOTARY_KEY_P8 NOTARY_KEY_ID NOTARY_ISSUER_ID; do
+            if [ -n "${!name:-}" ]; then set_count=$((set_count + 1)); else missing+=("$name"); fi
+          done
+          if [ "$set_count" -eq 0 ]; then
+            echo "No signing secrets: building an ad-hoc signed release."
+            echo "MODE=adhoc" >> "$GITHUB_ENV"
+          elif [ "$set_count" -eq 5 ]; then
+            echo "All signing secrets present: building a notarized release."
+            echo "MODE=notarized" >> "$GITHUB_ENV"
+          else
+            echo "::error::Signing is half set up. Missing: ${missing[*]}. Add them, or remove the others to release ad-hoc."
             exit 1
           fi
 
       - run: scripts/build-xcframework.sh
 
+      # Everything is built here, before any secret is in reach: this is the
+      # step where every dependency's build script runs. The bundle comes out
+      # ad-hoc signed, and in notarized mode the next step re-signs it.
       - name: Build the universal bundle and zip it
         working-directory: apps/macos/Perch
         run: make release
+
+      # Import, sign and throw away in one step, so the Developer ID key is
+      # only usable for the two codesign calls and never while anything else
+      # runs. The keychain is a temporary one, deleted on the way out whether
+      # signing worked or not; the certificate never touches the login one.
+      - name: Sign with the Developer ID
+        if: env.MODE == 'notarized'
+        working-directory: apps/macos/Perch
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(uuidgen)
+          CERT="$RUNNER_TEMP/cert.p12"
+          ORIGINAL_KEYCHAINS=$(security list-keychains -d user | tr -d '"')
+          cleanup() {
+            rm -f "$CERT"
+            security list-keychains -d user -s $ORIGINAL_KEYCHAINS || true
+            security delete-keychain "$KEYCHAIN" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          printf '%s' "$MACOS_CERT_P12" | base64 --decode > "$CERT"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          # Locks itself after five minutes, in case the trap never runs.
+          security set-keychain-settings -lut 300 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERT" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          rm -f "$CERT"
+          # Lets codesign use the key without a GUI prompt nobody can click.
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $ORIGINAL_KEYCHAINS
+
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+                       | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -1)
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::MACOS_CERT_P12 has no 'Developer ID Application' identity in it. An 'Apple Development' or 'Mac App Distribution' certificate can't be notarized for direct download."
+            security find-identity -v -p codesigning "$KEYCHAIN"
+            exit 1
+          fi
+          echo "Signing as: $IDENTITY"
+
+          # Re-signs the bundle built above; nothing is rebuilt.
+          make sign package SIGN_IDENTITY="$IDENTITY"
+
+      # The API key is written, used and deleted inside this one step, and
+      # readable only by the runner's user while it exists.
+      - name: Notarize and staple
+        if: env.MODE == 'notarized'
+        working-directory: apps/macos/Perch
+        env:
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          export NOTARY_KEY_PATH="$RUNNER_TEMP/notary.p8"
+          trap 'rm -f "$NOTARY_KEY_PATH"' EXIT
+          printf '%s' "$NOTARY_KEY_P8" > "$NOTARY_KEY_PATH"
+          make notarize
 
       # `make release` prints the architectures; this makes shipping the wrong
       # ones a build failure rather than a line in a log nobody reads. GitHub's
       # macOS runners are Apple Silicon, so an arm64-only slip here would
       # produce an artefact that simply fails to launch on every Intel Mac —
       # and it would not be noticed until a user reported it.
-      - name: Assert both binaries are universal
+      #
+      # It checks the app *inside the zip*, since that is what users get.
+      - name: Check what users will download
         working-directory: apps/macos/Perch
         run: |
           set -uo pipefail
+          ZIP="build/Perch-$VERSION-macos.zip"
+          CHECK="$RUNNER_TEMP/unzipped"
+          rm -rf "$CHECK"; mkdir -p "$CHECK"
+          ditto -x -k "$ZIP" "$CHECK"
+          APP="$CHECK/Perch.app"
+
           for bin in Perch perch-mcp; do
-            info=$(lipo -info "build/Perch.app/Contents/MacOS/$bin")
+            info=$(lipo -info "$APP/Contents/MacOS/$bin")
             echo "$info"
             for arch in arm64 x86_64; do
               if ! printf '%s' "$info" | grep -qw "$arch"; then
@@ -56,51 +199,87 @@ jobs:
               fi
             done
           done
-          codesign --verify --deep --strict build/Perch.app
+          codesign --verify --deep --strict "$APP"
+
+          if [ "$MODE" = notarized ]; then
+            codesign -dv --verbose=2 "$APP" 2>&1 | grep -q '^Authority=Developer ID Application' \
+              || { echo "::error::The app is not signed with the Developer ID."; exit 1; }
+            xcrun stapler validate "$APP" \
+              || { echo "::error::The zipped app has no stapled notarization ticket."; exit 1; }
+            spctl --assess --type execute --verbose=2 "$APP" \
+              || { echo "::error::Gatekeeper rejects the zipped app."; exit 1; }
+          fi
+
+      - name: Write the release notes
+        working-directory: apps/macos/Perch
+        run: |
+          set -uo pipefail
+          ZIP_NAME="Perch-$VERSION-macos.zip"
+          SHA=$(shasum -a 256 "build/$ZIP_NAME" | cut -d' ' -f1)
+
+          {
+            echo "## Install"
+            echo
+            echo "Requires macOS 15 or later. Universal (Apple Silicon and Intel)."
+            echo
+            echo "Download \`$ZIP_NAME\`, unzip it, and drag \`Perch.app\` to \`/Applications\`."
+            echo
+            if [ "$MODE" = notarized ]; then
+              echo "Perch is signed with a Developer ID and notarized by Apple, so it"
+              echo "opens like any other app you download."
+            else
+              echo "**The first launch will be blocked.** Perch is signed, but with an"
+              echo "ad-hoc signature rather than a paid Apple Developer ID, so macOS"
+              echo "treats it as coming from an unidentified developer. To open it:"
+              echo
+              echo "> **System Settings → Privacy & Security**, scroll to the bottom, and"
+              echo "> click **\"Open Anyway\"** next to the message about Perch."
+              echo
+              echo "On macOS 15 this is the only route — the old right-click → Open trick"
+              echo "no longer works for unsigned apps."
+              echo
+              echo "If you would rather not run an unidentified binary at all, that is a"
+              echo "reasonable instinct for an app that reads your transcripts. Building"
+              echo "from source is two commands; see the README."
+            fi
+            echo
+            echo "## Verify the download"
+            echo
+            echo '```'
+            echo "shasum -a 256 $ZIP_NAME"
+            echo "$SHA"
+            echo '```'
+            echo
+            echo "## Changes"
+          } > notes.md
+          cat notes.md
 
       - name: Publish the release
+        if: github.ref_type == 'tag'
         working-directory: apps/macos/Perch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -uo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          ZIP="build/Perch-$VERSION-macos.zip"
-          SHA=$(shasum -a 256 "$ZIP" | cut -d' ' -f1)
-
-          cat > notes.md <<EOF
-          ## Install
-
-          Requires macOS 15 or later. Universal (Apple Silicon and Intel).
-
-          Download \`$(basename "$ZIP")\`, unzip it, and drag \`Perch.app\` to
-          \`/Applications\`.
-
-          **The first launch will be blocked.** Perch is signed, but with an
-          ad-hoc signature rather than a paid Apple Developer ID, so macOS
-          treats it as coming from an unidentified developer. To open it:
-
-          > **System Settings → Privacy & Security**, scroll to the bottom, and
-          > click **"Open Anyway"** next to the message about Perch.
-
-          On macOS 15 this is the only route — the old right-click → Open trick
-          no longer works for unsigned apps.
-
-          If you would rather not run an unidentified binary at all, that is a
-          reasonable instinct for an app that reads your transcripts. Building
-          from source is two commands; see the README.
-
-          ## Verify the download
-
-          \`\`\`
-          shasum -a 256 $(basename "$ZIP")
-          $SHA
-          \`\`\`
-
-          ## Changes
-          EOF
-
-          gh release create "$GITHUB_REF_NAME" "$ZIP" \
+          gh release create "$GITHUB_REF_NAME" "build/Perch-$VERSION-macos.zip" \
             --title "Perch $VERSION" \
             --notes-file notes.md \
             --generate-notes
+
+      # A manual run publishes nothing; the zip and notes are attached to the
+      # run so the result can be downloaded and tried.
+      - name: Keep the dry-run build
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Perch-${{ env.VERSION }}-${{ env.MODE }}-dry-run
+          path: |
+            apps/macos/Perch/build/Perch-${{ env.VERSION }}-macos.zip
+            apps/macos/Perch/notes.md
+
+      # Belt and braces: the signing and notarizing steps clean up after
+      # themselves, but a cancelled job can skip a trap.
+      - name: Remove any signing material left behind
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/cert.p12"
