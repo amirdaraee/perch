@@ -13,8 +13,23 @@
 # a release that was meant to be notarized and silently wasn't is exactly the
 # mistake nobody notices until users do.
 #
-# Setting up the secrets, once there is an Apple Developer account
-# (Settings -> Secrets and variables -> Actions -> New repository secret):
+# The jobs, and why there are four:
+#
+#   mode     Looks at which secrets exist. Runs no project code.
+#   build    Builds and ad-hoc signs the app. Has no secrets at all: this is
+#            where every dependency's build script runs, so nothing it could
+#            leave behind ever shares a machine with the signing key.
+#   sign     Notarized mode only. A fresh runner that builds nothing: it takes
+#            the bundle from `build`, signs it with the Developer ID, notarizes
+#            and staples it.
+#   publish  Creates the GitHub release. The only job that can write to the
+#            repo.
+#
+# Setting up the secrets, once there is an Apple Developer account: create an
+# environment called `release` (Settings -> Environments), and add these as
+# environment secrets there, so only the jobs that declare that environment
+# can read them. Restrict the environment's deployment branches and tags to
+# `main` and `v*`.
 #
 #   MACOS_CERT_P12        Create a "Developer ID Application" certificate at
 #                         developer.apple.com, install it, export it from
@@ -31,6 +46,10 @@
 # To try the setup without publishing anything, run this workflow by hand
 # (Actions -> Release -> Run workflow). It does everything except create the
 # release, and attaches the zip to the run instead.
+#
+# Actions are pinned to full commit SHAs, not tags: a tag can be moved to
+# different code, and these run next to the signing key. Dependabot proposes
+# updates.
 
 name: Release
 
@@ -39,40 +58,18 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
-# Needed to create the release and upload the artefact. Nothing else.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    runs-on: macos-latest
+  mode:
+    runs-on: ubuntu-latest
+    environment: release
+    outputs:
+      mode: ${{ steps.choose.outputs.mode }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin, x86_64-apple-darwin
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Work out the version
-        run: |
-          set -uo pipefail
-          CARGO=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          PLIST=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
-                    apps/macos/Perch/Resources/Info.plist)
-          echo "cargo=$CARGO plist=$PLIST ref=$GITHUB_REF_NAME"
-          if [ "$CARGO" != "$PLIST" ]; then
-            echo "::error::Cargo.toml ($CARGO) and Info.plist ($PLIST) disagree. Bump both."
-            exit 1
-          fi
-          if [ "$GITHUB_REF_TYPE" = tag ] && [ "${GITHUB_REF_NAME#v}" != "$CARGO" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME disagrees with the source ($CARGO). Bump both, then retag."
-            exit 1
-          fi
-          echo "VERSION=$CARGO" >> "$GITHUB_ENV"
-
-      # Secrets are handed only to the steps that use them, never to the
-      # build, where every dependency's build script runs.
       - name: Choose ad-hoc or notarized
+        id: choose
         env:
           MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -88,30 +85,95 @@ jobs:
           done
           if [ "$set_count" -eq 0 ]; then
             echo "No signing secrets: building an ad-hoc signed release."
-            echo "MODE=adhoc" >> "$GITHUB_ENV"
+            echo "mode=adhoc" >> "$GITHUB_OUTPUT"
           elif [ "$set_count" -eq 5 ]; then
             echo "All signing secrets present: building a notarized release."
-            echo "MODE=notarized" >> "$GITHUB_ENV"
+            echo "mode=notarized" >> "$GITHUB_OUTPUT"
           else
             echo "::error::Signing is half set up. Missing: ${missing[*]}. Add them, or remove the others to release ad-hoc."
             exit 1
           fi
 
+  build:
+    runs-on: macos-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      # No rust-cache here on purpose: a release is built from a clean slate,
+      # never from a cache another workflow run could have written.
+
+      - name: Work out the version
+        id: version
+        run: |
+          set -uo pipefail
+          CARGO=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          PLIST=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+                    apps/macos/Perch/Resources/Info.plist)
+          echo "cargo=$CARGO plist=$PLIST ref=$GITHUB_REF_NAME"
+          if [ "$CARGO" != "$PLIST" ]; then
+            echo "::error::Cargo.toml ($CARGO) and Info.plist ($PLIST) disagree. Bump both."
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "${GITHUB_REF_NAME#v}" != "$CARGO" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME disagrees with the source ($CARGO). Bump both, then retag."
+            exit 1
+          fi
+          echo "version=$CARGO" >> "$GITHUB_OUTPUT"
+
       - run: scripts/build-xcframework.sh
 
-      # Everything is built here, before any secret is in reach: this is the
-      # step where every dependency's build script runs. The bundle comes out
-      # ad-hoc signed, and in notarized mode the next step re-signs it.
       - name: Build the universal bundle and zip it
         working-directory: apps/macos/Perch
         run: make release
 
-      # Import, sign and throw away in one step, so the Developer ID key is
-      # only usable for the two codesign calls and never while anything else
-      # runs. The keychain is a temporary one, deleted on the way out whether
-      # signing worked or not; the certificate never touches the login one.
+      - name: Check the build
+        working-directory: apps/macos/Perch
+        env:
+          ZIP: build/Perch-${{ steps.version.outputs.version }}-macos.zip
+        run: ../../../scripts/check-release.sh "$ZIP" adhoc
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: adhoc
+          path: apps/macos/Perch/build/Perch-${{ steps.version.outputs.version }}-macos.zip
+          if-no-files-found: error
+
+  sign:
+    needs: [mode, build]
+    if: needs.mode.outputs.mode == 'notarized'
+    runs-on: macos-latest
+    environment: release
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      # Only for the Makefile and scripts; nothing is built in this job.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: adhoc
+          path: ${{ runner.temp }}/adhoc
+
+      - name: Unpack the bundle
+        working-directory: apps/macos/Perch
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          ditto -x -k "$RUNNER_TEMP/adhoc/Perch-$VERSION-macos.zip" build
+
+      # Import, sign and throw away in one step. The keychain is a temporary
+      # one, deleted on the way out whether signing worked or not; the
+      # certificate never touches the login keychain.
       - name: Sign with the Developer ID
-        if: env.MODE == 'notarized'
         working-directory: apps/macos/Perch
         env:
           MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
@@ -152,13 +214,11 @@ jobs:
           fi
           echo "Signing as: $IDENTITY"
 
-          # Re-signs the bundle built above; nothing is rebuilt.
           make sign package SIGN_IDENTITY="$IDENTITY"
 
       # The API key is written, used and deleted inside this one step, and
       # readable only by the runner's user while it exists.
       - name: Notarize and staple
-        if: env.MODE == 'notarized'
         working-directory: apps/macos/Perch
         env:
           NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
@@ -172,50 +232,48 @@ jobs:
           printf '%s' "$NOTARY_KEY_P8" > "$NOTARY_KEY_PATH"
           make notarize
 
-      # `make release` prints the architectures; this makes shipping the wrong
-      # ones a build failure rather than a line in a log nobody reads. GitHub's
-      # macOS runners are Apple Silicon, so an arm64-only slip here would
-      # produce an artefact that simply fails to launch on every Intel Mac —
-      # and it would not be noticed until a user reported it.
-      #
-      # It checks the app *inside the zip*, since that is what users get.
       - name: Check what users will download
         working-directory: apps/macos/Perch
+        run: ../../../scripts/check-release.sh "build/Perch-$VERSION-macos.zip" notarized
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: notarized
+          path: apps/macos/Perch/build/Perch-${{ env.VERSION }}-macos.zip
+          if-no-files-found: error
+
+      # Belt and braces: the steps above clean up after themselves, but a
+      # cancelled job can skip a trap.
+      - name: Remove any signing material left behind
+        if: always()
         run: |
-          set -uo pipefail
-          ZIP="build/Perch-$VERSION-macos.zip"
-          CHECK="$RUNNER_TEMP/unzipped"
-          rm -rf "$CHECK"; mkdir -p "$CHECK"
-          ditto -x -k "$ZIP" "$CHECK"
-          APP="$CHECK/Perch.app"
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/cert.p12"
 
-          for bin in Perch perch-mcp; do
-            info=$(lipo -info "$APP/Contents/MacOS/$bin")
-            echo "$info"
-            for arch in arm64 x86_64; do
-              if ! printf '%s' "$info" | grep -qw "$arch"; then
-                echo "::error::$bin is missing the $arch slice."
-                exit 1
-              fi
-            done
-          done
-          codesign --verify --deep --strict "$APP"
-
-          if [ "$MODE" = notarized ]; then
-            codesign -dv --verbose=2 "$APP" 2>&1 | grep -q '^Authority=Developer ID Application' \
-              || { echo "::error::The app is not signed with the Developer ID."; exit 1; }
-            xcrun stapler validate "$APP" \
-              || { echo "::error::The zipped app has no stapled notarization ticket."; exit 1; }
-            spctl --assess --type execute --verbose=2 "$APP" \
-              || { echo "::error::Gatekeeper rejects the zipped app."; exit 1; }
-          fi
+  publish:
+    needs: [mode, build, sign]
+    # Runs after `sign`, or without it in ad-hoc mode -- but never after a
+    # `sign` that failed.
+    if: >-
+      always() && needs.mode.result == 'success' && needs.build.result == 'success'
+      && (needs.sign.result == 'success' || (needs.sign.result == 'skipped' && needs.mode.outputs.mode == 'adhoc'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+      MODE: ${{ needs.mode.outputs.mode }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ needs.mode.outputs.mode }}
+          path: dist
 
       - name: Write the release notes
-        working-directory: apps/macos/Perch
         run: |
           set -uo pipefail
           ZIP_NAME="Perch-$VERSION-macos.zip"
-          SHA=$(shasum -a 256 "build/$ZIP_NAME" | cut -d' ' -f1)
+          SHA=$(sha256sum "dist/$ZIP_NAME" | cut -d' ' -f1)
 
           {
             echo "## Install"
@@ -256,11 +314,11 @@ jobs:
 
       - name: Publish the release
         if: github.ref_type == 'tag'
-        working-directory: apps/macos/Perch
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" "build/Perch-$VERSION-macos.zip" \
+          gh release create "$GITHUB_REF_NAME" "dist/Perch-$VERSION-macos.zip" \
+            --repo "$GITHUB_REPOSITORY" \
             --title "Perch $VERSION" \
             --notes-file notes.md \
             --generate-notes
@@ -269,17 +327,9 @@ jobs:
       # run so the result can be downloaded and tried.
       - name: Keep the dry-run build
         if: github.ref_type != 'tag'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: Perch-${{ env.VERSION }}-${{ env.MODE }}-dry-run
           path: |
-            apps/macos/Perch/build/Perch-${{ env.VERSION }}-macos.zip
-            apps/macos/Perch/notes.md
-
-      # Belt and braces: the signing and notarizing steps clean up after
-      # themselves, but a cancelled job can skip a trap.
-      - name: Remove any signing material left behind
-        if: always()
-        run: |
-          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
-          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/cert.p12"
+            dist/Perch-${{ env.VERSION }}-macos.zip
+            notes.md

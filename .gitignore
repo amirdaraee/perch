@@ -1,8 +1,3 @@
-# Working notes — plans, specs, decisions, backlog. Kept on disk, never
-# published: they are a record of how the project was built, not documentation
-# anyone installing Perch needs.
-docs/
-
 target/
 Cargo.lock.orig
 .DS_Store
@@ -17,4 +12,3 @@ build/
 apps/macos/Perch/Frameworks/
 apps/macos/Perch/Sources/PerchFFI/
 apps/macos/Perch/.build/
-.serena/
