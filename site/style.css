@@ -2,38 +2,57 @@
  *
  * Hand-written, no framework, no build step, no third-party request. System
  * fonts only: a page whose headline claim is "this app talks to nothing" has
- * no business fetching a typeface from Google.
+ * no business fetching a typeface from Google. SF Pro Rounded ships with
+ * macOS, which is who this page is for; everyone else gets their system face.
+ *
+ * The palette is the app icon's: slate dusk behind an amber bird. Amber and
+ * green mean what they mean in the app (waiting, running) and nothing else.
  */
 
 :root {
   color-scheme: light dark;
 
-  --bg: #fbfaf8;
-  --bg-band: #f3f1ed;
-  --surface: #ffffff;
-  --ink: #1b1a17;
-  --ink-soft: #55514a;
-  --rule: #e4e0d9;
-  --accent: #b4531a;
-  --accent-ink: #ffffff;
-  --code-bg: #f0ede8;
+  /* The hero is always dusk, whatever the reader's appearance. */
+  --dusk: #1b2130;
+  --dusk-deep: #141927;
+  --dusk-line: #2d3548;
+  --dusk-ink: #eee9dc;
+  --dusk-soft: #9da5b7;
 
-  --measure: 34rem;
-  --wrap: 60rem;
-  --radius: 10px;
+  --amber: #f2b440;
+  --green: #7dc36b;
+  --idle: #4f7a46;
+
+  /* The rest of the page: morning. */
+  --bg: #f3f5f9;
+  --bg-alt: #e8ecf3;
+  --line: #d3d9e4;
+  --ink: #1b2130;
+  --ink-soft: #545d72;
+  --link: #8a5a00;
+  --code-bg: #1b2130;
+  --code-ink: #eee9dc;
+
+  --round: ui-rounded, "SF Pro Rounded", system-ui, -apple-system,
+           "Segoe UI", Roboto, sans-serif;
+  --text: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  --wrap: 68rem;
+  --measure: 36rem;
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #171614;
-    --bg-band: #1f1e1b;
-    --surface: #232220;
-    --ink: #eceae6;
-    --ink-soft: #a9a49b;
-    --rule: #33312d;
-    --accent: #e8813f;
-    --accent-ink: #1b1a17;
-    --code-bg: #121110;
+    --bg: #151a26;
+    --bg-alt: #1b2130;
+    --line: #2d3548;
+    --ink: #eee9dc;
+    --ink-soft: #9da5b7;
+    --link: #f2b440;
+    --code-bg: #121622;
+    --code-ink: #eee9dc;
   }
 }
 
@@ -45,20 +64,38 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--ink);
-  font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui,
-        Roboto, "Helvetica Neue", Arial, sans-serif;
+  font: 17px/1.6 var(--text);
   -webkit-font-smoothing: antialiased;
 }
 
 img { max-width: 100%; height: auto; display: block; }
 
-a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+a { color: var(--link); text-decoration-thickness: 1px; text-underline-offset: 3px; }
 a:hover { text-decoration-thickness: 2px; }
 
-code, pre {
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-  font-size: 0.875em;
+:focus-visible { outline: 2px solid var(--amber); outline-offset: 3px; border-radius: 4px; }
+
+h2, h3 { font-family: var(--round); text-wrap: balance; }
+
+h2 {
+  margin: 0 0 1rem;
+  font-size: clamp(1.75rem, 4.2vw, 2.5rem);
+  font-weight: 750;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
 }
+
+h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1.25rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.25;
+}
+
+p { margin: 0 0 1rem; max-width: var(--measure); }
+
+code { font-family: var(--mono); font-size: 0.85em; }
 
 .wrap {
   width: 100%;
@@ -70,190 +107,296 @@ code, pre {
 /* ---- Hero ---------------------------------------------------------------- */
 
 .hero {
-  padding-block: clamp(3rem, 9vw, 6rem);
-  text-align: center;
-  border-bottom: 1px solid var(--rule);
-  background: linear-gradient(to bottom, var(--bg-band), var(--bg));
+  background:
+    radial-gradient(60rem 30rem at 85% -10%, #2a3350 0%, transparent 70%),
+    var(--dusk);
+  color: var(--dusk-ink);
+  padding-bottom: clamp(3rem, 8vw, 6rem);
+  overflow: hidden;
 }
 
-.hero h1 {
-  margin: 0;
-  font-size: clamp(2.75rem, 9vw, 4.25rem);
-  font-weight: 700;
-  letter-spacing: -0.03em;
-  line-height: 1.05;
+.menubar {
+  background: rgb(255 255 255 / 0.06);
+  border-bottom: 1px solid rgb(255 255 255 / 0.06);
+  font: 500 13px/1 var(--text);
+  color: var(--dusk-ink);
+  user-select: none;
 }
 
-.tagline {
-  margin: 1rem auto 0;
-  max-width: 28rem;
-  font-size: clamp(1.0625rem, 2.4vw, 1.25rem);
-  color: var(--ink-soft);
+.menubar-inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 30px;
+}
+
+.menubar-apps { display: flex; gap: 1.25rem; white-space: nowrap; overflow: hidden; }
+.menubar-apps span { opacity: 0.85; }
+
+.menubar-status { display: flex; align-items: center; gap: 1rem; flex: none; }
+
+.status-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 4px 8px;
+  border-radius: 5px;
+  background: rgb(255 255 255 / 0.16);
+}
+
+.clock { opacity: 0.85; }
+
+.hero-grid {
+  display: grid;
+  gap: 2.5rem;
+  padding-top: clamp(2.5rem, 7vw, 5rem);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  margin: 0 0 clamp(1.5rem, 4vw, 2.5rem);
+  font: 750 1.5rem/1 var(--round);
+  letter-spacing: -0.01em;
+}
+
+.brand img { border-radius: 10px; }
+
+/* The app's own sentence, set as the headline. */
+.signal {
+  margin: 0 0 1.5rem;
+  max-width: 11ch;
+  font: 800 clamp(2.75rem, 8vw, 5rem)/0.98 var(--round);
+  letter-spacing: -0.035em;
+  color: var(--amber);
   text-wrap: balance;
 }
 
-.cta {
-  margin-top: 2rem;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.75rem;
-  justify-content: center;
+.lede {
+  font-size: clamp(1.0625rem, 2vw, 1.25rem);
+  line-height: 1.5;
+  color: var(--dusk-soft);
+  max-width: 30rem;
 }
+
+.cta { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-top: 2rem; }
 
 .button {
   display: inline-block;
-  padding: 0.7rem 1.4rem;
-  border-radius: var(--radius);
-  background: var(--accent);
-  color: var(--accent-ink);
-  font-weight: 600;
+  padding: 0.8rem 1.4rem;
+  border-radius: 999px;
+  background: var(--amber);
+  color: var(--dusk-deep);
+  font: 700 1rem/1.2 var(--round);
   text-decoration: none;
-  border: 1px solid transparent;
 }
 
-.button:hover { filter: brightness(1.08); text-decoration: none; }
+.button:hover { background: #f7c45f; }
 
-.button.ghost {
+.button.quiet {
   background: transparent;
-  color: var(--ink);
-  border-color: var(--rule);
+  color: var(--dusk-ink);
+  box-shadow: inset 0 0 0 1px var(--dusk-line);
 }
 
-.button.ghost:hover { background: var(--surface); filter: none; }
+.button.quiet:hover { background: rgb(255 255 255 / 0.06); }
 
-.fineprint {
-  margin-top: 0.9rem;
-  font-size: 0.8125rem;
-  color: var(--ink-soft);
+.fineprint { margin-top: 1rem; font-size: 0.875rem; color: var(--dusk-soft); }
+
+.menu-shot { margin: 0; justify-self: center; width: min(100%, 300px); }
+
+.menu-shot img {
+  filter: drop-shadow(0 24px 40px rgb(0 0 0 / 0.45));
 }
 
-/* ---- Screenshots --------------------------------------------------------- */
+/* Wide enough to hang the menu from its item: the status item and the menu
+   share the right-hand column, so the menu drops from where you'd click. */
+@media (min-width: 56rem) {
+  .menubar-inner,
+  .hero-grid {
+    display: grid;
+    grid-template-columns: 1fr 360px;
+    column-gap: 4rem;
+  }
+
+  .menubar-status { justify-content: space-between; }
+
+  .hero-grid { padding-top: 0; align-items: start; }
+
+  .hero-text { padding-top: clamp(3rem, 6vw, 5rem); }
+
+  .menu-shot { width: 360px; justify-self: start; padding-top: 6px; }
+
+  .menu-shot img { animation: drop 420ms cubic-bezier(.2, .8, .2, 1) 250ms both; }
+}
+
+@keyframes drop {
+  from { opacity: 0; transform: translateY(-10px); }
+  to   { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .menu-shot img { animation: none; }
+}
+
+@media (max-width: 40rem) {
+  .menubar-apps span:nth-child(n + 4) { display: none; }
+}
+
+/* ---- Story --------------------------------------------------------------- */
+
+.story { padding-block: clamp(3.5rem, 9vw, 6rem) clamp(2rem, 5vw, 3rem); }
+
+.story p { font-size: 1.125rem; color: var(--ink-soft); }
+
+/* ---- Features ------------------------------------------------------------ */
+
+.features {
+  display: grid;
+  gap: clamp(3.5rem, 8vw, 6rem);
+  padding-block: clamp(1.5rem, 4vw, 3rem) clamp(4rem, 10vw, 7rem);
+}
+
+.feature { display: grid; gap: 1.75rem; }
+
+.feature-text p { color: var(--ink-soft); margin-bottom: 0; }
 
 .shot { margin: 0; }
 
-.shot img {
-  border: 1px solid var(--rule);
-  border-radius: var(--radius);
-  background: var(--surface);
-  box-shadow: 0 12px 32px rgb(0 0 0 / 0.10);
+.shot img { filter: drop-shadow(0 18px 36px rgb(20 25 39 / 0.28)); }
+
+@media (min-width: 56rem) {
+  .feature {
+    grid-template-columns: 18rem 1fr;
+    column-gap: 3.5rem;
+    align-items: center;
+  }
 }
 
-.hero-shot { margin-top: clamp(2.5rem, 6vw, 4rem); }
-
-/* The menu shot is portrait and much taller than the landscape ones. Left
-   unconstrained it stretches its whole grid row, and the paragraph beside it
-   floats in the middle of an empty half-screen. */
-.shot.tall img {
-  max-height: 30rem;
-  width: auto;
-  margin-inline: auto;
+/* The three states, coloured as the app colours them. */
+.states {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.1rem;
+  margin: 0.25rem 0 0.9rem !important;
+  font: 600 0.9375rem/1.4 var(--round);
+  color: var(--ink) !important;
 }
 
-/* ---- Sections ------------------------------------------------------------ */
-
-.band { padding-block: clamp(3rem, 8vw, 5rem); }
-
-/* Tinted bands. They carry `band` too, so the padding comes from there —
-   adding it to .wrap as well would double it. */
-section.privacy, section.install {
-  background: var(--bg-band);
-  border-block: 1px solid var(--rule);
+.state::before {
+  content: "";
+  display: inline-block;
+  width: 0.6em;
+  height: 0.6em;
+  margin-right: 0.4em;
+  border-radius: 50%;
+  vertical-align: 0.05em;
+  background: currentColor;
 }
 
-h2 {
-  margin: 0 0 0.75rem;
-  font-size: clamp(1.5rem, 4vw, 2rem);
-  font-weight: 650;
-  letter-spacing: -0.02em;
-  line-height: 1.2;
-  text-wrap: balance;
+.state.waiting::before { background: var(--amber); }
+.state.working::before { background: var(--green); }
+.state.idle::before    { background: var(--idle); }
+
+/* ---- Privacy ------------------------------------------------------------- */
+
+.privacy {
+  background: var(--bg-alt);
+  padding-block: clamp(4rem, 10vw, 6.5rem);
 }
 
-h3 {
-  margin: 0 0 0.6rem;
-  font-size: 1.25rem;
-  font-weight: 650;
-  letter-spacing: -0.015em;
+.privacy .intro { font-size: 1.125rem; color: var(--ink-soft); }
+
+.promises {
+  list-style: none;
+  margin: 2.5rem 0;
+  padding: 0;
+  display: grid;
+  gap: 2rem 3.5rem;
 }
 
-p { margin: 0 0 1rem; max-width: var(--measure); }
+@media (min-width: 46rem) {
+  .promises { grid-template-columns: 1fr 1fr; }
+}
 
-.lede { font-size: 1.0625rem; color: var(--ink-soft); }
+.promises h3 { font-size: 1.125rem; }
+
+.promises p { margin: 0; color: var(--ink-soft); font-size: 0.975rem; }
 
 .aside { font-size: 0.9375rem; color: var(--ink-soft); }
 
+/* ---- MCP ----------------------------------------------------------------- */
+
+.mcp { padding-block: clamp(4rem, 10vw, 6.5rem); }
+
+.mcp p { color: var(--ink-soft); }
+
 pre {
-  margin: 1.25rem 0;
-  padding: 1rem 1.1rem;
+  margin: 1.5rem 0;
+  padding: 1.1rem 1.25rem;
   background: var(--code-bg);
-  border: 1px solid var(--rule);
-  border-radius: var(--radius);
+  color: var(--code-ink);
+  border-radius: 12px;
   overflow-x: auto;
+  font-size: 0.95rem;
+  line-height: 1.5;
 }
 
 pre code { white-space: pre; }
 
-/* ---- Feature rows -------------------------------------------------------- */
-
-.features { display: grid; gap: clamp(3rem, 7vw, 4.5rem);
-            padding-block: clamp(2rem, 5vw, 3rem) clamp(3rem, 8vw, 5rem); }
-
-.feature {
-  display: grid;
-  gap: clamp(1.5rem, 4vw, 3rem);
-  align-items: center;
-  grid-template-columns: 1fr;
-}
-
-.feature-text p { margin-bottom: 0; }
-
-@media (min-width: 46rem) {
-  .feature { grid-template-columns: 1fr 1.15fr; }
-  .feature.reverse .feature-text { order: 2; }
-}
-
-/* ---- Privacy ------------------------------------------------------------- */
-
-.promises {
-  list-style: none;
-  margin: 1.75rem 0;
-  padding: 0;
-  display: grid;
-  gap: 1rem;
-}
-
-@media (min-width: 46rem) {
-  .promises { grid-template-columns: 1fr 1fr; gap: 1.25rem; }
-}
-
-.promises li {
-  background: var(--surface);
-  border: 1px solid var(--rule);
-  border-radius: var(--radius);
-  padding: 1.1rem 1.25rem;
-  font-size: 0.9375rem;
-  color: var(--ink-soft);
-}
-
-.promises strong { display: block; color: var(--ink); margin-bottom: 0.2rem; }
-
-.promises code { background: var(--code-bg); padding: 0.1em 0.35em; border-radius: 4px; }
-
 /* ---- Install ------------------------------------------------------------- */
 
-.steps { max-width: var(--measure); padding-left: 1.2rem; }
-.steps li { margin-bottom: 0.9rem; }
+.install {
+  background: var(--bg-alt);
+  padding-block: clamp(4rem, 10vw, 6.5rem);
+}
+
+.steps {
+  list-style: none;
+  counter-reset: step;
+  margin: 2rem 0;
+  padding: 0;
+  max-width: var(--measure);
+}
+
+.steps li {
+  counter-increment: step;
+  position: relative;
+  padding-left: 3rem;
+  margin-bottom: 1.5rem;
+}
+
+.steps li::before {
+  content: counter(step);
+  position: absolute;
+  left: 0;
+  top: -0.05em;
+  width: 2rem;
+  height: 2rem;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--ink);
+  color: var(--bg);
+  font: 750 1rem/1 var(--round);
+}
 
 /* ---- Footer -------------------------------------------------------------- */
 
 footer {
-  padding-block: 2.5rem 3.5rem;
-  border-top: 1px solid var(--rule);
-  font-size: 0.875rem;
+  padding-block: 3rem 4rem;
+  font-size: 0.9375rem;
   color: var(--ink-soft);
-  text-align: center;
 }
 
-footer p { max-width: none; }
+.footer-links {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.75rem;
+  margin: 0 0 1rem;
+  padding: 0;
+}
 
-.disclaimer { margin-top: 0.5rem; font-size: 0.8125rem; }
+.disclaimer { font-size: 0.8125rem; max-width: none; }

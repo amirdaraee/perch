@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Perch — a menu bar app for Claude Code</title>
 <meta name="description" content="A small menu bar app that tells you when a Claude Code session is waiting for you, and what your sessions are costing. Runs entirely on your Mac.">
+<meta name="theme-color" content="#1b2130">
 <link rel="icon" href="favicon.png" type="image/png">
 <link rel="stylesheet" href="style.css">
 
@@ -15,66 +16,92 @@
 <body>
 
 <header class="hero">
-  <div class="wrap">
-    <h1>Perch</h1>
-    <p class="tagline">
-      A menu bar app that tells you when a Claude Code session is waiting
-      on&nbsp;you.
-    </p>
 
-    <div class="cta">
-      <a class="button" href="https://github.com/amirdaraee/perch/releases/latest">
-        Download for macOS
-      </a>
-      <a class="button ghost" href="https://github.com/amirdaraee/perch">
-        View source
-      </a>
+  <!-- A stand-in for the macOS menu bar, with Perch's item open. Decorative:
+       the real content is the text and the screenshot beside it. -->
+  <div class="menubar" aria-hidden="true">
+    <div class="wrap menubar-inner">
+      <span class="menubar-apps">
+        <b>Terminal</b><span>Shell</span><span>Edit</span><span>View</span><span>Window</span><span>Help</span>
+      </span>
+      <span class="menubar-status">
+        <span class="status-item">
+          <svg viewBox="0 0 24 24" width="16" height="16"><path fill="currentColor" d="M15.5 5.2c-1.6 0-2.9 1-3.4 2.4L3 10.4l5.3 1.2c.8 2.7 3.2 4.6 6.1 4.6h.4l-.9 3.3h1.4l.9-3.4h1l-.9 3.4h1.4l1-3.8c1.7-1 2.8-2.9 2.8-5V9l2.4-1-2.6-.8c-.5-1.2-1.7-2-3.1-2h-1.6Zm1.3 2.1a.8.8 0 1 1 0 1.6.8.8 0 0 1 0-1.6Z"/></svg>
+          1 ⏳
+        </span>
+        <span class="clock">Mon 9:41</span>
+      </span>
     </div>
-    <p class="fineprint">
-      Free and open source (MIT). Needs macOS&nbsp;15 or later. Runs on Apple
-      Silicon and Intel.
-    </p>
+  </div>
 
-    <figure class="shot hero-shot">
-      <img src="screenshots/main-window.png" alt="Perch's main window. A grid of project cards, each showing a description, how many sessions it has, tokens used, cost, and a small bar chart of the last two weeks." width="1280" height="572">
+  <div class="wrap hero-grid">
+    <div class="hero-text">
+      <h1 class="brand">
+        <img src="favicon.png" alt="" width="44" height="44">
+        Perch
+      </h1>
+
+      <p class="signal">1 session is waiting on&nbsp;you</p>
+
+      <p class="lede">
+        Perch is a menu bar app for Claude Code. It tells you when a session is
+        stuck on a prompt, and what your sessions are costing you.
+      </p>
+
+      <div class="cta">
+        <a class="button" href="https://github.com/amirdaraee/perch/releases/latest">Download for macOS</a>
+        <a class="button quiet" href="https://github.com/amirdaraee/perch">View source</a>
+      </div>
+      <p class="fineprint">
+        Free and open source (MIT). Needs macOS&nbsp;15 or later. Runs on Apple
+        Silicon and Intel.
+      </p>
+    </div>
+
+    <figure class="menu-shot">
+      <img src="screenshots/menu.png" alt="The Perch menu open under its menu bar icon. One session is waiting for permission to run a command; three others are working or idle." width="360" height="621">
     </figure>
   </div>
 </header>
 
 <main>
 
-<section class="wrap band">
-  <h2>I left a session waiting for 32 hours</h2>
-  <p class="lede">
+<section class="story wrap">
+  <h2>I left a session waiting for 32&nbsp;hours</h2>
+  <p>
     It was sitting on a permission prompt, behind a fullscreen window, in a
     terminal tab I'd forgotten about. That's why I wrote this.
   </p>
-  <p class="lede">
+  <p>
     Perch reads the files Claude Code already writes to your disk and keeps a
     summary in your menu bar, so you can glance up and see what's running and
     what's stuck.
   </p>
 </section>
 
-<section class="wrap features">
+<section class="features wrap">
 
   <article class="feature">
     <div class="feature-text">
       <h3>You'll know when something is stuck</h3>
+      <p class="states">
+        <span class="state waiting">waiting on you</span>
+        <span class="state working">working</span>
+        <span class="state idle">idle</span>
+      </p>
       <p>
-        Every session shows as working, idle, or waiting on you, with the
-        terminal it belongs to. You can have Perch notify you once when a
-        session has been waiting longer than you're happy with. Some projects
-        are fine to leave sitting, so you can set a different limit on those, or
-        turn it off for them entirely.
+        Every session shows which of those it is, and the terminal it belongs
+        to. Perch can notify you once when a session has been waiting longer
+        than you're happy with. Some projects are fine to leave sitting, so you
+        can set a different limit on those, or turn it off for them entirely.
       </p>
     </div>
-    <figure class="shot tall">
-      <img src="screenshots/menu.png" alt="The Perch menu open in the macOS menu bar, listing live sessions with their status and which project they belong to." width="360" height="621" loading="lazy">
+    <figure class="shot">
+      <img src="screenshots/main-window.png" alt="Perch's main window. A grid of project cards, each showing a description, how many sessions it has, tokens used, cost, and a small bar chart of the last two weeks." width="1280" height="572" loading="lazy">
     </figure>
   </article>
 
-  <article class="feature reverse">
+  <article class="feature">
     <div class="feature-text">
       <h3>Where the tokens went</h3>
       <p>
@@ -97,8 +124,8 @@
         Each project keeps its README blurb, whatever notes you've added, and
         every session you've run in it. Resume picks an old session back up,
         and there's a button to start a fresh one. Either way it opens in the
-        right folder, in the terminal you actually use. Terminal, iTerm2, Warp,
-        Ghostty, Alacritty, Kitty and WezTerm all work.
+        right folder, in the terminal you actually use: Terminal, iTerm2, Warp,
+        Ghostty, Alacritty, Kitty or WezTerm.
       </p>
     </div>
     <figure class="shot">
@@ -108,10 +135,10 @@
 
 </section>
 
-<section class="band privacy">
+<section class="privacy">
   <div class="wrap">
     <h2>Nothing leaves your Mac</h2>
-    <p class="lede">
+    <p class="intro">
       Your transcripts have your source code in them, and probably a few things
       you pasted in without thinking too hard about it. So Perch doesn't send
       them anywhere. It doesn't send anything anywhere.
@@ -119,26 +146,32 @@
 
     <ul class="promises">
       <li>
-        <strong>There's no network code</strong>
-        No HTTP library anywhere in the build, no sockets in the source. The
-        build fails if anyone adds one, or writes an <code>http://</code>
-        address into the app at all.
+        <h3>There's no network code</h3>
+        <p>
+          No HTTP library anywhere in the build, no sockets in the source. The
+          build fails if anyone adds one, or writes an <code>http://</code>
+          address into the app at all.
+        </p>
       </li>
       <li>
-        <strong>No analytics, no crash reports</strong>
-        There's no setting to turn off. It was never there in the first place.
+        <h3>No analytics, no crash reports</h3>
+        <p>There's no setting to turn off. It was never there in the first place.</p>
       </li>
       <li>
-        <strong>It doesn't write to your Claude Code folder</strong>
-        Perch only reads it. Its own database and settings live somewhere else,
-        in a folder of its own. The build fails if a file-writing call turns up
-        where it shouldn't be.
+        <h3>It doesn't write to your Claude Code folder</h3>
+        <p>
+          Perch only reads it. Its own database and settings live in a folder
+          of its own. The build fails if a file-writing call turns up where it
+          shouldn't be.
+        </p>
       </li>
       <li>
-        <strong>It doesn't keep what it reads</strong>
-        Perch counts tokens and works out what state a session is in. What your
-        conversations actually say never reaches a window, a notification, a log
-        file, or the MCP server.
+        <h3>It doesn't keep what it reads</h3>
+        <p>
+          Perch counts tokens and works out what state a session is in. What
+          your conversations actually say never reaches a window, a
+          notification, a log file, or the MCP server.
+        </p>
       </li>
     </ul>
 
@@ -150,9 +183,9 @@
   </div>
 </section>
 
-<section class="wrap band">
+<section class="mcp wrap">
   <h2>Claude Code can ask it things</h2>
-  <p class="lede">
+  <p>
     There's a small MCP server inside the app. Register it and you can ask
     Claude Code about your own projects and usage:
   </p>
@@ -165,22 +198,21 @@
   </p>
 </section>
 
-<section class="band install">
+<section class="install">
   <div class="wrap">
     <h2>Installing it</h2>
     <ol class="steps">
       <li>
         <a href="https://github.com/amirdaraee/perch/releases/latest">Download
-        the latest release</a>, unzip it, and drag <strong>Perch</strong> into
-        your Applications folder.
+        the latest release</a>, unzip it, and drag Perch into your Applications
+        folder.
       </li>
       <li>
         <strong>The first time you open it, macOS will stop you.</strong> I
         haven't paid Apple $99 a year for a developer certificate, so as far as
-        your Mac is concerned Perch comes from a stranger. To get past it: open
-        <strong>System Settings</strong>, go to <strong>Privacy &amp;
-        Security</strong>, scroll to the bottom, and click
-        <strong>Open Anyway</strong>.
+        your Mac is concerned Perch comes from a stranger. To get past it, open
+        System Settings, go to Privacy &amp; Security, scroll to the bottom,
+        and click <strong>Open Anyway</strong>.
       </li>
       <li>
         After that it should just work. Perch finds your Claude Code folder on
@@ -203,11 +235,11 @@
 
 <footer>
   <div class="wrap">
-    <p>
-      <a href="https://github.com/amirdaraee/perch">GitHub</a> ·
-      <a href="https://github.com/amirdaraee/perch/releases">Releases</a> ·
-      <a href="https://github.com/amirdaraee/perch/blob/main/LICENSE">MIT</a>
-    </p>
+    <ul class="footer-links">
+      <li><a href="https://github.com/amirdaraee/perch">GitHub</a></li>
+      <li><a href="https://github.com/amirdaraee/perch/releases">Releases</a></li>
+      <li><a href="https://github.com/amirdaraee/perch/blob/main/LICENSE">MIT licence</a></li>
+    </ul>
     <p class="disclaimer">
       Perch is an independent project. It isn't affiliated with Anthropic, or
       endorsed or sponsored by them.
