@@ -163,12 +163,38 @@ jobs:
           name: adhoc
           path: ${{ runner.temp }}/adhoc
 
-      - name: Unpack the bundle
+      # The zip came from a job that ran every dependency's build script, so
+      # it is treated as untrusted until checked. It is unpacked outside the
+      # checkout, and only a plain Perch.app -- every entry under Perch.app/,
+      # no `..`, no absolute paths, no symlinks -- is copied in. Otherwise a
+      # crafted entry could overwrite the Makefile this job is about to run
+      # with the signing key in reach.
+      - name: Unpack and check the bundle
         working-directory: apps/macos/Perch
         run: |
           set -euo pipefail
-          mkdir -p build
-          ditto -x -k "$RUNNER_TEMP/adhoc/Perch-$VERSION-macos.zip" build
+          ZIP="$RUNNER_TEMP/adhoc/Perch-$VERSION-macos.zip"
+          UNPACKED="$RUNNER_TEMP/unpacked"
+
+          bad=$(zipinfo -1 "$ZIP" | grep -vE '^Perch\.app/' || true)
+          bad+=$(zipinfo -1 "$ZIP" | grep -E '(^/|(^|/)\.\.(/|$))' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::The build artefact has entries outside Perch.app/:"
+            printf '%s\n' "$bad"
+            exit 1
+          fi
+
+          rm -rf "$UNPACKED"; mkdir -p "$UNPACKED"
+          ditto -x -k "$ZIP" "$UNPACKED"
+          links=$(find "$UNPACKED" -type l)
+          if [ -n "$links" ]; then
+            echo "::error::The build artefact contains symlinks, which Perch.app never has:"
+            printf '%s\n' "$links"
+            exit 1
+          fi
+
+          rm -rf build/Perch.app; mkdir -p build
+          ditto --norsrc "$UNPACKED/Perch.app" build/Perch.app
 
       # Import, sign and throw away in one step. The keychain is a temporary
       # one, deleted on the way out whether signing worked or not; the
