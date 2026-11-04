@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Check the release zip the way a user will get it: unzipped, not the bundle
-# in build/ that it was made from.
+# Check a release download the way a user will get it: unzipped or mounted, not
+# the bundle in build/ that it was made from.
 #
-#   scripts/check-release.sh <Perch-x.y.z-macos.zip> <adhoc|notarized>
+#   scripts/check-release.sh <Perch-x.y.z-macos.zip|.dmg> <adhoc|notarized>
 #
 # Both binaries must be universal. GitHub's macOS runners are Apple Silicon, so
 # an arm64-only slip would produce an app that simply fails to launch on every
@@ -11,14 +11,35 @@
 # Gatekeeper check a user's Mac makes.
 set -uo pipefail
 
-ZIP=${1:?usage: check-release.sh <zip> <adhoc|notarized>}
-MODE=${2:?usage: check-release.sh <zip> <adhoc|notarized>}
+FILE=${1:?usage: check-release.sh <zip|dmg> <adhoc|notarized>}
+MODE=${2:?usage: check-release.sh <zip|dmg> <adhoc|notarized>}
 
 fail() { echo "::error::$*"; exit 1; }
 
 CHECK=$(mktemp -d)
-trap 'rm -rf "$CHECK"' EXIT
-ditto -x -k "$ZIP" "$CHECK" || fail "Could not unzip $ZIP."
+MOUNTED=
+cleanup() {
+  # Detached first: rm -rf must never walk into a mounted image.
+  if [ -n "$MOUNTED" ]; then
+    hdiutil detach -quiet "$CHECK" || hdiutil detach -quiet -force "$CHECK" || return
+  fi
+  rm -rf "$CHECK"
+}
+trap cleanup EXIT
+
+case "$FILE" in
+  *.dmg)
+    hdiutil attach -quiet -readonly -nobrowse -mountpoint "$CHECK" "$FILE" \
+      || fail "Could not mount $FILE."
+    MOUNTED=1
+    [ "$(readlink "$CHECK/Applications")" = /Applications ] \
+      || fail "The disk image has no link to /Applications to drag Perch onto."
+    ;;
+  *.zip)
+    ditto -x -k "$FILE" "$CHECK" || fail "Could not unzip $FILE."
+    ;;
+  *) fail "$FILE is neither a .zip nor a .dmg." ;;
+esac
 APP="$CHECK/Perch.app"
 
 for bin in Perch perch-mcp; do
@@ -43,8 +64,18 @@ case "$MODE" in
       || fail "The app is not signed with the Developer ID."
     xcrun stapler validate "$APP" || fail "The app has no stapled notarization ticket."
     spctl --assess --type execute --verbose=2 "$APP" || fail "Gatekeeper rejects the app."
+    case "$FILE" in
+      *.dmg)
+        sig=$(codesign -dv --verbose=2 "$FILE" 2>&1)
+        grep -q '^Authority=Developer ID Application' <<<"$sig" \
+          || fail "The disk image is not signed with the Developer ID."
+        xcrun stapler validate "$FILE" || fail "The disk image has no stapled notarization ticket."
+        spctl --assess --type open --context context:primary-signature --verbose=2 "$FILE" \
+          || fail "Gatekeeper rejects the disk image."
+        ;;
+    esac
     ;;
   *) fail "Unknown mode '$MODE'." ;;
 esac
 
-echo "$ZIP looks right for this release ($MODE)."
+echo "$FILE looks right for this release ($MODE)."

@@ -24,6 +24,9 @@
 #            and staples it.
 #   publish  Creates the GitHub release. The only job that can write to the
 #            repo.
+#   tap      Notarized tags only. Points the Homebrew cask at the new disk
+#            image. An ad-hoc build is never offered through Homebrew, because
+#            Gatekeeper would block it after installing.
 #
 # Setting up the secrets, once there is an Apple Developer account: create an
 # environment called `release` (Settings -> Environments), and add these as
@@ -43,9 +46,16 @@
 #   NOTARY_KEY_ID         The key's ID, the XXXXXXXXXX in the file name.
 #   NOTARY_ISSUER_ID      The Issuer ID shown above the list of keys.
 #
+# The tap job needs one more environment secret. It isn't part of choosing the
+# mode, and a release published without it is still a good release:
+#
+#   HOMEBREW_TAP_DEPLOY_KEY  The private half of an SSH deploy key with write
+#                            access to amirdaraee/homebrew-tap, and to nothing
+#                            else.
+#
 # To try the setup without publishing anything, run this workflow by hand
 # (Actions -> Release -> Run workflow). It does everything except create the
-# release, and attaches the zip to the run instead.
+# release and update the tap, and attaches the downloads to the run instead.
 #
 # Actions are pinned to full commit SHAs, not tags: a tag can be moved to
 # different code, and these run next to the signing key. Dependabot proposes
@@ -136,13 +146,18 @@ jobs:
       - name: Check the build
         working-directory: apps/macos/Perch
         env:
-          ZIP: build/Perch-${{ steps.version.outputs.version }}-macos.zip
-        run: ../../../scripts/check-release.sh "$ZIP" adhoc
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -e
+          ../../../scripts/check-release.sh "build/Perch-$VERSION-macos.zip" adhoc
+          ../../../scripts/check-release.sh "build/Perch-$VERSION-macos.dmg" adhoc
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: adhoc
-          path: apps/macos/Perch/build/Perch-${{ steps.version.outputs.version }}-macos.zip
+          path: |
+            apps/macos/Perch/build/Perch-${{ steps.version.outputs.version }}-macos.zip
+            apps/macos/Perch/build/Perch-${{ steps.version.outputs.version }}-macos.dmg
           if-no-files-found: error
 
   sign:
@@ -196,23 +211,29 @@ jobs:
           rm -rf build/Perch.app; mkdir -p build
           ditto --norsrc "$UNPACKED/Perch.app" build/Perch.app
 
-      # Import, sign and throw away in one step. The keychain is a temporary
-      # one, deleted on the way out whether signing worked or not; the
-      # certificate never touches the login keychain.
-      - name: Sign with the Developer ID
+      # Import, sign, notarize and throw away in one step, because the disk
+      # image has to be signed after the app inside it is stapled. The keychain
+      # is a temporary one, deleted on the way out whether this worked or not;
+      # the certificate never touches the login keychain. The API key is
+      # readable only by the runner's user while it exists.
+      - name: Sign and notarize
         working-directory: apps/macos/Perch
         env:
           MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
         run: |
           set -euo pipefail
           umask 077
           KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
           KEYCHAIN_PASSWORD=$(uuidgen)
           CERT="$RUNNER_TEMP/cert.p12"
+          export NOTARY_KEY_PATH="$RUNNER_TEMP/notary.p8"
           ORIGINAL_KEYCHAINS=$(security list-keychains -d user | tr -d '"')
           cleanup() {
-            rm -f "$CERT"
+            rm -f "$CERT" "$NOTARY_KEY_PATH"
             security list-keychains -d user -s $ORIGINAL_KEYCHAINS || true
             security delete-keychain "$KEYCHAIN" 2>/dev/null || true
           }
@@ -242,30 +263,24 @@ jobs:
 
           make sign package SIGN_IDENTITY="$IDENTITY"
 
-      # The API key is written, used and deleted inside this one step, and
-      # readable only by the runner's user while it exists.
-      - name: Notarize and staple
-        working-directory: apps/macos/Perch
-        env:
-          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
-          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
-          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
-        run: |
-          set -euo pipefail
-          umask 077
-          export NOTARY_KEY_PATH="$RUNNER_TEMP/notary.p8"
-          trap 'rm -f "$NOTARY_KEY_PATH"' EXIT
           printf '%s' "$NOTARY_KEY_P8" > "$NOTARY_KEY_PATH"
           make notarize
+          make dmg SIGN_IDENTITY="$IDENTITY"
+          make notarize-dmg
 
       - name: Check what users will download
         working-directory: apps/macos/Perch
-        run: ../../../scripts/check-release.sh "build/Perch-$VERSION-macos.zip" notarized
+        run: |
+          set -e
+          ../../../scripts/check-release.sh "build/Perch-$VERSION-macos.zip" notarized
+          ../../../scripts/check-release.sh "build/Perch-$VERSION-macos.dmg" notarized
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: notarized
-          path: apps/macos/Perch/build/Perch-${{ env.VERSION }}-macos.zip
+          path: |
+            apps/macos/Perch/build/Perch-${{ env.VERSION }}-macos.zip
+            apps/macos/Perch/build/Perch-${{ env.VERSION }}-macos.dmg
           if-no-files-found: error
 
       # Belt and braces: the steps above clean up after themselves, but a
@@ -299,14 +314,23 @@ jobs:
         run: |
           set -uo pipefail
           ZIP_NAME="Perch-$VERSION-macos.zip"
-          SHA=$(sha256sum "dist/$ZIP_NAME" | cut -d' ' -f1)
+          DMG_NAME="Perch-$VERSION-macos.dmg"
 
           {
             echo "## Install"
             echo
             echo "Requires macOS 15 or later. Universal (Apple Silicon and Intel)."
             echo
-            echo "Download \`$ZIP_NAME\`, unzip it, and drag \`Perch.app\` to \`/Applications\`."
+            if [ "$MODE" = notarized ]; then
+              echo '```'
+              echo "brew install amirdaraee/tap/perch"
+              echo '```'
+              echo
+              echo "Or download \`$DMG_NAME\`, open it, and drag Perch to Applications."
+            else
+              echo "Download \`$DMG_NAME\`, open it, and drag Perch to Applications."
+            fi
+            echo "\`$ZIP_NAME\` holds the same app."
             echo
             if [ "$MODE" = notarized ]; then
               echo "Perch is signed with a Developer ID and notarized by Apple, so it"
@@ -330,8 +354,8 @@ jobs:
             echo "## Verify the download"
             echo
             echo '```'
-            echo "shasum -a 256 $ZIP_NAME"
-            echo "$SHA"
+            echo "shasum -a 256 <file>"
+            (cd dist && sha256sum "$DMG_NAME" "$ZIP_NAME")
             echo '```'
             echo
             echo "## Changes"
@@ -343,19 +367,74 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" "dist/Perch-$VERSION-macos.zip" \
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/Perch-$VERSION-macos.dmg" "dist/Perch-$VERSION-macos.zip" \
             --repo "$GITHUB_REPOSITORY" \
             --title "Perch $VERSION" \
             --notes-file notes.md \
             --generate-notes
 
-      # A manual run publishes nothing; the zip and notes are attached to the
-      # run so the result can be downloaded and tried.
+      # A manual run publishes nothing; the downloads and notes are attached to
+      # the run so the result can be tried.
       - name: Keep the dry-run build
         if: github.ref_type != 'tag'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: Perch-${{ env.VERSION }}-${{ env.MODE }}-dry-run
           path: |
+            dist/Perch-${{ env.VERSION }}-macos.dmg
             dist/Perch-${{ env.VERSION }}-macos.zip
             notes.md
+
+  tap:
+    needs: [mode, build, publish]
+    if: github.ref_type == 'tag' && needs.mode.outputs.mode == 'notarized'
+    runs-on: ubuntu-latest
+    environment: release
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      # Only for write-cask.sh; nothing is built in this job.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: notarized
+          path: ${{ runner.temp }}/dist
+
+      # GitHub's host key is written out rather than fetched, so the push can't
+      # be pointed somewhere else by whoever answers first.
+      - name: Update the cask
+        env:
+          DEPLOY_KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if [ -z "$DEPLOY_KEY" ]; then
+            echo "::error::HOMEBREW_TAP_DEPLOY_KEY is not set. The release is published, but the cask still points at the previous one."
+            exit 1
+          fi
+          KEY="$RUNNER_TEMP/tap.key"
+          HOSTS="$RUNNER_TEMP/known_hosts"
+          trap 'rm -f "$KEY"' EXIT
+          printf '%s\n' "$DEPLOY_KEY" > "$KEY"
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > "$HOSTS"
+          export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOSTS -o StrictHostKeyChecking=yes"
+
+          git clone --depth 1 git@github.com:amirdaraee/homebrew-tap.git "$RUNNER_TEMP/tap"
+          mkdir -p "$RUNNER_TEMP/tap/Casks"
+          scripts/write-cask.sh "$VERSION" "$RUNNER_TEMP/dist/Perch-$VERSION-macos.dmg" \
+            > "$RUNNER_TEMP/tap/Casks/perch.rb"
+
+          cd "$RUNNER_TEMP/tap"
+          git add Casks/perch.rb
+          if git diff --cached --quiet; then
+            echo "The cask is already on $VERSION."
+            exit 0
+          fi
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -m "perch $VERSION"
+          git push origin HEAD

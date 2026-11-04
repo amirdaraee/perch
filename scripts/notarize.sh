@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# Notarize, staple and re-zip a Developer ID-signed Perch.app.
+# Notarize and staple a Developer ID-signed Perch.app or disk image.
 #
 #   scripts/notarize.sh <path/to/Perch.app> <path/to/output.zip>
+#   scripts/notarize.sh <path/to/Perch.dmg>
+#
+# The app comes first, so the copy inside the disk image carries its own ticket
+# and still opens on a Mac that is offline. Build the image from the stapled
+# app, then notarize the image as well.
 #
 # Authenticates with an App Store Connect API key, read from the environment:
 #   NOTARY_KEY_PATH   path to the AuthKey_XXXXXXXXXX.p8 file
@@ -13,47 +18,68 @@
 # two-factor prompts in CI.
 set -euo pipefail
 
-APP=${1:?usage: notarize.sh <Perch.app> <output.zip>}
-ZIP=${2:?usage: notarize.sh <Perch.app> <output.zip>}
+USAGE="usage: notarize.sh <Perch.app> <output.zip> | notarize.sh <Perch.dmg>"
+TARGET=${1:?$USAGE}
 : "${NOTARY_KEY_PATH:?NOTARY_KEY_PATH is not set}"
 : "${NOTARY_KEY_ID:?NOTARY_KEY_ID is not set}"
 : "${NOTARY_ISSUER_ID:?NOTARY_ISSUER_ID is not set}"
 
 auth=(--key "$NOTARY_KEY_PATH" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID")
 
-# Apple is sent a zip of the app; the ticket it issues is then stapled to the
-# app itself, so the zip handed to users has to be made again afterwards.
-SUBMISSION="$(dirname "$ZIP")/notarize-submission.zip"
-rm -f "$SUBMISSION"
-ditto -c -k --keepParent "$APP" "$SUBMISSION"
+submit() {
+  echo "Submitting $1 to Apple. This usually takes a few minutes."
+  local result id status
+  result=$(xcrun notarytool submit "$1" "${auth[@]}" \
+             --wait --timeout 45m --output-format json)
+  echo "$result"
 
-echo "Submitting to Apple. This usually takes a few minutes."
-RESULT=$(xcrun notarytool submit "$SUBMISSION" "${auth[@]}" \
-           --wait --timeout 45m --output-format json)
-rm -f "$SUBMISSION"
-echo "$RESULT"
+  id=$(plutil -extract id raw - <<<"$result" 2>/dev/null || true)
+  status=$(plutil -extract status raw - <<<"$result" 2>/dev/null || true)
 
-ID=$(plutil -extract id raw - <<<"$RESULT" 2>/dev/null || true)
-STATUS=$(plutil -extract status raw - <<<"$RESULT" 2>/dev/null || true)
-
-if [ "$STATUS" != "Accepted" ]; then
-  # The log is where Apple says *which* binary failed and why. Without it a
-  # rejection is just the word "Invalid".
-  if [ -n "$ID" ]; then
-    xcrun notarytool log "$ID" "${auth[@]}" || true
+  if [ "$status" != "Accepted" ]; then
+    # The log is where Apple says *which* binary failed and why. Without it a
+    # rejection is just the word "Invalid".
+    if [ -n "$id" ]; then
+      xcrun notarytool log "$id" "${auth[@]}" || true
+    fi
+    echo "Notarization was not accepted (status: ${status:-unknown})." >&2
+    exit 1
   fi
-  echo "Notarization was not accepted (status: ${STATUS:-unknown})." >&2
-  exit 1
-fi
+}
 
-# Stapling puts the ticket inside the app, so Gatekeeper can check it on a Mac
-# that is offline at first launch.
-xcrun stapler staple "$APP"
-xcrun stapler validate "$APP"
+case "$TARGET" in
+  *.dmg)
+    submit "$TARGET"
+    xcrun stapler staple "$TARGET"
+    xcrun stapler validate "$TARGET"
+    spctl --assess --type open --context context:primary-signature --verbose=2 "$TARGET"
+    echo "Notarized and stapled: $TARGET"
+    ;;
+  *.app)
+    ZIP=${2:?$USAGE}
 
-# The check a user's Mac will make. If this passes, there is no "Open Anyway".
-spctl --assess --type execute --verbose=2 "$APP"
+    # Apple is sent a zip of the app; the ticket it issues is then stapled to
+    # the app itself, so the zip handed to users has to be made again afterwards.
+    SUBMISSION="$(dirname "$ZIP")/notarize-submission.zip"
+    rm -f "$SUBMISSION"
+    ditto -c -k --keepParent "$TARGET" "$SUBMISSION"
+    submit "$SUBMISSION"
+    rm -f "$SUBMISSION"
 
-rm -f "$ZIP"
-ditto -c -k --keepParent "$APP" "$ZIP"
-echo "Notarized and stapled: $ZIP"
+    # Stapling puts the ticket inside the app, so Gatekeeper can check it on a
+    # Mac that is offline at first launch.
+    xcrun stapler staple "$TARGET"
+    xcrun stapler validate "$TARGET"
+
+    # The check a user's Mac will make. If this passes, there is no "Open Anyway".
+    spctl --assess --type execute --verbose=2 "$TARGET"
+
+    rm -f "$ZIP"
+    ditto -c -k --keepParent "$TARGET" "$ZIP"
+    echo "Notarized and stapled: $ZIP"
+    ;;
+  *)
+    echo "$USAGE" >&2
+    exit 1
+    ;;
+esac

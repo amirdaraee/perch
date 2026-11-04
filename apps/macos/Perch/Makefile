@@ -1,4 +1,4 @@
-.PHONY: framework build mcp run bundle sign package release notarize clean
+.PHONY: framework build mcp run bundle sign package dmg release notarize notarize-dmg clean
 
 ROOT := ../../..
 
@@ -42,6 +42,7 @@ export MACOSX_DEPLOYMENT_TARGET := 15.0
 
 VERSION := $(shell /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)
 ZIP := build/Perch-$(VERSION)-macos.zip
+DMG := build/Perch-$(VERSION)-macos.dmg
 
 framework:
 	$(ROOT)/scripts/build-xcframework.sh
@@ -132,6 +133,7 @@ sign:
 release:
 	$(MAKE) bundle UNIVERSAL=1
 	$(MAKE) package
+	$(MAKE) dmg
 
 # Zips and checks whatever is in build/Perch.app, as signed. Split from
 # `release` so a re-signed bundle can be packaged without being rebuilt.
@@ -149,11 +151,19 @@ package:
 	done; echo "hardened runtime ok"
 	@shasum -a 256 $(ZIP)
 
+# Wraps whatever is in build/Perch.app, as signed, in a disk image. For a
+# notarized release this runs after `notarize`, so the app inside is stapled.
+dmg:
+	$(ROOT)/scripts/make-dmg.sh build/Perch.app $(DMG) "$(SIGN_IDENTITY)"
+
 # Needs a Developer ID-signed bundle (`make sign package SIGN_IDENTITY=...`)
 # and the NOTARY_* variables described in scripts/notarize.sh. Replaces $(ZIP)
 # with one containing the stapled app.
 notarize:
 	$(ROOT)/scripts/notarize.sh build/Perch.app $(ZIP)
+
+notarize-dmg:
+	$(ROOT)/scripts/notarize.sh $(DMG)
 
 clean:
 	rm -rf .build build Frameworks Sources/PerchFFI
