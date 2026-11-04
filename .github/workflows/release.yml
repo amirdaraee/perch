@@ -109,7 +109,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -152,7 +152,7 @@ jobs:
           ../../../scripts/check-release.sh "build/Perch-$VERSION-macos.zip" adhoc
           ../../../scripts/check-release.sh "build/Perch-$VERSION-macos.dmg" adhoc
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: adhoc
           path: |
@@ -169,11 +169,11 @@ jobs:
       VERSION: ${{ needs.build.outputs.version }}
     steps:
       # Only for the Makefile and scripts; nothing is built in this job.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: adhoc
           path: ${{ runner.temp }}/adhoc
@@ -275,7 +275,7 @@ jobs:
           ../../../scripts/check-release.sh "build/Perch-$VERSION-macos.zip" notarized
           ../../../scripts/check-release.sh "build/Perch-$VERSION-macos.dmg" notarized
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: notarized
           path: |
@@ -305,7 +305,7 @@ jobs:
       VERSION: ${{ needs.build.outputs.version }}
       MODE: ${{ needs.mode.outputs.mode }}
     steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: ${{ needs.mode.outputs.mode }}
           path: dist
@@ -378,7 +378,7 @@ jobs:
       # the run so the result can be tried.
       - name: Keep the dry-run build
         if: github.ref_type != 'tag'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: Perch-${{ env.VERSION }}-${{ env.MODE }}-dry-run
           path: |
@@ -395,11 +395,11 @@ jobs:
       VERSION: ${{ needs.build.outputs.version }}
     steps:
       # Only for write-cask.sh; nothing is built in this job.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: notarized
           path: ${{ runner.temp }}/dist
