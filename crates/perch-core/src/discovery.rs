@@ -63,6 +63,21 @@ fn session_files_in(project_dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// The subagent transcripts of one session, which live beside its transcript at
+/// `<session-id>/subagents/agent-<agent-id>.jsonl`. Paired with each agent's id.
+/// A session that never ran a subagent has no such directory.
+pub fn subagent_files_of(session_file: &Path) -> Vec<(String, PathBuf)> {
+    let dir = session_file.with_extension("").join("subagents");
+    session_files_in(&dir)
+        .into_iter()
+        .filter_map(|file| {
+            let stem = file.file_stem()?.to_str()?;
+            let agent_id = stem.strip_prefix("agent-")?.to_owned();
+            Some((agent_id, file))
+        })
+        .collect()
+}
+
 /// Why one attempt to reach the user's Claude Code session data failed.
 ///
 /// Carries its own finished sentence rather than an `io::Error` for a shell

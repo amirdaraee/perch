@@ -370,3 +370,210 @@ fn one_unreadable_session_does_not_stop_other_projects() {
         "a session that could not be read must be counted, not silently dropped"
     );
 }
+
+fn response(id: &str, ts: &str, cwd: &str, output: u64) -> String {
+    format!(
+        r#"{{"type":"assistant","isSidechain":true,"cwd":"{cwd}","timestamp":"{ts}","message":{{"id":"{id}","model":"claude-fable-5","usage":{{"input_tokens":0,"output_tokens":{output},"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#
+    )
+}
+
+fn subagent_path(root: &Path, slug: &str, session: &str, agent: &str) -> std::path::PathBuf {
+    root.join(slug)
+        .join(session)
+        .join("subagents")
+        .join(format!("agent-{agent}.jsonl"))
+}
+
+fn write_subagent(root: &Path, slug: &str, session: &str, agent: &str, lines: &[String]) {
+    let p = subagent_path(root, slug, session, agent);
+    fs::create_dir_all(p.parent().unwrap()).unwrap();
+    let mut f = fs::File::create(p).unwrap();
+    for l in lines {
+        writeln!(f, "{l}").unwrap();
+    }
+}
+
+const CWD: &str = "/Users/a/one";
+const SLUG: &str = "-Users-a-one";
+
+#[test]
+fn subagent_turns_count_towards_the_session_that_ran_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_session(
+        root,
+        SLUG,
+        "aaaa",
+        &[response("own", "2026-08-18T10:00:00.000Z", CWD, 1)],
+    );
+    write_subagent(
+        root,
+        SLUG,
+        "aaaa",
+        "x1",
+        &[
+            response("sub", "2026-08-18T10:00:01.000Z", CWD, 10),
+            response("sub", "2026-08-18T10:00:02.000Z", CWD, 20),
+        ],
+    );
+
+    let db = open_in_memory().unwrap();
+    let stats = index_all(&db, root).unwrap();
+
+    assert_eq!(stats.sessions, 1, "a subagent is not a session of its own");
+    assert_eq!(stats.subagents, 1);
+    assert_eq!(db.session_count().unwrap(), 1);
+    assert_eq!(db.turn_count().unwrap(), 2);
+    assert_eq!(db.turn_totals().unwrap().1, 21);
+    let session_turns: i64 = db
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM turns WHERE session_id = 'aaaa'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(session_turns, 2);
+}
+
+#[test]
+fn a_second_pass_adds_nothing_and_new_subagent_lines_are_picked_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_session(
+        root,
+        SLUG,
+        "aaaa",
+        &[response("own", "2026-08-18T10:00:00.000Z", CWD, 1)],
+    );
+    write_subagent(
+        root,
+        SLUG,
+        "aaaa",
+        "x1",
+        &[response("sub", "2026-08-18T10:00:01.000Z", CWD, 10)],
+    );
+
+    let db = open_in_memory().unwrap();
+    index_all(&db, root).unwrap();
+    let again = index_all(&db, root).unwrap();
+    assert_eq!(again.new_turns, 0);
+    assert_eq!(db.turn_totals().unwrap().1, 11);
+
+    // The same response goes on growing while it streams, plus a new one.
+    let mut f = fs::File::options()
+        .append(true)
+        .open(subagent_path(root, SLUG, "aaaa", "x1"))
+        .unwrap();
+    writeln!(
+        f,
+        "{}",
+        response("sub", "2026-08-18T10:00:02.000Z", CWD, 30)
+    )
+    .unwrap();
+    writeln!(
+        f,
+        "{}",
+        response("next", "2026-08-18T10:00:03.000Z", CWD, 5)
+    )
+    .unwrap();
+    drop(f);
+
+    index_all(&db, root).unwrap();
+    assert_eq!(db.turn_count().unwrap(), 3);
+    assert_eq!(db.turn_totals().unwrap().1, 1 + 30 + 5);
+}
+
+#[test]
+fn a_shrunken_subagent_transcript_replaces_only_its_own_turns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_session(
+        root,
+        SLUG,
+        "aaaa",
+        &[response("own", "2026-08-18T10:00:00.000Z", CWD, 1)],
+    );
+    write_subagent(
+        root,
+        SLUG,
+        "aaaa",
+        "x1",
+        &[
+            response("old1", "2026-08-18T10:00:01.000Z", CWD, 10),
+            response("old2", "2026-08-18T10:00:02.000Z", CWD, 20),
+        ],
+    );
+    write_subagent(
+        root,
+        SLUG,
+        "aaaa",
+        "x2",
+        &[response("other", "2026-08-18T10:00:03.000Z", CWD, 100)],
+    );
+
+    let db = open_in_memory().unwrap();
+    index_all(&db, root).unwrap();
+    write_subagent(
+        root,
+        SLUG,
+        "aaaa",
+        "x1",
+        &[response("new", "2026-08-18T10:00:04.000Z", CWD, 7)],
+    );
+    index_all(&db, root).unwrap();
+
+    assert_eq!(db.turn_totals().unwrap().1, 1 + 7 + 100);
+}
+
+#[test]
+fn only_agent_transcripts_in_the_subagents_folder_are_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_session(
+        root,
+        SLUG,
+        "aaaa",
+        &[response("own", "2026-08-18T10:00:00.000Z", CWD, 1)],
+    );
+    write_subagent(
+        root,
+        SLUG,
+        "aaaa",
+        "x1",
+        &[response("sub", "2026-08-18T10:00:01.000Z", CWD, 10)],
+    );
+    let dir = root.join(SLUG).join("aaaa").join("subagents");
+    let usage_line = response("stray", "2026-08-18T10:00:02.000Z", CWD, 500);
+    fs::write(dir.join("agent-x1.meta.json"), &usage_line).unwrap();
+    fs::write(dir.join("notes.jsonl"), format!("{usage_line}\n")).unwrap();
+
+    let db = open_in_memory().unwrap();
+    let stats = index_all(&db, root).unwrap();
+
+    assert_eq!(stats.subagents, 1);
+    assert_eq!(db.turn_totals().unwrap().1, 11);
+}
+
+#[test]
+fn a_response_repeated_by_a_resumed_session_is_billed_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let shared = response("shared", "2026-08-18T10:00:00.000Z", CWD, 9);
+    write_session(root, SLUG, "aaaa", std::slice::from_ref(&shared));
+    write_session(
+        root,
+        SLUG,
+        "bbbb",
+        &[
+            shared,
+            response("later", "2026-08-18T10:00:01.000Z", CWD, 1),
+        ],
+    );
+
+    let db = open_in_memory().unwrap();
+    index_all(&db, root).unwrap();
+
+    assert_eq!(db.turn_count().unwrap(), 2);
+    assert_eq!(db.turn_totals().unwrap().1, 10);
+}

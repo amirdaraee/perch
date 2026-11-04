@@ -2,6 +2,7 @@
 
 use crate::model::{SessionMeta, Turn};
 use crate::transcript::parse_line;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -67,6 +68,7 @@ pub fn scan_from(path: &Path, offset: u64) -> std::io::Result<ScanOutcome> {
         restarted,
         ..Default::default()
     };
+    let mut turn_for_message: HashMap<String, usize> = HashMap::new();
 
     for raw in complete.split(|b| *b == b'\n') {
         if raw.is_empty() {
@@ -108,7 +110,23 @@ pub fn scan_from(path: &Path, offset: u64) -> std::io::Result<ScanOutcome> {
         }
 
         if let (Some(usage), Some(ts)) = (parsed.usage, parsed.ts) {
+            // Another line of a response already seen. Its usage replaces the
+            // earlier one, since output tokens can still be growing while a
+            // response streams. A response split across two scans is settled
+            // the same way when the turn is stored.
+            if let Some(i) = parsed
+                .message_id
+                .as_ref()
+                .and_then(|id| turn_for_message.get(id))
+            {
+                out.turns[*i].usage = usage;
+                continue;
+            }
+            if let Some(id) = &parsed.message_id {
+                turn_for_message.insert(id.clone(), out.turns.len());
+            }
             out.turns.push(Turn {
+                message_id: parsed.message_id,
                 ts,
                 model: parsed.model.unwrap_or_else(|| "unknown".to_string()),
                 usage,
@@ -142,6 +160,41 @@ mod tests {
         for l in lines {
             writeln!(f, "{l}").unwrap();
         }
+    }
+
+    fn block_of(id: &str, ts: &str, output: u64) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","message":{{"id":"{id}","model":"m","usage":{{"input_tokens":1,"output_tokens":{output}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn a_response_written_as_several_lines_is_one_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.jsonl");
+        write_lines(
+            &p,
+            &[
+                block_of("msg_1", "2026-08-18T10:00:00.000Z", 3),
+                block_of("msg_1", "2026-08-18T10:00:01.000Z", 3),
+                block_of("msg_1", "2026-08-18T10:00:02.000Z", 90),
+                block_of("msg_2", "2026-08-18T10:00:03.000Z", 7),
+            ],
+        );
+
+        let out = scan_from(&p, 0).unwrap();
+        assert_eq!(out.turns.len(), 2);
+        assert_eq!(
+            out.turns[0].usage.output, 90,
+            "the last line is the final count"
+        );
+        assert_eq!(out.turns[1].usage.output, 7);
+        assert!(
+            out.turns[0].ts < out.turns[1].ts,
+            "a turn keeps its first time"
+        );
+        // Lines, not responses: this is how many transcript lines there were.
+        assert_eq!(out.meta.message_count, 4);
     }
 
     #[test]

@@ -813,6 +813,7 @@ mod tests {
         let turns: Vec<Turn> = turns
             .iter()
             .map(|(ts, model, usage)| Turn {
+                message_id: None,
                 ts: *ts,
                 model: (*model).into(),
                 usage: *usage,

@@ -506,6 +506,7 @@ mod tests {
         db.insert_turns(
             sid,
             &[Turn {
+                message_id: None,
                 ts: last,
                 model: "claude-fable-5".into(),
                 usage: TurnUsage {

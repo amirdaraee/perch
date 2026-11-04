@@ -38,6 +38,10 @@ impl TurnUsage {
 /// One assistant message with usage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Turn {
+    /// The API response this usage belongs to. A response with several content
+    /// blocks is written as several transcript lines repeating the same usage,
+    /// so this is what keeps it from being counted once per line.
+    pub message_id: Option<String>,
     pub ts: i64,
     pub model: String,
     pub usage: TurnUsage,

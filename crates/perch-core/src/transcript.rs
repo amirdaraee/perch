@@ -11,6 +11,7 @@ pub struct ParsedLine {
     pub cc_version: Option<String>,
     pub ai_title: Option<String>,
     pub ts: Option<i64>,
+    pub message_id: Option<String>,
     pub model: Option<String>,
     pub usage: Option<TurnUsage>,
 }
@@ -87,6 +88,7 @@ pub fn parse_line(line: &str) -> Option<ParsedLine> {
         cc_version: string_at(&v, "version"),
         ai_title: string_at(&v, "aiTitle"),
         ts: parse_ts(&v),
+        message_id: message.and_then(|m| string_at(m, "id")),
         model: message.and_then(|m| string_at(m, "model")),
         usage: message.and_then(parse_usage),
     })
@@ -109,6 +111,16 @@ mod tests {
         assert_eq!(u.cache_write_5m, 0);
         assert_eq!(u.thinking, 79);
         assert_eq!(p.model.as_deref(), Some("claude-fable-5"));
+    }
+
+    #[test]
+    fn reads_the_response_id_and_tolerates_its_absence() {
+        let line = r#"{"type":"assistant","timestamp":"2026-08-18T12:16:08.619Z","message":{"id":"msg_1","usage":{"input_tokens":1}}}"#;
+        assert_eq!(
+            parse_line(line).unwrap().message_id.as_deref(),
+            Some("msg_1")
+        );
+        assert_eq!(parse_line(ASSISTANT).unwrap().message_id, None);
     }
 
     #[test]

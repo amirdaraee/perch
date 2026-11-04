@@ -97,11 +97,9 @@ wasn't: no such process, that pid isn't `claude`, or the record wouldn't parse.
 
 ### Things worth knowing
 
-* **The totals are a floor, not a total.** Perch indexes the top-level `.jsonl`
-  transcripts in each project folder. Subagent transcripts, under
-  `<session-id>/subagents/`, aren't indexed yet even though that work is billed
-  separately, so your real usage is higher than what Perch shows. Sometimes a
-  lot higher.
+* **Subagents count towards the session that ran them.** Perch indexes each
+  session's transcript and its subagent transcripts, under
+  `<session-id>/subagents/`, and counts each API response once.
 * **The model prices are placeholders.** I haven't verified them. You can edit
   them in the Prices pane. If a model has no price, Perch counts its tokens and
   says it doesn't know the cost rather than showing you a zero.

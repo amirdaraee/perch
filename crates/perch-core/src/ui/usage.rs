@@ -288,6 +288,7 @@ mod tests {
         db.insert_turns(
             sid,
             &[Turn {
+                message_id: None,
                 ts,
                 model: model.into(),
                 usage: u,

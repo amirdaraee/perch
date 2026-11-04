@@ -1,7 +1,7 @@
 //! Composes discovery, scanning, and persistence into one indexing pass.
 
 use crate::db::Db;
-use crate::discovery::{discover, parent_path_of};
+use crate::discovery::{discover, parent_path_of, subagent_files_of};
 use crate::model::SessionRecord;
 use crate::scan::scan_from;
 use anyhow::Result;
@@ -20,6 +20,10 @@ pub struct IndexStats {
     /// total, so without this counter it would disappear from the report with no
     /// signal anywhere that anything was missed.
     pub sessions_skipped: usize,
+    pub subagents: usize,
+    /// Subagent transcripts the pass could not read, for the same reason
+    /// `sessions_skipped` exists.
+    pub subagents_skipped: usize,
 }
 
 pub fn index_all(db: &Db, projects_root: &Path) -> Result<IndexStats> {
@@ -109,6 +113,8 @@ pub fn index_all(db: &Db, projects_root: &Path) -> Result<IndexStats> {
                 &outcome.turns,
                 restarted,
             )?;
+
+            index_subagents(db, session_id, file, &mut stats)?;
         }
     }
 
@@ -119,4 +125,47 @@ pub fn index_all(db: &Db, projects_root: &Path) -> Result<IndexStats> {
     }
 
     Ok(stats)
+}
+
+/// Scan one session's subagent transcripts. Their turns are stored against the
+/// parent session, so every total that session is part of includes them.
+fn index_subagents(
+    db: &Db,
+    session_id: &str,
+    session_file: &Path,
+    stats: &mut IndexStats,
+) -> Result<()> {
+    for (agent_id, file) in subagent_files_of(session_file) {
+        let offset = db.subagent_offset(session_id, &agent_id)?;
+        let outcome = match scan_from(&file, offset) {
+            Ok(o) => o,
+            // Unreadable file: skip, never fatal. Its stored turns stay as they are.
+            Err(_) => {
+                stats.subagents_skipped += 1;
+                continue;
+            }
+        };
+
+        stats.subagents += 1;
+        stats.new_turns += outcome.turns.len();
+        stats.bytes_read +=
+            outcome
+                .new_offset
+                .saturating_sub(if outcome.restarted { 0 } else { offset });
+        stats.lines_skipped += outcome.lines_skipped;
+
+        // Most subagents finished long ago, and this runs on every pass.
+        if outcome.new_offset == offset && !outcome.restarted {
+            continue;
+        }
+        db.apply_subagent_scan(
+            session_id,
+            &agent_id,
+            &file.to_string_lossy(),
+            outcome.new_offset,
+            &outcome.turns,
+            outcome.restarted,
+        )?;
+    }
+    Ok(())
 }

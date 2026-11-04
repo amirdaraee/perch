@@ -51,13 +51,15 @@ fn main() -> Result<()> {
             let started = std::time::Instant::now();
             let stats = index::index_all(&database, &root)?;
             println!(
-                "indexed {} projects, {} sessions, {} new turns, {} new bytes, {} lines skipped, {} sessions skipped in {:.2}s",
+                "indexed {} projects, {} sessions, {} new turns, {} new bytes, {} lines skipped, {} sessions skipped, {} subagents, {} subagents skipped in {:.2}s",
                 stats.projects,
                 stats.sessions,
                 stats.new_turns,
                 stats.bytes_read,
                 stats.lines_skipped,
                 stats.sessions_skipped,
+                stats.subagents,
+                stats.subagents_skipped,
                 started.elapsed().as_secs_f64()
             );
         }

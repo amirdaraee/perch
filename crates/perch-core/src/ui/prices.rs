@@ -295,6 +295,7 @@ mod tests {
 
     fn turn(model: &str, input: u64) -> Turn {
         Turn {
+            message_id: None,
             ts: 1_000,
             model: model.to_string(),
             usage: TurnUsage {

@@ -5,7 +5,7 @@ use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::path::Path;
 
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;
 
 pub struct Db {
     conn: Connection,
@@ -126,8 +126,19 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id);
 
+CREATE TABLE IF NOT EXISTS subagents (
+    session_id     TEXT NOT NULL REFERENCES sessions(id),
+    agent_id       TEXT NOT NULL,
+    file_path      TEXT NOT NULL,
+    indexed_offset INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, agent_id)
+);
+
 CREATE TABLE IF NOT EXISTS turns (
     session_id     TEXT NOT NULL REFERENCES sessions(id),
+    -- NULL for the session's own turns.
+    agent_id       TEXT,
+    message_id     TEXT,
     ts             INTEGER NOT NULL,
     model          TEXT NOT NULL,
     input          INTEGER NOT NULL DEFAULT 0,
@@ -265,6 +276,69 @@ fn migrate(conn: &Connection, existing_version: i32) -> Result<()> {
             )?;
         }
     }
+    if existing_version < 4 {
+        migrate_to_v4(conn)?;
+    }
+    Ok(())
+}
+
+/// v3 -> v4: turns record which API response they came from, and which subagent
+/// if any. Before this, a response was counted once per transcript line, so the
+/// stored turns are wrong rather than merely incomplete.
+///
+/// A session whose transcript still exists is simply rescanned. One whose
+/// transcript is gone can't be: Claude Code deletes old transcripts, which makes
+/// this index the only record of that usage, and dropping it would erase history
+/// nothing can rebuild. Its turns have no response ids to go by, but the repeated
+/// lines of a response carry identical usage, and two different responses
+/// matching on every count is unlikely, so identical rows are collapsed into one.
+///
+/// If a transcript is only unreachable for now (a moved config directory, an
+/// unmounted disk) it takes the second path, which loses nothing: it keeps its
+/// offset and carries on from there when it comes back.
+///
+/// Also runs on a brand-new database, where there is nothing to act on.
+/// `projects` is never touched.
+fn migrate_to_v4(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for column in ["agent_id", "message_id"] {
+        let exists: bool = tx
+            .prepare("SELECT 1 FROM pragma_table_info('turns') WHERE name = ?1")?
+            .exists([column])?;
+        if !exists {
+            tx.execute(&format!("ALTER TABLE turns ADD COLUMN {column} TEXT"), [])?;
+        }
+    }
+
+    let sessions: Vec<(String, String)> = tx
+        .prepare("SELECT id, file_path FROM sessions")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, file_path) in sessions {
+        if Path::new(&file_path).exists() {
+            tx.execute("DELETE FROM turns WHERE session_id = ?1", params![id])?;
+            tx.execute(
+                "UPDATE sessions SET indexed_offset = 0 WHERE id = ?1",
+                params![id],
+            )?;
+        }
+    }
+
+    tx.execute_batch(
+        "DELETE FROM subagents;
+         DELETE FROM turns WHERE rowid NOT IN (
+             SELECT MIN(rowid) FROM turns
+             GROUP BY session_id, model, input, output,
+                      cache_read, cache_write_5m, cache_write_1h
+         );
+         -- Here rather than in SCHEMA, which runs before these columns exist on
+         -- an older database. Global, not per session: a resumed session can
+         -- repeat a response from the transcript it was resumed from, and it
+         -- was only billed once.
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_message
+             ON turns(message_id) WHERE message_id IS NOT NULL;",
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -422,12 +496,61 @@ impl Db {
     pub fn apply_scan(&self, s: &SessionRecord, turns: &[Turn], restarted: bool) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         if restarted {
-            delete_turns_on(&tx, &s.id)?;
+            // Only the session's own turns: its subagents have transcripts and
+            // offsets of their own, which this restart says nothing about.
+            tx.execute(
+                "DELETE FROM turns WHERE session_id = ?1 AND agent_id IS NULL",
+                params![s.id],
+            )?;
         }
         upsert_session_on(&tx, s)?;
-        insert_turns_on(&tx, &s.id, turns)?;
+        insert_turns_on(&tx, &s.id, None, turns)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// `apply_scan` for one subagent transcript, under the same all-or-nothing
+    /// rule. The parent session's row must already exist.
+    pub fn apply_subagent_scan(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        file_path: &str,
+        indexed_offset: u64,
+        turns: &[Turn],
+        restarted: bool,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        if restarted {
+            tx.execute(
+                "DELETE FROM turns WHERE session_id = ?1 AND agent_id = ?2",
+                params![session_id, agent_id],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO subagents (session_id, agent_id, file_path, indexed_offset)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(session_id, agent_id) DO UPDATE SET
+                 file_path = ?3, indexed_offset = ?4",
+            params![session_id, agent_id, file_path, indexed_offset as i64],
+        )?;
+        insert_turns_on(&tx, session_id, Some(agent_id), turns)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn subagent_offset(&self, session_id: &str, agent_id: &str) -> Result<u64> {
+        let found = self.conn.query_row(
+            "SELECT indexed_offset FROM subagents WHERE session_id = ?1 AND agent_id = ?2",
+            params![session_id, agent_id],
+            |r| r.get::<_, i64>(0),
+        );
+        match found {
+            Ok(v) => Ok(v.max(0) as u64),
+            // Never scanned before — the normal first-pass signal.
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Err(e) => Err(e.into()),
+        }
     }
 
     pub fn session_offset(&self, session_id: &str) -> Result<u64> {
@@ -446,7 +569,7 @@ impl Db {
 
     pub fn insert_turns(&self, session_id: &str, turns: &[Turn]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        insert_turns_on(&tx, session_id, turns)?;
+        insert_turns_on(&tx, session_id, None, turns)?;
         tx.commit()?;
         Ok(())
     }
@@ -454,7 +577,7 @@ impl Db {
     /// Drop derived rows only. Never touches `projects`.
     pub fn rebuild_derived(&self) -> Result<()> {
         self.conn
-            .execute_batch("DELETE FROM turns; DELETE FROM sessions;")?;
+            .execute_batch("DELETE FROM turns; DELETE FROM subagents; DELETE FROM sessions;")?;
         Ok(())
     }
 
@@ -558,18 +681,35 @@ fn upsert_session_on(conn: &Connection, s: &SessionRecord) -> Result<()> {
     Ok(())
 }
 
-fn insert_turns_on(conn: &Connection, session_id: &str, turns: &[Turn]) -> Result<()> {
+fn insert_turns_on(
+    conn: &Connection,
+    session_id: &str,
+    agent_id: Option<&str>,
+    turns: &[Turn],
+) -> Result<()> {
     if turns.is_empty() {
         return Ok(());
     }
+    // A response already stored keeps its session and time and takes the newer
+    // usage: it may be the rest of a response whose first lines an earlier pass
+    // read while it was still being written.
     let mut stmt = conn.prepare(
-        "INSERT INTO turns (session_id, ts, model, input, output,
+        "INSERT INTO turns (session_id, agent_id, message_id, ts, model, input, output,
              cache_read, cache_write_5m, cache_write_1h, thinking)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+         ON CONFLICT(message_id) WHERE message_id IS NOT NULL DO UPDATE SET
+             input = excluded.input,
+             output = excluded.output,
+             cache_read = excluded.cache_read,
+             cache_write_5m = excluded.cache_write_5m,
+             cache_write_1h = excluded.cache_write_1h,
+             thinking = excluded.thinking",
     )?;
     for t in turns {
         stmt.execute(params![
             session_id,
+            agent_id,
+            t.message_id,
             t.ts,
             t.model,
             t.usage.input as i64,
@@ -827,6 +967,7 @@ mod tests {
             db.insert_turns(
                 "s1",
                 &[Turn {
+                    message_id: None,
                     ts: 1,
                     model: "m".into(),
                     usage: TurnUsage {
@@ -891,6 +1032,7 @@ mod tests {
         db.insert_turns(
             "s1",
             &[Turn {
+                message_id: None,
                 ts: 1,
                 model: "m".into(),
                 usage: TurnUsage {
@@ -924,16 +1066,19 @@ mod tests {
             "s1",
             &[
                 Turn {
+                    message_id: None,
                     ts: 10,
                     model: "m".into(),
                     usage: TurnUsage::default(),
                 },
                 Turn {
+                    message_id: None,
                     ts: 30,
                     model: "m".into(),
                     usage: TurnUsage::default(),
                 },
                 Turn {
+                    message_id: None,
                     ts: 20,
                     model: "m".into(),
                     usage: TurnUsage::default(),
@@ -1012,6 +1157,7 @@ mod tests {
         db.insert_turns(
             "s1",
             &[Turn {
+                message_id: None,
                 ts: 1_700_000_000_000,
                 model: "claude-fable-5".into(),
                 usage: TurnUsage {
@@ -1211,6 +1357,7 @@ mod tests {
         db.insert_turns(
             "s1",
             &[Turn {
+                message_id: None,
                 ts: 2,
                 model: "m".into(),
                 usage: TurnUsage::default(),
@@ -1230,16 +1377,17 @@ mod tests {
         );
     }
 
-    /// Stronger version of the above: build a genuinely v2-stamped database
-    /// on disk (no `notify_mode`/`notify_after_minutes` columns, `user_version
-    /// = 2`) with real indexed data already present *before* the v3 migration
-    /// runs, then reopen with today's code. This is the regression the v2
-    /// migration's own comment warns about: a reset/delete that runs after
-    /// real rows exist would be a silent data-loss path.
+    /// A genuinely v2-stamped database on disk (no `notify_mode`,
+    /// `notify_after_minutes`, `agent_id` or `message_id` columns) with real
+    /// indexed data, reopened with today's code. `s1` still has a transcript, so
+    /// its per-line turns go and it is rescanned. `gone` doesn't, so the index is
+    /// the only record of it: its repeated lines collapse and the rest stays.
     #[test]
-    fn v2_database_migrates_to_v3_and_preserves_turns_offsets_and_notes() {
+    fn upgrading_rescans_what_it_can_and_keeps_history_it_cannot_rebuild() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("v2.db");
+        let transcript = dir.path().join("s1.jsonl");
+        std::fs::write(&transcript, "").unwrap();
         {
             let conn = Connection::open(&p).unwrap();
             conn.execute_batch(
@@ -1290,13 +1438,18 @@ mod tests {
             .unwrap();
             conn.execute(
                 "INSERT INTO sessions (id, project_id, file_path, file_size, indexed_offset, message_count)
-                 VALUES ('s1', 1, '/tmp/s1.jsonl', 900, 900, 1)",
-                [],
+                 VALUES ('s1', 1, ?1, 900, 900, 1),
+                        ('gone', 1, '/nonexistent/gone.jsonl', 500, 500, 4)",
+                [transcript.to_str().unwrap()],
             )
             .unwrap();
-            conn.execute(
-                "INSERT INTO turns (session_id, ts, model, input, output) VALUES ('s1', 2, 'm', 1, 2)",
-                [],
+            conn.execute_batch(
+                "INSERT INTO turns (session_id, ts, model, input, output) VALUES
+                     ('s1', 2, 'm', 1, 2),
+                     ('gone', 10, 'm', 1, 50),
+                     ('gone', 11, 'm', 1, 50),
+                     ('gone', 12, 'm', 1, 50),
+                     ('gone', 13, 'm', 1, 7);",
             )
             .unwrap();
             conn.pragma_update(None, "user_version", 2i32).unwrap();
@@ -1304,17 +1457,128 @@ mod tests {
 
         let db = open(&p).unwrap();
         assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
-        assert_eq!(
-            db.session_offset("s1").unwrap(),
-            900,
-            "a v2 -> v3 migration must not reset offsets"
-        );
+        assert_eq!(db.session_offset("s1").unwrap(), 0, "must rescan from zero");
+        assert_eq!(db.session_offset("gone").unwrap(), 500);
+
+        let gone_turns: Vec<(i64, i64)> = db
+            .conn()
+            .prepare("SELECT ts, output FROM turns WHERE session_id = 'gone' ORDER BY ts")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(gone_turns, vec![(10, 50), (13, 7)]);
         assert_eq!(
             db.turn_count().unwrap(),
-            1,
-            "a v2 -> v3 migration must not delete turns"
+            2,
+            "s1's per-line turns must not survive"
         );
+
         assert_eq!(db.note(1).unwrap().as_deref(), Some("keep me"));
         assert_eq!(db.project_meta(1).unwrap().notify, NotifyOverride::Default);
+
+        // The new columns and the index that depends on them are really there.
+        db.insert_turns("s1", &[response("msg_1", 5)]).unwrap();
+        db.insert_turns("s1", &[response("msg_1", 5)]).unwrap();
+        assert_eq!(db.turn_count().unwrap(), 3);
+    }
+
+    fn response(message_id: &str, output: u64) -> Turn {
+        Turn {
+            message_id: Some(message_id.into()),
+            ts: 2,
+            model: "m".into(),
+            usage: TurnUsage {
+                output,
+                ..TurnUsage::default()
+            },
+        }
+    }
+
+    fn db_with_session(id: &str) -> Db {
+        let db = open_in_memory().unwrap();
+        let project_id = db.upsert_project("-a-b", "/a/b", false).unwrap();
+        db.upsert_session(&SessionRecord {
+            id: id.into(),
+            project_id,
+            file_path: format!("/tmp/{id}.jsonl"),
+            file_size: 0,
+            indexed_offset: 0,
+            started_at: None,
+            last_activity_at: None,
+            cwd: None,
+            git_branch: None,
+            cc_version: None,
+            message_count: 0,
+            title: None,
+        })
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn a_response_split_across_two_scans_is_one_turn_with_the_later_usage() {
+        let db = db_with_session("s1");
+        db.insert_turns("s1", &[response("msg_1", 5)]).unwrap();
+        db.insert_turns("s1", &[response("msg_1", 40)]).unwrap();
+
+        assert_eq!(db.turn_count().unwrap(), 1);
+        assert_eq!(db.turn_totals().unwrap().1, 40);
+    }
+
+    #[test]
+    fn turns_without_a_message_id_are_never_merged() {
+        let db = db_with_session("s1");
+        let turn = Turn {
+            message_id: None,
+            ts: 2,
+            model: "m".into(),
+            usage: TurnUsage::default(),
+        };
+        db.insert_turns("s1", &[turn.clone(), turn]).unwrap();
+        assert_eq!(db.turn_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn restarting_one_transcript_leaves_the_others_turns_alone() {
+        let db = db_with_session("s1");
+        let session = SessionRecord {
+            id: "s1".into(),
+            project_id: 1,
+            file_path: "/tmp/s1.jsonl".into(),
+            file_size: 0,
+            indexed_offset: 10,
+            started_at: None,
+            last_activity_at: None,
+            cwd: None,
+            git_branch: None,
+            cc_version: None,
+            message_count: 0,
+            title: None,
+        };
+        db.apply_scan(&session, &[response("own", 1)], false)
+            .unwrap();
+        db.apply_subagent_scan("s1", "a", "/tmp/a.jsonl", 10, &[response("a1", 2)], false)
+            .unwrap();
+        db.apply_subagent_scan("s1", "b", "/tmp/b.jsonl", 10, &[response("b1", 4)], false)
+            .unwrap();
+
+        db.apply_subagent_scan("s1", "a", "/tmp/a.jsonl", 3, &[], true)
+            .unwrap();
+        assert_eq!(db.turn_totals().unwrap().1, 1 + 4);
+        assert_eq!(db.subagent_offset("s1", "a").unwrap(), 3);
+
+        db.apply_scan(&session, &[], true).unwrap();
+        assert_eq!(db.turn_totals().unwrap().1, 4);
+    }
+
+    #[test]
+    fn rebuilding_clears_subagents_too() {
+        let db = db_with_session("s1");
+        db.apply_subagent_scan("s1", "a", "/tmp/a.jsonl", 10, &[], false)
+            .unwrap();
+        db.rebuild_derived().unwrap();
+        assert_eq!(db.subagent_offset("s1", "a").unwrap(), 0);
     }
 }

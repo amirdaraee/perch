@@ -463,6 +463,7 @@ pub(crate) mod tests {
                     db.insert_turns(
                         id,
                         &[Turn {
+                            message_id: None,
                             ts: last,
                             model: "claude-fable-5".into(),
                             usage: TurnUsage {
@@ -640,6 +641,7 @@ pub(crate) mod tests {
             db.insert_turns(
                 "s-new",
                 &[Turn {
+                    message_id: None,
                     ts: NOW - 30_000,
                     model: "claude-imaginary-9".into(),
                     usage: TurnUsage {

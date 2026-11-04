@@ -722,6 +722,7 @@ mod tests {
             "s1",
             &[
                 Turn {
+                    message_id: None,
                     ts: 1_000,
                     model: "claude-fable-5".into(),
                     usage: TurnUsage {
@@ -730,6 +731,7 @@ mod tests {
                     },
                 },
                 Turn {
+                    message_id: None,
                     ts: 5_000,
                     model: "claude-haiku-4-5-20251001".into(),
                     usage: TurnUsage {
@@ -799,6 +801,7 @@ mod tests {
         db.insert_turns(
             "s1",
             &[Turn {
+                message_id: None,
                 ts: 6_000,
                 model: "model-from-the-future".into(),
                 usage: TurnUsage {
@@ -852,6 +855,7 @@ mod tests {
         db.insert_turns(
             id,
             &[Turn {
+                message_id: None,
                 ts: last,
                 model: "claude-fable-5".into(),
                 usage: TurnUsage {
@@ -940,6 +944,7 @@ mod tests {
             "s-a",
             &[
                 Turn {
+                    message_id: None,
                     ts: 9_000,
                     model: "claude-fable-5".into(),
                     usage: TurnUsage {
@@ -948,6 +953,7 @@ mod tests {
                     },
                 },
                 Turn {
+                    message_id: None,
                     ts: 10_000,
                     model: "claude-sonnet-5".into(),
                     usage: TurnUsage {
@@ -993,6 +999,7 @@ mod tests {
         let turns: Vec<Turn> = turns
             .iter()
             .map(|(ts, model, usage)| Turn {
+                message_id: None,
                 ts: *ts,
                 model: (*model).into(),
                 usage: *usage,

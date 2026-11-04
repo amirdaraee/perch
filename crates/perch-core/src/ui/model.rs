@@ -749,6 +749,7 @@ mod tests {
         db.insert_turns(
             "a",
             &[Turn {
+                message_id: None,
                 ts: 9_000,
                 model: "claude-fable-5".into(),
                 usage: TurnUsage {
@@ -861,6 +862,7 @@ mod tests {
                 db.insert_turns(
                     "a",
                     &[Turn {
+                        message_id: None,
                         ts: 9_000,
                         model: "claude-fable-5".into(),
                         usage: TurnUsage {
@@ -922,6 +924,7 @@ mod tests {
                 db.insert_turns(
                     session_id,
                     &[Turn {
+                        message_id: None,
                         ts: 8_000,
                         model: "claude-fable-5".into(),
                         usage: TurnUsage {
@@ -1015,6 +1018,7 @@ mod tests {
         db.insert_turns(
             "a",
             &[Turn {
+                message_id: None,
                 ts: 9_000,
                 model: "claude-fable-5".into(),
                 usage: TurnUsage {
@@ -1133,6 +1137,7 @@ mod tests {
         db.insert_turns(
             "a",
             &[Turn {
+                message_id: None,
                 ts: 9_000,
                 model: "claude-fable-5".into(),
                 usage: TurnUsage {
