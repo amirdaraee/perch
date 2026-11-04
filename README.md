@@ -46,19 +46,20 @@ before it is.
 
 You need macOS 15 or later.
 
-Download the latest `.zip` from
-[Releases](https://github.com/amirdaraee/perch/releases/latest), unzip it, and
-drag `Perch.app` into your Applications folder.
+With Homebrew:
 
-**The first time you open it, macOS will stop you.** I haven't paid Apple $99 a
-year for a developer certificate, so as far as your Mac is concerned Perch comes
-from a stranger. To get past it, open **System Settings**, go to **Privacy &
-Security**, scroll to the bottom, and click **Open Anyway**.
+```
+brew install amirdaraee/tap/perch
+```
 
-On macOS 15 that's the only way in. Right-clicking and choosing Open used to
-work and doesn't any more. If you'd rather not run an unsigned binary you
-downloaded from someone's website, that seems fair enough to me given what this
-thing reads, and [building it yourself](#building-it-yourself) is two commands.
+Or download the latest `.dmg` from
+[Releases](https://github.com/amirdaraee/perch/releases/latest), open it, and
+drag Perch into your Applications folder.
+
+Perch is signed with a Developer ID and notarized by Apple, so it opens like any
+other app. If you'd rather not run a binary you downloaded from someone's
+website, that seems fair enough to me given what this thing reads, and
+[building it yourself](#building-it-yourself) is two commands.
 
 ## What it does
 

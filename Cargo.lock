@@ -638,7 +638,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "perch-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "perch-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -664,7 +664,7 @@ dependencies = [
 
 [[package]]
 name = "perch-ffi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "perch-core",
@@ -675,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "perch-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
