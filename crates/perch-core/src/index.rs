@@ -1,7 +1,7 @@
 //! Composes discovery, scanning, and persistence into one indexing pass.
 
 use crate::db::Db;
-use crate::discovery::{discover, parent_path_of, subagent_files_of};
+use crate::discovery::{discover, parent_path_of, subagent_files_of, subagent_type_of};
 use crate::model::SessionRecord;
 use crate::scan::scan_from;
 use anyhow::Result;
@@ -166,6 +166,7 @@ fn index_subagents(
             &outcome.turns,
             outcome.restarted,
         )?;
+        db.set_subagent_type(session_id, &agent_id, subagent_type_of(&file).as_deref())?;
     }
     Ok(())
 }

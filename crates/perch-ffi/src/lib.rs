@@ -317,6 +317,8 @@ pub struct SessionUsage {
     pub by_model: Vec<DetailRow>,
     pub chart_caption: String,
     pub chart: Vec<ActivityPoint>,
+    pub subagents_heading: String,
+    pub subagents: Vec<DetailRow>,
     pub note: Option<String>,
 }
 
@@ -389,6 +391,8 @@ impl From<core_session_menu::SessionUsage> for SessionUsage {
             by_model,
             chart_caption,
             chart,
+            subagents_heading,
+            subagents,
             note,
         } = u;
         SessionUsage {
@@ -398,6 +402,8 @@ impl From<core_session_menu::SessionUsage> for SessionUsage {
             by_model: by_model.into_iter().map(Into::into).collect(),
             chart_caption,
             chart: chart.into_iter().map(Into::into).collect(),
+            subagents_heading,
+            subagents: subagents.into_iter().map(Into::into).collect(),
             note,
         }
     }
@@ -2344,6 +2350,8 @@ impl Perch {
                 owning_app: owning_app.as_deref(),
                 db: database.as_ref(),
                 settings: &settings,
+                now_ms: chrono::Utc::now().timestamp_millis(),
+                process: perch_core::process::read_stats(session.pid),
             })
             .into(),
         )
@@ -3415,6 +3423,8 @@ mod tests {
                 // action, which reads neither.
                 db: None,
                 settings: &perch_core::settings::Settings::default(),
+                now_ms: 0,
+                process: None,
             },
         );
         let resume = menu

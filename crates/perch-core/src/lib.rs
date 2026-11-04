@@ -10,6 +10,7 @@ pub mod model;
 pub mod notify;
 pub mod platform;
 pub mod pricing;
+pub mod process;
 pub mod query;
 pub mod readme;
 pub mod scan;

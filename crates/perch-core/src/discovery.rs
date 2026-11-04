@@ -78,6 +78,25 @@ pub fn subagent_files_of(session_file: &Path) -> Vec<(String, PathBuf)> {
         .collect()
 }
 
+/// What this metadata file is read for, and all it is read for. The file also
+/// holds the task's description, which is written from the conversation. No
+/// transcript or message content may enter Perch, so that field isn't declared
+/// here and never gets past parsing.
+#[derive(serde::Deserialize)]
+struct AgentMeta {
+    #[serde(rename = "agentType")]
+    agent_type: Option<String>,
+}
+
+/// The kind of agent a subagent transcript belongs to, like `Explore`, from the
+/// `agent-<id>.meta.json` beside it. `None` when there is no such file, it won't
+/// parse, or it doesn't say.
+pub fn subagent_type_of(transcript: &Path) -> Option<String> {
+    let raw = fs::read_to_string(transcript.with_extension("meta.json")).ok()?;
+    let meta: AgentMeta = serde_json::from_str(&raw).ok()?;
+    meta.agent_type.filter(|t| !t.is_empty())
+}
+
 /// Why one attempt to reach the user's Claude Code session data failed.
 ///
 /// Carries its own finished sentence rather than an `io::Error` for a shell

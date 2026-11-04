@@ -129,6 +129,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id);
 CREATE TABLE IF NOT EXISTS subagents (
     session_id     TEXT NOT NULL REFERENCES sessions(id),
     agent_id       TEXT NOT NULL,
+    agent_type     TEXT,
     file_path      TEXT NOT NULL,
     indexed_offset INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (session_id, agent_id)
@@ -536,6 +537,22 @@ impl Db {
         )?;
         insert_turns_on(&tx, session_id, Some(agent_id), turns)?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Which kind of agent this is, when Perch could tell. `None` leaves
+    /// whatever is already stored.
+    pub fn set_subagent_type(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+        agent_type: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE subagents SET agent_type = COALESCE(?3, agent_type)
+             WHERE session_id = ?1 AND agent_id = ?2",
+            params![session_id, agent_id, agent_type],
+        )?;
         Ok(())
     }
 

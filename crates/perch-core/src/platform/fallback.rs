@@ -14,3 +14,8 @@ impl ProcessProbe for RealProcessProbe {
         None
     }
 }
+
+/// Nothing to report, for the same reason as above.
+pub fn process_table() -> Option<String> {
+    None
+}

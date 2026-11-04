@@ -117,6 +117,7 @@ final class SessionSubmenu: NSObject, NSMenuDelegate {
             && usage.byModel.isEmpty
             && usage.chartCaption.isEmpty
             && usage.chart.isEmpty
+            && usage.subagents.isEmpty
             && usage.note == nil
     }
 

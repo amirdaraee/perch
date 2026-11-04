@@ -31,3 +31,18 @@ impl ProcessProbe for RealProcessProbe {
             .map(|n| n.to_string_lossy().into_owned())
     }
 }
+
+/// Every process as `pid ppid %cpu rss-in-kb`, for `crate::process`. Numbers only,
+/// never a command line. `%cpu` is `ps`'s own decaying average, so one read means
+/// something without Perch having to sample over time. `LC_ALL=C` keeps the
+/// decimal separator a full stop under every language setting.
+pub fn process_table() -> Option<String> {
+    let out = std::process::Command::new("/bin/ps")
+        .args(["-axo", "pid=,ppid=,pcpu=,rss="])
+        .env("LC_ALL", "C")
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}

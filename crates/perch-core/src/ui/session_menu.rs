@@ -4,9 +4,10 @@
 
 use crate::db::Db;
 use crate::model::TurnUsage;
+use crate::process::ProcessStats;
 use crate::query::{self, SessionActivity};
 use crate::settings::Settings;
-use crate::ui::format::{human_cost, human_elapsed, human_tokens};
+use crate::ui::format::{human_bytes, human_cost, human_elapsed, human_tokens};
 use crate::ui::model::SessionRow;
 
 /// One labelled fact. Both halves are final strings; a shell puts them side
@@ -75,6 +76,11 @@ pub struct SessionUsage {
     /// "Activity over 3h", or empty when there is no chart to caption.
     pub chart_caption: String,
     pub chart: Vec<ActivityPoint>,
+    /// "3 subagents · 1 active", or empty when this session has run none.
+    pub subagents_heading: String,
+    /// One row per subagent, most recently active first. The label is the kind
+    /// of agent and never what it was asked to do, which is message content.
+    pub subagents: Vec<DetailRow>,
     /// The sentence shown in place of all of the above when there is nothing
     /// to show — no turns recorded, or no index to read them from. `None`
     /// whenever there is.
@@ -124,6 +130,11 @@ pub struct SessionContext<'a> {
     /// this menu still reaches it by way of `ctx.row`, and the two are held
     /// together by a test that hiding usage empties both at once.
     pub settings: &'a Settings,
+    /// What "active" and "5m ago" are measured against.
+    pub now_ms: i64,
+    /// CPU and memory for the session's process and everything it started.
+    /// `None` when they couldn't be read, which shows as an em dash.
+    pub process: Option<ProcessStats>,
 }
 
 const DASH: &str = "—";
@@ -157,6 +168,17 @@ fn or_dash(s: &str) -> &str {
 /// a warm-up, a long quiet stretch, a burst at the end — and few enough that
 /// each one is still a readable bar inside a menu.
 const ACTIVITY_BUCKETS: usize = 16;
+
+/// How recently a subagent's transcript must have changed for it to count as
+/// active. Claude Code records no finish for a subagent that Perch can read
+/// without opening message content, so this says what is known, that it wrote
+/// something just now, and doesn't claim it has finished otherwise. Long enough
+/// to span an ordinary tool call, during which nothing is written.
+const SUBAGENT_ACTIVE_WITHIN_MS: i64 = 120_000;
+
+/// How many subagents get a row of their own. A menu has to fit on the screen,
+/// and a session can run hundreds; the rest are summed into one row.
+const MAX_SUBAGENT_ROWS: usize = 8;
 
 /// The detail rows, the usage section and the actions for one live session.
 ///
@@ -208,6 +230,28 @@ fn tokens_and_cost(tokens: u64, cost_usd: f64, show_cost: bool) -> String {
     }
 }
 
+/// [`tokens_and_cost`] for something that may have no price. A cost of zero
+/// only because Perch doesn't know the price says "no price", since Perch never
+/// shows a made-up zero. When part of it is priced, that part still shows.
+fn tokens_and_known_cost(tokens: u64, cost_usd: f64, unpriced: bool, show_cost: bool) -> String {
+    if show_cost && unpriced && cost_usd == 0.0 {
+        format!("{} · no price", human_tokens(tokens))
+    } else {
+        tokens_and_cost(tokens, cost_usd, show_cost)
+    }
+}
+
+/// How long ago, for something that can be weeks old: `human_elapsed` stops at
+/// hours, and "1164h ago" takes arithmetic to read.
+fn human_ago(ms: i64) -> String {
+    const TWO_DAYS_MS: i64 = 48 * 3_600_000;
+    if ms >= TWO_DAYS_MS {
+        format!("{}d ago", ms / (24 * 3_600_000))
+    } else {
+        format!("{} ago", human_elapsed(ms))
+    }
+}
+
 fn activity_points(activity: &SessionActivity) -> (String, Vec<ActivityPoint>) {
     let span = activity.last_ts - activity.first_ts;
     // Nothing to plot across: a session whose turns share one instant has no
@@ -256,10 +300,11 @@ fn usage_section(ctx: &SessionContext) -> SessionUsage {
         return nothing("Perch could not read its index, so this session's usage is unknown.");
     };
     let id = &ctx.row.id;
-    let (Ok((totals, cost)), Ok(by_model), Ok(activity)) = (
+    let (Ok((totals, cost)), Ok(by_model), Ok(activity), Ok(subagents)) = (
         query::session_usage(db, id),
         query::session_usage_by_model(db, id),
         query::session_activity(db, id, ACTIVITY_BUCKETS),
+        query::session_subagents(db, id),
     ) else {
         return nothing("Perch could not read its index, so this session's usage is unknown.");
     };
@@ -272,6 +317,7 @@ fn usage_section(ctx: &SessionContext) -> SessionUsage {
 
     let show_cost = ctx.settings.show_cost;
     let (chart_caption, chart) = activity_points(&activity);
+    let (subagents_heading, subagents) = subagent_rows(subagents, ctx.now_ms, show_cost);
     // One model restates the total; the rows only earn their space when there
     // is something to compare.
     let by_model: Vec<DetailRow> = if by_model.len() > 1 {
@@ -279,7 +325,12 @@ fn usage_section(ctx: &SessionContext) -> SessionUsage {
             .iter()
             .map(|(model, u, c)| DetailRow {
                 label: model.clone(),
-                value: tokens_and_cost(u.total_tokens(), *c, show_cost),
+                value: tokens_and_known_cost(
+                    u.total_tokens(),
+                    *c,
+                    u.total_tokens() > 0 && !query::model_has_price(db, model).unwrap_or(true),
+                    show_cost,
+                ),
             })
             .collect()
     } else {
@@ -300,8 +351,94 @@ fn usage_section(ctx: &SessionContext) -> SessionUsage {
         by_model,
         chart_caption,
         chart,
+        subagents_heading,
+        subagents,
         note: None,
     }
+}
+
+/// When a subagent last did anything: whichever is later of its transcript
+/// changing and its last recorded turn. The file comes first because tool
+/// results are written to it and aren't turns, and the index lags it by a pass.
+fn subagent_last_active(s: &query::SubagentUsage) -> Option<i64> {
+    let modified = std::fs::metadata(&s.file_path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64);
+    modified.max(s.last_ts)
+}
+
+fn subagent_rows(
+    subagents: Vec<query::SubagentUsage>,
+    now_ms: i64,
+    show_cost: bool,
+) -> (String, Vec<DetailRow>) {
+    let mut rows: Vec<(Option<i64>, query::SubagentUsage)> = subagents
+        .into_iter()
+        .map(|s| (subagent_last_active(&s), s))
+        .collect();
+    if rows.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    // Most recent first, ties broken by name so the order never depends on
+    // SQLite's row order.
+    rows.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.agent_type.cmp(&b.1.agent_type))
+    });
+
+    let is_active = |last: Option<i64>| {
+        last.is_some_and(|t| now_ms.saturating_sub(t) < SUBAGENT_ACTIVE_WITHIN_MS)
+    };
+    let active = rows.iter().filter(|(last, _)| is_active(*last)).count();
+    let total = rows.len();
+    let count = if total == 1 {
+        "1 subagent".to_string()
+    } else {
+        format!("{total} subagents")
+    };
+    let heading = if active > 0 {
+        format!("{count} · {active} active")
+    } else {
+        count
+    };
+
+    let rest = rows.split_off(total.min(MAX_SUBAGENT_ROWS));
+    let mut out: Vec<DetailRow> = rows
+        .iter()
+        .map(|(last, s)| {
+            let when = match last {
+                _ if is_active(*last) => "active".to_string(),
+                Some(t) => human_ago(now_ms - t),
+                None => DASH.to_string(),
+            };
+            DetailRow {
+                label: s
+                    .agent_type
+                    .clone()
+                    .unwrap_or_else(|| "Subagent".to_string()),
+                value: format!(
+                    "{when} · {}",
+                    tokens_and_known_cost(
+                        s.usage.total_tokens(),
+                        s.cost_usd,
+                        s.has_unpriced,
+                        show_cost
+                    )
+                ),
+            }
+        })
+        .collect();
+    if !rest.is_empty() {
+        let tokens = rest.iter().map(|(_, s)| s.usage.total_tokens()).sum();
+        let cost = rest.iter().map(|(_, s)| s.cost_usd).sum();
+        out.push(DetailRow {
+            label: format!("{} more", rest.len()),
+            value: tokens_and_cost(tokens, cost, show_cost),
+        });
+    }
+    (heading, out)
 }
 
 fn detail_rows(ctx: &SessionContext) -> Vec<DetailRow> {
@@ -329,8 +466,37 @@ fn detail_rows(ctx: &SessionContext) -> Vec<DetailRow> {
         },
     );
     push(&mut out, "Process", &row.pid.to_string());
+    let (cpu, memory) = process_rows(ctx.process.as_ref());
+    push(&mut out, "CPU", &cpu);
+    push(&mut out, "Memory", &memory);
     push(&mut out, "Session", or_dash(&row.id));
     out
+}
+
+/// The values of the CPU and Memory rows. They say when they include child
+/// processes, because a session running a build reads very differently from one
+/// that is using that much by itself.
+fn process_rows(stats: Option<&ProcessStats>) -> (String, String) {
+    let Some(stats) = stats else {
+        return (DASH.to_string(), DASH.to_string());
+    };
+    let cpu = if stats.cpu_percent > 0.0 && stats.cpu_percent < 1.0 {
+        "<1%".to_string()
+    } else {
+        format!("{:.0}%", stats.cpu_percent)
+    };
+    let memory = human_bytes(stats.memory_bytes);
+    match stats.child_processes {
+        0 => (cpu, memory),
+        1 => (
+            format!("{cpu} including 1 child process"),
+            format!("{memory} including 1 child process"),
+        ),
+        n => (
+            format!("{cpu} including {n} child processes"),
+            format!("{memory} including {n} child processes"),
+        ),
+    }
 }
 
 fn actions(ctx: &SessionContext) -> Vec<MenuAction> {
@@ -475,6 +641,8 @@ mod tests {
             owning_app: app,
             db,
             settings,
+            now_ms: 65_000,
+            process: None,
         })
     }
 
@@ -750,6 +918,8 @@ mod tests {
                 "Cost",
                 "Claude Code",
                 "Process",
+                "CPU",
+                "Memory",
                 "Session",
             ]
         );
@@ -1097,6 +1267,287 @@ mod tests {
 
         assert_eq!(value(&m, "Tokens").as_deref(), Some("2.0M"));
         assert_eq!(value(&m, "Cost").as_deref(), Some("$30.00"));
+    }
+
+    // ---- cpu and memory -------------------------------------------------------
+
+    fn stats(cpu_percent: f64, memory_bytes: u64, child_processes: usize) -> ProcessStats {
+        ProcessStats {
+            cpu_percent,
+            memory_bytes,
+            child_processes,
+        }
+    }
+
+    #[test]
+    fn unreadable_process_stats_are_unknown_never_zero() {
+        let s = live("/Users/a/proj", None);
+        let m = menu(&row_for(&s, &Settings::default()), &s.cwd, None, None);
+        assert_eq!(value(&m, "CPU").as_deref(), Some(DASH));
+        assert_eq!(value(&m, "Memory").as_deref(), Some(DASH));
+    }
+
+    #[test]
+    fn a_process_alone_shows_just_its_numbers() {
+        assert_eq!(
+            process_rows(Some(&stats(12.4, 310_000_000, 0))),
+            ("12%".to_string(), "310.0 MB".to_string())
+        );
+    }
+
+    #[test]
+    fn child_processes_are_called_out_and_counted() {
+        assert_eq!(
+            process_rows(Some(&stats(140.0, 2_000_000_000, 1))),
+            (
+                "140% including 1 child process".to_string(),
+                "2.0 GB including 1 child process".to_string()
+            )
+        );
+        assert!(process_rows(Some(&stats(1.0, 1, 3)))
+            .0
+            .ends_with("3 child processes"));
+    }
+
+    #[test]
+    fn a_trace_of_cpu_is_not_rounded_away_to_nothing() {
+        assert_eq!(process_rows(Some(&stats(0.2, 1, 0))).0, "<1%");
+        assert_eq!(process_rows(Some(&stats(0.0, 1, 0))).0, "0%");
+    }
+
+    // ---- subagents -----------------------------------------------------------
+
+    const NOW: i64 = 10_000_000;
+
+    fn turn(id: &str, ts: i64, output: u64) -> Turn {
+        Turn {
+            message_id: Some(id.into()),
+            ts,
+            model: "claude-fable-5".into(),
+            usage: TurnUsage {
+                output,
+                ..TurnUsage::default()
+            },
+        }
+    }
+
+    /// Adds a subagent whose transcript path doesn't exist, so it is dated by
+    /// its turn alone and its age is exact.
+    fn add_subagent(db: &Db, agent: &str, kind: Option<&str>, ts: i64, output: u64) {
+        db.apply_subagent_scan(
+            "0f2c-9a11",
+            agent,
+            &format!("/nonexistent/agent-{agent}.jsonl"),
+            1,
+            &[turn(&format!("msg-{agent}"), ts, output)],
+            false,
+        )
+        .unwrap();
+        db.set_subagent_type("0f2c-9a11", agent, kind).unwrap();
+    }
+
+    fn subagent_section(db: &Db, settings: &Settings) -> SessionUsage {
+        let s = live("/Users/a/proj", None);
+        let row = row_from(Some(db), &s, settings);
+        build_session_menu(&SessionContext {
+            row: &row,
+            cwd: &s.cwd,
+            branch: None,
+            owning_app: None,
+            db: Some(db),
+            settings,
+            now_ms: NOW,
+            process: None,
+        })
+        .usage
+    }
+
+    fn with_own_turn() -> Db {
+        indexed(&[(1_000, "claude-fable-5", spread(10, 10, 0, 0))])
+    }
+
+    #[test]
+    fn a_session_with_no_subagents_has_no_such_section() {
+        let usage = subagent_section(&with_own_turn(), &Settings::default());
+        assert_eq!(usage.subagents_heading, "");
+        assert!(usage.subagents.is_empty());
+    }
+
+    #[test]
+    fn subagents_are_listed_most_recent_first_with_their_type_and_age() {
+        let db = with_own_turn();
+        add_subagent(&db, "old", Some("Plan"), NOW - 300_000, 2_000);
+        add_subagent(&db, "new", Some("Explore"), NOW - 5_000, 12_000);
+        let settings = Settings {
+            show_cost: false,
+            ..Settings::default()
+        };
+
+        let usage = subagent_section(&db, &settings);
+
+        assert_eq!(usage.subagents_heading, "2 subagents · 1 active");
+        assert_eq!(usage.subagents[0].label, "Explore");
+        assert_eq!(
+            usage.subagents[0].value,
+            format!("active · {}", human_tokens(12_000))
+        );
+        assert_eq!(usage.subagents[1].label, "Plan");
+        assert_eq!(
+            usage.subagents[1].value,
+            format!("5m ago · {}", human_tokens(2_000))
+        );
+    }
+
+    #[test]
+    fn one_quiet_subagent_is_worded_in_the_singular_with_no_active_count() {
+        let db = with_own_turn();
+        add_subagent(&db, "a", Some("Explore"), NOW - 300_000, 1);
+        let usage = subagent_section(&db, &Settings::default());
+        assert_eq!(usage.subagents_heading, "1 subagent");
+    }
+
+    #[test]
+    fn a_subagent_of_unknown_type_still_gets_a_row() {
+        let db = with_own_turn();
+        add_subagent(&db, "a", None, NOW - 300_000, 1);
+        let usage = subagent_section(&db, &Settings::default());
+        assert_eq!(usage.subagents[0].label, "Subagent");
+    }
+
+    #[test]
+    fn an_old_subagent_is_dated_in_days() {
+        assert_eq!(human_ago(47 * 3_600_000), "47h ago");
+        assert_eq!(human_ago(1164 * 3_600_000), "48d ago");
+    }
+
+    #[test]
+    fn a_model_with_no_price_says_so_rather_than_showing_a_zero() {
+        let db = indexed(&[
+            (1_000, "claude-fable-5", spread(1_000_000, 0, 0, 0)),
+            (2_000, "made-up-model", spread(1_000_000, 0, 0, 0)),
+        ]);
+        db.apply_subagent_scan(
+            "0f2c-9a11",
+            "a",
+            "/nonexistent/agent-a.jsonl",
+            1,
+            &[Turn {
+                message_id: Some("msg-a".into()),
+                ts: NOW - 300_000,
+                model: "made-up-model".into(),
+                usage: spread(1_000, 0, 0, 0),
+            }],
+            false,
+        )
+        .unwrap();
+
+        let usage = subagent_section(&db, &Settings::default());
+
+        assert!(
+            usage.subagents[0].value.ends_with("· no price"),
+            "{:?}",
+            usage.subagents
+        );
+        let unpriced = usage
+            .by_model
+            .iter()
+            .find(|r| r.label == "made-up-model")
+            .unwrap();
+        assert!(unpriced.value.ends_with("· no price"), "{unpriced:?}");
+        let priced = usage
+            .by_model
+            .iter()
+            .find(|r| r.label == "claude-fable-5")
+            .unwrap();
+        assert!(priced.value.contains('$'), "{priced:?}");
+    }
+
+    #[test]
+    fn a_long_list_is_cut_short_and_the_rest_are_summed() {
+        let db = with_own_turn();
+        for i in 0..11 {
+            add_subagent(
+                &db,
+                &format!("a{i}"),
+                Some("Explore"),
+                NOW - 300_000 - i,
+                1_000,
+            );
+        }
+        let settings = Settings {
+            show_cost: false,
+            ..Settings::default()
+        };
+
+        let usage = subagent_section(&db, &settings);
+
+        assert_eq!(usage.subagents_heading, "11 subagents");
+        assert_eq!(usage.subagents.len(), MAX_SUBAGENT_ROWS + 1);
+        let last = usage.subagents.last().unwrap();
+        assert_eq!(last.label, "3 more");
+        assert_eq!(last.value, human_tokens(3_000));
+    }
+
+    #[test]
+    fn hiding_cost_or_usage_applies_to_subagents_too() {
+        let db = with_own_turn();
+        add_subagent(&db, "a", Some("Explore"), NOW - 5_000, 1_000_000);
+
+        let shown = subagent_section(&db, &Settings::default());
+        assert!(
+            shown.subagents[0].value.contains('$'),
+            "{:?}",
+            shown.subagents
+        );
+
+        let no_cost = Settings {
+            show_cost: false,
+            ..Settings::default()
+        };
+        assert!(!subagent_section(&db, &no_cost).subagents[0]
+            .value
+            .contains('$'));
+
+        let no_usage = Settings {
+            show_row_usage: false,
+            ..Settings::default()
+        };
+        assert_eq!(subagent_section(&db, &no_usage), SessionUsage::default());
+    }
+
+    #[test]
+    fn a_transcript_written_just_now_is_active_though_its_last_turn_is_old() {
+        // A long tool call: the result was written, no new response yet.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("agent-a.jsonl");
+        std::fs::write(&file, "x").unwrap();
+        let db = with_own_turn();
+        db.apply_subagent_scan(
+            "0f2c-9a11",
+            "a",
+            file.to_str().unwrap(),
+            1,
+            &[turn("msg-a", 1_000, 1)],
+            false,
+        )
+        .unwrap();
+        let s = live("/Users/a/proj", None);
+        let settings = Settings::default();
+        let row = row_from(Some(&db), &s, &settings);
+
+        let usage = build_session_menu(&SessionContext {
+            row: &row,
+            cwd: &s.cwd,
+            branch: None,
+            owning_app: None,
+            db: Some(&db),
+            settings: &settings,
+            now_ms: chrono::Utc::now().timestamp_millis(),
+            process: None,
+        })
+        .usage;
+
+        assert_eq!(usage.subagents_heading, "1 subagent · 1 active");
     }
 
     impl SessionMenu {

@@ -12,9 +12,9 @@ pub trait ProcessProbe: Send + Sync {
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub use macos::RealProcessProbe;
+pub use macos::{process_table, RealProcessProbe};
 
 #[cfg(not(target_os = "macos"))]
 mod fallback;
 #[cfg(not(target_os = "macos"))]
-pub use fallback::RealProcessProbe;
+pub use fallback::{process_table, RealProcessProbe};

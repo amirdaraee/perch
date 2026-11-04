@@ -577,3 +577,99 @@ fn a_response_repeated_by_a_resumed_session_is_billed_once() {
     assert_eq!(db.turn_count().unwrap(), 2);
     assert_eq!(db.turn_totals().unwrap().1, 10);
 }
+
+#[test]
+fn a_subagents_type_is_read_and_its_description_is_not_stored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_session(
+        root,
+        SLUG,
+        "aaaa",
+        &[response("own", "2026-08-18T10:00:00.000Z", CWD, 1)],
+    );
+    write_subagent(
+        root,
+        SLUG,
+        "aaaa",
+        "x1",
+        &[response("sub", "2026-08-18T10:00:01.000Z", CWD, 10)],
+    );
+    let secret = "sentinel-task-description";
+    fs::write(
+        root.join(SLUG)
+            .join("aaaa")
+            .join("subagents")
+            .join("agent-x1.meta.json"),
+        format!(r#"{{"agentType":"Explore","description":"{secret}"}}"#),
+    )
+    .unwrap();
+
+    let db = open_in_memory().unwrap();
+    index_all(&db, root).unwrap();
+
+    let rows = perch_core::query::session_subagents(&db, "aaaa").unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].agent_type.as_deref(), Some("Explore"));
+    assert_eq!(rows[0].usage.output, 10);
+
+    // Nowhere in the index, whichever table you look in.
+    let mut stmt = db
+        .conn()
+        .prepare("SELECT agent_id, agent_type, file_path FROM subagents")
+        .unwrap();
+    let stored: Vec<String> = stmt
+        .query_map([], |r| {
+            Ok(format!(
+                "{}{}{}",
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                r.get::<_, String>(2)?
+            ))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(!stored.join("").contains(secret));
+}
+
+#[test]
+fn a_subagent_without_usable_metadata_still_counts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_session(
+        root,
+        SLUG,
+        "aaaa",
+        &[response("own", "2026-08-18T10:00:00.000Z", CWD, 1)],
+    );
+    write_subagent(
+        root,
+        SLUG,
+        "aaaa",
+        "x1",
+        &[response("sub1", "2026-08-18T10:00:01.000Z", CWD, 10)],
+    );
+    write_subagent(
+        root,
+        SLUG,
+        "aaaa",
+        "x2",
+        &[response("sub2", "2026-08-18T10:00:01.000Z", CWD, 20)],
+    );
+    fs::write(
+        root.join(SLUG)
+            .join("aaaa")
+            .join("subagents")
+            .join("agent-x2.meta.json"),
+        "{not json",
+    )
+    .unwrap();
+
+    let db = open_in_memory().unwrap();
+    index_all(&db, root).unwrap();
+
+    let rows = perch_core::query::session_subagents(&db, "aaaa").unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.agent_type.is_none()));
+}

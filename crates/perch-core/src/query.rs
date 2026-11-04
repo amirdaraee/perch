@@ -281,6 +281,81 @@ pub fn session_usage_by_model(db: &Db, session_id: &str) -> Result<Vec<(String, 
     Ok(out)
 }
 
+/// One subagent's share of a session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubagentUsage {
+    pub agent_type: Option<String>,
+    pub file_path: String,
+    /// Its most recent turn. `None` for a subagent with no turns yet.
+    pub last_ts: Option<i64>,
+    pub usage: TurnUsage,
+    pub cost_usd: f64,
+    /// It spent tokens on a model Perch has no price for, so `cost_usd` leaves
+    /// that work out.
+    pub has_unpriced: bool,
+}
+
+/// Whether Perch has a price for this model at all. Unpriced tokens add nothing
+/// to a cost, so a cost of zero alone can't say which of the two it means.
+pub fn model_has_price(db: &Db, model: &str) -> Result<bool> {
+    Ok(price_for(db, model)?.is_some())
+}
+
+/// Every subagent this session has run, each priced per model and summed.
+pub fn session_subagents(db: &Db, session_id: &str) -> Result<Vec<SubagentUsage>> {
+    let mut stmt = db.conn().prepare(&format!(
+        "SELECT sa.agent_id, sa.agent_type, sa.file_path, t.model, MAX(t.ts), {SUMS}
+         FROM subagents sa
+         LEFT JOIN turns t ON t.session_id = sa.session_id AND t.agent_id = sa.agent_id
+         WHERE sa.session_id = ?1
+         GROUP BY sa.agent_id, t.model"
+    ))?;
+    let rows = stmt
+        .query_map(params![session_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                TurnUsage {
+                    input: r.get::<_, i64>(5)? as u64,
+                    output: r.get::<_, i64>(6)? as u64,
+                    cache_read: r.get::<_, i64>(7)? as u64,
+                    cache_write_5m: r.get::<_, i64>(8)? as u64,
+                    cache_write_1h: r.get::<_, i64>(9)? as u64,
+                    thinking: r.get::<_, i64>(10)? as u64,
+                },
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut by_agent: std::collections::BTreeMap<String, SubagentUsage> = Default::default();
+    for (agent_id, agent_type, file_path, model, last_ts, usage) in rows {
+        let cost = match &model {
+            Some(m) => cost_of(db, m, &usage)?,
+            None => 0.0,
+        };
+        let unpriced = match &model {
+            Some(m) => usage.total_tokens() > 0 && !model_has_price(db, m)?,
+            None => false,
+        };
+        let entry = by_agent.entry(agent_id).or_insert(SubagentUsage {
+            agent_type,
+            file_path,
+            last_ts: None,
+            usage: TurnUsage::default(),
+            cost_usd: 0.0,
+            has_unpriced: false,
+        });
+        entry.has_unpriced |= unpriced;
+        entry.last_ts = entry.last_ts.max(last_ts);
+        entry.usage = entry.usage.plus(&usage);
+        entry.cost_usd += cost;
+    }
+    Ok(by_agent.into_values().collect())
+}
+
 /// One session's own activity over its own lifetime: its turns bucketed into
 /// `buckets` equal slices of the span between its first turn and its last,
 /// oldest first, quiet slices present and zeroed.

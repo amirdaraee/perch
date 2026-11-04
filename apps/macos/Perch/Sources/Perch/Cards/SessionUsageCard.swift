@@ -4,8 +4,8 @@ import PerchFFI
 
 /// What one session has spent, drawn under its facts in its own submenu: the
 /// four token classes broken out and totalled, the models that spent them
-/// when there was more than one, and the shape of the session's activity over
-/// its own lifetime.
+/// when there was more than one, its subagents, and the shape of the session's
+/// activity over its own lifetime.
 ///
 /// Nothing here is composed. Every heading, every label, every value and
 /// every caption on the chart's axis arrives finished from Rust — including
@@ -38,6 +38,11 @@ struct SessionUsageCard: View {
             if !usage.byModel.isEmpty {
                 heading(usage.modelsHeading)
                 DetailRowsGrid(rows: usage.byModel)
+            }
+
+            if !usage.subagents.isEmpty {
+                heading(usage.subagentsHeading)
+                DetailRowsGrid(rows: usage.subagents)
             }
 
             if !usage.chart.isEmpty {
