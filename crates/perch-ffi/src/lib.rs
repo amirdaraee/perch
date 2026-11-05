@@ -567,6 +567,7 @@ pub struct UsageModel {
     pub top_projects: Vec<RankedProject>,
     pub by_model: Vec<ModelUsage>,
     pub burn_rate: Option<String>,
+    pub unpriced_note: Option<String>,
     pub has_data: bool,
 }
 
@@ -808,6 +809,7 @@ impl From<core_usage::UsageModel> for UsageModel {
             top_projects,
             by_model,
             burn_rate,
+            unpriced_note,
             has_data,
         } = m;
         UsageModel {
@@ -816,6 +818,7 @@ impl From<core_usage::UsageModel> for UsageModel {
             top_projects: top_projects.into_iter().map(Into::into).collect(),
             by_model: by_model.into_iter().map(Into::into).collect(),
             burn_rate,
+            unpriced_note,
             has_data,
         }
     }
@@ -4342,7 +4345,7 @@ mod tests {
                      INSERT INTO sessions (id, project_id, file_path)
                          VALUES ('s1', 1, '/p/s1.jsonl');
                      INSERT INTO turns (session_id, ts, model, input, output)
-                         VALUES ('s1', 1, 'claude-fable-5-1', 775336909, 0),
+                         VALUES ('s1', 1, 'claude-future-1', 775336909, 0),
                                 ('s1', 2, '<synthetic>', 0, 0);",
                 )
                 .unwrap();
@@ -4354,7 +4357,7 @@ mod tests {
                 .iter()
                 .map(|u| u.model.as_str())
                 .collect::<Vec<_>>(),
-            ["claude-fable-5-1"],
+            ["claude-future-1"],
             "a zero-token entry is not a model anyone can price"
         );
         assert!(m.unpriced_summary.is_some());
@@ -4367,7 +4370,7 @@ mod tests {
         // Pricing it from the pane closes the gap without a re-read.
         let after = p
             .set_price(
-                "claude-fable-5-1".into(),
+                "claude-future-1".into(),
                 RateFields {
                     input: "15".into(),
                     output: "75".into(),
@@ -4377,7 +4380,7 @@ mod tests {
             )
             .unwrap();
         assert!(after.unpriced.is_empty());
-        assert!(after.rows.iter().any(|r| r.model == "claude-fable-5-1"));
+        assert!(after.rows.iter().any(|r| r.model == "claude-future-1"));
     }
 
     #[test]
@@ -5050,8 +5053,8 @@ mod tests {
         let before = mine(&p);
         assert_eq!(before.tokens, 2_000_000);
         assert_eq!(
-            before.cost, "$0.00",
-            "an unpriced model's tokens must currently read as free — this is the bug"
+            before.cost, "no price",
+            "an unpriced model's tokens must not read as free"
         );
         assert!(
             p.prices()
@@ -5100,7 +5103,7 @@ mod tests {
         assert!(!removed.rows.iter().any(|r| r.model == MODEL));
         assert!(removed.unpriced.iter().any(|u| u.model == MODEL));
         let gone = mine(&p);
-        assert_eq!(gone.cost, "$0.00");
+        assert_eq!(gone.cost, "no price");
         assert_eq!(
             gone.tokens, 2_000_000,
             "forgetting a rate must not forget the tokens"
@@ -5133,7 +5136,11 @@ mod tests {
             Some(true),
             "and restores the rate Perch ships"
         );
-        assert_eq!(mine(&p).cost, "$0.00", "the user's model is unpriced again");
+        assert_eq!(
+            mine(&p).cost,
+            "no price",
+            "the user's model is unpriced again"
+        );
     }
 
     /// Reset-all is about the twenty-seven settings and nothing else. The index,

@@ -100,9 +100,13 @@ wasn't: no such process, that pid isn't `claude`, or the record wouldn't parse.
 * **Subagents count towards the session that ran them.** Perch indexes each
   session's transcript and its subagent transcripts, under
   `<session-id>/subagents/`, and counts each API response once.
-* **The model prices are placeholders.** I haven't verified them. You can edit
-  them in the Prices pane. If a model has no price, Perch counts its tokens and
-  says it doesn't know the cost rather than showing you a zero.
+* **Costs are estimates at list price.** Perch uses Anthropic's published rates
+  as of November 2026, and you can edit them in the Prices pane. On a
+  subscription, this is what the usage would cost at those rates, not what you
+  pay. Fast mode and the higher Haiku 5.5 rate on very large prompts aren't
+  counted. If a model has no price, Perch counts its tokens and says "no price"
+  or "at least $4.20" rather than showing you a zero. Prices for new models
+  arrive with Perch updates, since Perch never goes online to fetch them.
 * **The fullscreen behaviour is right by construction, not by testing.** A
   tracked `NSMenu` is the documented way to stay visible over a fullscreen app,
   and two spikes confirmed the alternatives don't work. Nobody has actually

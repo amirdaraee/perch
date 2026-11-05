@@ -17,7 +17,28 @@ pub struct ProjectSummary {
     pub sessions: i64,
     pub usage: TurnUsage,
     pub cost_usd: f64,
+    pub unpriced_tokens: u64,
     pub last_activity_at: Option<i64>,
+}
+
+/// Tokens and what they cost, with how many of them have no price. Those tokens
+/// add nothing to `cost_usd`, so it is only a lower bound when this isn't zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Spend {
+    pub usage: TurnUsage,
+    pub cost_usd: f64,
+    pub unpriced_tokens: u64,
+}
+
+impl Spend {
+    fn add(&mut self, db: &Db, model: &str, usage: &TurnUsage) -> Result<()> {
+        self.usage = self.usage.plus(usage);
+        match price_for(db, model)? {
+            Some(price) => self.cost_usd += cost_usd(&price, usage),
+            None => self.unpriced_tokens += usage.total_tokens(),
+        }
+        Ok(())
+    }
 }
 
 /// Sum usage per (scope, model) so each model's rate applies to its own tokens.
@@ -61,14 +82,17 @@ fn cost_of(db: &Db, model: &str, usage: &TurnUsage) -> Result<f64> {
 
 /// Reduce per-model usage rows into a total: tokens summed across models, and
 /// cost summed after pricing each model's tokens at that model's own rate.
-fn priced_usage(db: &Db, per_model: &[(String, TurnUsage)]) -> Result<(TurnUsage, f64)> {
-    let mut usage = TurnUsage::default();
-    let mut cost = 0.0;
+fn spend_of(db: &Db, per_model: &[(String, TurnUsage)]) -> Result<Spend> {
+    let mut spend = Spend::default();
     for (model, u) in per_model {
-        usage = usage.plus(u);
-        cost += cost_of(db, model, u)?;
+        spend.add(db, model, u)?;
     }
-    Ok((usage, cost))
+    Ok(spend)
+}
+
+/// Whether Perch has a price for this model at all.
+pub fn model_has_price(db: &Db, model: &str) -> Result<bool> {
+    Ok(price_for(db, model)?.is_some())
 }
 
 pub fn project_summaries(db: &Db) -> Result<Vec<ProjectSummary>> {
@@ -107,7 +131,7 @@ pub fn project_summaries(db: &Db) -> Result<Vec<ProjectSummary>> {
             &[&id],
         )?;
 
-        let (usage, cost) = priced_usage(db, &per_model)?;
+        let spend = spend_of(db, &per_model)?;
 
         let last_activity_at: Option<i64> = db.conn().query_row(
             "SELECT MAX(ts) FROM turns
@@ -124,8 +148,9 @@ pub fn project_summaries(db: &Db) -> Result<Vec<ProjectSummary>> {
             parent_project_id,
             path_is_guess,
             sessions,
-            usage,
-            cost_usd: cost,
+            usage: spend.usage,
+            cost_usd: spend.cost_usd,
+            unpriced_tokens: spend.unpriced_tokens,
             last_activity_at,
         });
     }
@@ -135,12 +160,18 @@ pub fn project_summaries(db: &Db) -> Result<Vec<ProjectSummary>> {
 /// Serves both clocks: a trailing 5-hour window and a trailing week differ only
 /// in `since_ms`. Pass 0 for all time.
 pub fn usage_since(db: &Db, since_ms: i64) -> Result<(TurnUsage, f64)> {
+    let spend = spend_since(db, since_ms)?;
+    Ok((spend.usage, spend.cost_usd))
+}
+
+/// [`usage_since`], with how much of it has no price.
+pub fn spend_since(db: &Db, since_ms: i64) -> Result<Spend> {
     let per_model = usage_rows(
         db,
         &format!("SELECT model, {SUMS} FROM turns WHERE ts >= ?1 GROUP BY model"),
         &[&since_ms],
     )?;
-    priced_usage(db, &per_model)
+    spend_of(db, &per_model)
 }
 
 /// The timestamp of the earliest turn at or after `since_ms`, or `None` if
@@ -196,6 +227,7 @@ pub struct RecentSession {
     pub title: Option<String>,
     pub usage: TurnUsage,
     pub cost_usd: f64,
+    pub unpriced_tokens: u64,
 }
 
 /// The stored titles for the given session ids. Live records carry Claude
@@ -245,13 +277,19 @@ pub fn session_branch(db: &Db, session_id: &str) -> Result<Option<String>> {
 /// Tokens and estimated cost for one session, priced per model and summed.
 /// An unknown session is simply zero — it is not an error to ask.
 pub fn session_usage(db: &Db, session_id: &str) -> Result<(TurnUsage, f64)> {
+    let spend = session_spend(db, session_id)?;
+    Ok((spend.usage, spend.cost_usd))
+}
+
+/// [`session_usage`], with how much of it has no price.
+pub fn session_spend(db: &Db, session_id: &str) -> Result<Spend> {
     let args: [&dyn rusqlite::ToSql; 1] = [&session_id];
     let per_model = usage_rows(
         db,
         &format!("SELECT model, {SUMS} FROM turns WHERE session_id = ?1 GROUP BY model"),
         &args,
     )?;
-    priced_usage(db, &per_model)
+    spend_of(db, &per_model)
 }
 
 /// The same turns [`session_usage`] totals, split by the model that spent
@@ -290,15 +328,7 @@ pub struct SubagentUsage {
     pub last_ts: Option<i64>,
     pub usage: TurnUsage,
     pub cost_usd: f64,
-    /// It spent tokens on a model Perch has no price for, so `cost_usd` leaves
-    /// that work out.
-    pub has_unpriced: bool,
-}
-
-/// Whether Perch has a price for this model at all. Unpriced tokens add nothing
-/// to a cost, so a cost of zero alone can't say which of the two it means.
-pub fn model_has_price(db: &Db, model: &str) -> Result<bool> {
-    Ok(price_for(db, model)?.is_some())
+    pub unpriced_tokens: u64,
 }
 
 /// Every subagent this session has run, each priced per model and summed.
@@ -332,26 +362,22 @@ pub fn session_subagents(db: &Db, session_id: &str) -> Result<Vec<SubagentUsage>
 
     let mut by_agent: std::collections::BTreeMap<String, SubagentUsage> = Default::default();
     for (agent_id, agent_type, file_path, model, last_ts, usage) in rows {
-        let cost = match &model {
-            Some(m) => cost_of(db, m, &usage)?,
-            None => 0.0,
-        };
-        let unpriced = match &model {
-            Some(m) => usage.total_tokens() > 0 && !model_has_price(db, m)?,
-            None => false,
-        };
+        let mut spend = Spend::default();
+        if let Some(m) = &model {
+            spend.add(db, m, &usage)?;
+        }
         let entry = by_agent.entry(agent_id).or_insert(SubagentUsage {
             agent_type,
             file_path,
             last_ts: None,
             usage: TurnUsage::default(),
             cost_usd: 0.0,
-            has_unpriced: false,
+            unpriced_tokens: 0,
         });
-        entry.has_unpriced |= unpriced;
         entry.last_ts = entry.last_ts.max(last_ts);
-        entry.usage = entry.usage.plus(&usage);
-        entry.cost_usd += cost;
+        entry.usage = entry.usage.plus(&spend.usage);
+        entry.cost_usd += spend.cost_usd;
+        entry.unpriced_tokens += spend.unpriced_tokens;
     }
     Ok(by_agent.into_values().collect())
 }
@@ -461,14 +487,15 @@ pub fn recent_sessions(
         if exclude_ids.iter().any(|x| x == &id) {
             continue;
         }
-        let (usage, cost_usd) = session_usage(db, &id)?;
+        let spend = session_spend(db, &id)?;
         out.push(RecentSession {
             id,
             cwd,
             last_activity_at: last,
             title,
-            usage,
-            cost_usd,
+            usage: spend.usage,
+            cost_usd: spend.cost_usd,
+            unpriced_tokens: spend.unpriced_tokens,
         });
         if out.len() == limit {
             break;
@@ -489,6 +516,7 @@ pub struct HistorySession {
     pub title: Option<String>,
     pub usage: TurnUsage,
     pub cost_usd: f64,
+    pub unpriced_tokens: u64,
 }
 
 /// Every session ever recorded for a project, newest first. Sessions with no
@@ -517,7 +545,7 @@ pub fn session_history(db: &Db, project_id: i64) -> Result<Vec<HistorySession>> 
     let mut out = Vec::new();
     for row in rows {
         let (id, started_at, last_activity_at, git_branch, message_count, title) = row?;
-        let (usage, cost_usd) = session_usage(db, &id)?;
+        let spend = session_spend(db, &id)?;
         out.push(HistorySession {
             id,
             started_at,
@@ -525,8 +553,9 @@ pub fn session_history(db: &Db, project_id: i64) -> Result<Vec<HistorySession>> 
             git_branch,
             message_count,
             title,
-            usage,
-            cost_usd,
+            usage: spend.usage,
+            cost_usd: spend.cost_usd,
+            unpriced_tokens: spend.unpriced_tokens,
         });
     }
     Ok(out)
@@ -537,6 +566,7 @@ pub struct DayUsage {
     pub day_start_ms: i64,
     pub usage: TurnUsage,
     pub cost_usd: f64,
+    pub unpriced_tokens: u64,
 }
 
 fn day_start(ts_ms: i64) -> i64 {
@@ -558,8 +588,7 @@ fn daily_usage_grouped(
     // place (rather than being computed and then discarded).
     let upper = last + DAY_MS;
 
-    let mut per_day: std::collections::HashMap<i64, (TurnUsage, f64)> =
-        std::collections::HashMap::new();
+    let mut per_day: std::collections::HashMap<i64, Spend> = std::collections::HashMap::new();
     let scope = match project_filter {
         Some(_) => "AND session_id IN (SELECT id FROM sessions WHERE project_id = ?3)",
         None => "",
@@ -581,20 +610,18 @@ fn daily_usage_grouped(
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
     for (day, model, u) in rows {
-        let cost = cost_of(db, &model, &u)?;
-        let slot = per_day.entry(day).or_insert((TurnUsage::default(), 0.0));
-        slot.0 = slot.0.plus(&u);
-        slot.1 += cost;
+        per_day.entry(day).or_default().add(db, &model, &u)?;
     }
 
     Ok((0..days)
         .map(|i| {
             let day_start_ms = first + i as i64 * DAY_MS;
-            let (usage, cost_usd) = per_day.get(&day_start_ms).cloned().unwrap_or_default();
+            let spend = per_day.get(&day_start_ms).copied().unwrap_or_default();
             DayUsage {
                 day_start_ms,
-                usage,
-                cost_usd,
+                usage: spend.usage,
+                cost_usd: spend.cost_usd,
+                unpriced_tokens: spend.unpriced_tokens,
             }
         })
         .collect())
@@ -702,7 +729,7 @@ pub fn latest_branches(db: &Db) -> Result<std::collections::HashMap<i64, String>
 
 /// Projects ranked by tokens since `since_ms`. The label is the directory name,
 /// which is what the user recognises — not the slug and not the whole path.
-pub fn top_projects(db: &Db, since_ms: i64, limit: usize) -> Result<Vec<(String, TurnUsage, f64)>> {
+pub fn top_projects(db: &Db, since_ms: i64, limit: usize) -> Result<Vec<(String, Spend)>> {
     let mut stmt = db.conn().prepare(&format!(
         "SELECT p.id, p.real_path, p.display_name, t.model, {SUMS}
          FROM turns t
@@ -731,7 +758,7 @@ pub fn top_projects(db: &Db, since_ms: i64, limit: usize) -> Result<Vec<(String,
     // Keyed by project id, not by label: two distinct projects can share a
     // directory basename (nested checkouts named the same leaf directory are
     // ordinary), and folding by label would silently merge their usage.
-    let mut totals: std::collections::HashMap<i64, (String, TurnUsage, f64)> =
+    let mut totals: std::collections::HashMap<i64, (String, Spend)> =
         std::collections::HashMap::new();
     for row in rows {
         let (project_id, real_path, display_name, model, u) = row?;
@@ -746,19 +773,18 @@ pub fn top_projects(db: &Db, since_ms: i64, limit: usize) -> Result<Vec<(String,
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or(real_path.clone())
         });
-        let cost = cost_of(db, &model, &u)?;
         let slot = totals
             .entry(project_id)
-            .or_insert_with(|| (label.clone(), TurnUsage::default(), 0.0));
+            .or_insert_with(|| (label.clone(), Spend::default()));
         slot.0 = label;
-        slot.1 = slot.1.plus(&u);
-        slot.2 += cost;
+        slot.1.add(db, &model, &u)?;
     }
 
-    let mut out: Vec<(String, TurnUsage, f64)> = totals.into_values().collect();
+    let mut out: Vec<(String, Spend)> = totals.into_values().collect();
     out.sort_by(|a, b| {
-        b.1.total_tokens()
-            .cmp(&a.1.total_tokens())
+        b.1.usage
+            .total_tokens()
+            .cmp(&a.1.usage.total_tokens())
             .then_with(|| a.0.cmp(&b.0))
     });
     out.truncate(limit);
@@ -834,7 +860,8 @@ mod tests {
         // that pools tokens across models and multiplies by a single rate
         // would still land on the right total. Do not "tidy" this fixture
         // back to two equal-rate models.
-        assert!((r.cost_usd - 20.0).abs() < 1e-9);
+        assert!((r.cost_usd - 15.0).abs() < 1e-9);
+        assert_eq!(r.unpriced_tokens, 0);
         assert_eq!(r.last_activity_at, Some(5_000));
     }
 
@@ -893,8 +920,12 @@ mod tests {
             "tokens must still be counted"
         );
         assert!(
-            (rows[0].cost_usd - 20.0).abs() < 1e-9,
+            (rows[0].cost_usd - 15.0).abs() < 1e-9,
             "unpriced model adds no cost"
+        );
+        assert_eq!(
+            rows[0].unpriced_tokens, 2_000_000,
+            "and the gap is recorded, so the cost can say it is a lower bound"
         );
     }
 
@@ -990,11 +1021,9 @@ mod tests {
 
     #[test]
     fn session_usage_prices_per_model() {
-        // claude-fable-5 and claude-opus-5 have byte-identical default rates,
-        // so a single-model fixture can't prove per-model pricing is applied
-        // (a bug that resolved the wrong model's price would still pass).
-        // Use two models with genuinely different input rates instead:
-        // fable at $15.0/MTok and sonnet at $3.0/MTok.
+        // A single-model fixture can't prove per-model pricing is applied (a bug
+        // that resolved the wrong model's price could still pass). Use two
+        // models with different input rates: fable at $10/MTok, sonnet at $2.
         let db = open_in_memory().unwrap();
         seed_default_prices(&db).unwrap();
         let pid = db
@@ -1041,12 +1070,12 @@ mod tests {
         .unwrap();
         let (u, cost) = session_usage(&db, "s-a").unwrap();
         assert_eq!(u.input, 3_000_000);
-        // Reachable only if fable's 2 MTok is priced at $15.0/MTok ($30.00)
-        // and sonnet's 1 MTok is priced at its own $3.0/MTok ($3.00), summed.
+        // Reachable only if fable's 2 MTok is priced at $10/MTok ($20.00) and
+        // sonnet's 1 MTok is priced at its own $2/MTok ($2.00), summed.
         // Pooling both under either rate would give a different total.
         assert!(
-            (cost - 33.0).abs() < 1e-9,
-            "fable 2 MTok @ 15.0 + sonnet 1 MTok @ 3.0 = 33.00"
+            (cost - 22.0).abs() < 1e-9,
+            "fable 2 MTok @ 10.0 + sonnet 1 MTok @ 2.0 = 22.00"
         );
     }
 
@@ -1110,8 +1139,8 @@ mod tests {
         assert_eq!(rows[1].0, "claude-sonnet-5");
         // Fable at $15.0/MTok, sonnet at its own $3.0/MTok — pooling both
         // under either rate would give different numbers here.
-        assert!((rows[0].2 - 30.0).abs() < 1e-9, "2 MTok @ 15.0");
-        assert!((rows[1].2 - 3.0).abs() < 1e-9, "1 MTok @ 3.0");
+        assert!((rows[0].2 - 20.0).abs() < 1e-9, "2 MTok @ 10.0");
+        assert!((rows[1].2 - 2.0).abs() < 1e-9, "1 MTok @ 2.0");
         // The split must add up to exactly what the session's own total says.
         let (total, cost) = session_usage(&db, "s-m").unwrap();
         assert_eq!(
@@ -1277,7 +1306,7 @@ mod tests {
         assert_eq!(ids, vec!["new", "old"]);
         assert_eq!(rows[0].usage.input, 2_000_000);
         assert!(
-            (rows[0].cost_usd - 30.0).abs() < 1e-9,
+            (rows[0].cost_usd - 20.0).abs() < 1e-9,
             "2 MTok fable input at 15.0"
         );
     }
@@ -1495,7 +1524,7 @@ mod tests {
             "ranked by tokens, labelled by directory name"
         );
         assert_eq!(rows[1].0, "mid");
-        assert!(rows[0].1.input > rows[1].1.input);
+        assert!(rows[0].1.usage.input > rows[1].1.usage.input);
     }
 
     #[test]
@@ -1523,14 +1552,14 @@ mod tests {
             "distinct projects must stay separate rows, not merge into one \"app\""
         );
         assert!(rows.iter().all(|r| r.0 == "app"));
-        // fable input @ 15.0/MTok: 4 MTok -> $60, 1 MTok -> $15.
-        let mut totals: Vec<u64> = rows.iter().map(|r| r.1.input).collect();
+        // fable input @ 10.0/MTok: 4 MTok -> $40, 1 MTok -> $10.
+        let mut totals: Vec<u64> = rows.iter().map(|r| r.1.usage.input).collect();
         totals.sort_unstable();
         assert_eq!(totals, vec![1_000_000, 4_000_000]);
-        let mut costs: Vec<f64> = rows.iter().map(|r| r.2).collect();
+        let mut costs: Vec<f64> = rows.iter().map(|r| r.1.cost_usd).collect();
         costs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        assert!((costs[0] - 15.0).abs() < 1e-9);
-        assert!((costs[1] - 60.0).abs() < 1e-9);
+        assert!((costs[0] - 10.0).abs() < 1e-9);
+        assert!((costs[1] - 40.0).abs() < 1e-9);
     }
 
     #[test]

@@ -6,7 +6,7 @@ use crate::live::{LiveSession, SessionStatus};
 use crate::query;
 use crate::readme;
 use crate::settings::Settings;
-use crate::ui::format::{elapsed_or_dash, human_cost, human_elapsed, human_tokens, plural};
+use crate::ui::format::{cost_label, elapsed_or_dash, human_elapsed, human_tokens, plural};
 use crate::ui::model::PopoverModel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -28,7 +28,7 @@ pub struct ProjectRow {
     pub cost: String,
     pub last_active: String,
     pub live_session_count: u32,
-    /// "N sessions · 2.0M · $30.00 · 1h" — composed here so no shell rebuilds it.
+    /// "N sessions · 2.0M · $20.00 · 1h" — composed here so no shell rebuilds it.
     pub subtitle: String,
     /// The overview card's opening paragraph from the project's own README or
     /// CLAUDE.md; `None` when neither says anything or the folder is gone.
@@ -40,7 +40,7 @@ pub struct ProjectRow {
     pub live_label: Option<String>,
     /// "1 waiting", or `None` when no session here is waiting on the user.
     pub waiting_label: Option<String>,
-    /// "12 sessions · 2.0M · $30.00" — the subtitle without its recency.
+    /// "12 sessions · 2.0M · $20.00" — the subtitle without its recency.
     pub stats_line: String,
     /// "main · 3h" — the latest branch, when one was recorded, then recency.
     pub activity_line: String,
@@ -219,7 +219,7 @@ pub fn build_main_window(
             // `ui::usage` already follow: a blank string here says "the user
             // hid this", not "this project cost nothing".
             let cost = if settings.show_cost {
-                human_cost(s.cost_usd)
+                cost_label(s.cost_usd, s.unpriced_tokens, s.usage.total_tokens())
             } else {
                 String::new()
             };
@@ -406,7 +406,7 @@ pub fn build_project_detail(
             // Hidden means absent, not "$0.00" — same rule as the project
             // row above.
             let cost = if settings.show_cost {
-                human_cost(h.cost_usd)
+                cost_label(h.cost_usd, h.unpriced_tokens, h.usage.total_tokens())
             } else {
                 String::new()
             };
@@ -455,7 +455,11 @@ pub fn build_project_detail(
         // Hidden means absent, not "$0.00" — same rule as the project row
         // and the session history row above.
         cost: if settings.show_cost {
-            human_cost(summary.cost_usd)
+            cost_label(
+                summary.cost_usd,
+                summary.unpriced_tokens,
+                summary.usage.total_tokens(),
+            )
         } else {
             String::new()
         },
@@ -710,6 +714,48 @@ mod tests {
     }
 
     #[test]
+    fn a_project_never_reads_as_free_when_its_model_has_no_price() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        crate::pricing::remove_price(&db, "claude-fable-5").unwrap();
+        let now = 100 * DAY;
+        project_with_session(&db, "-a-p", "/a/proj", "s1", now - 3_600_000, 2_000_000);
+
+        let m = build_main_window(
+            Some(&db),
+            PopoverModel::empty(),
+            &[],
+            now,
+            &Settings::default(),
+        );
+        assert_eq!(m.projects[0].cost, "no price");
+        assert_eq!(m.projects[0].tokens, "2.0M", "the tokens are still known");
+
+        // With a priced model beside it, the figure is a lower bound.
+        db.insert_turns(
+            "s1",
+            &[Turn {
+                message_id: None,
+                ts: now - 3_000_000,
+                model: "claude-sonnet-5".into(),
+                usage: TurnUsage {
+                    input: 1_000_000,
+                    ..TurnUsage::default()
+                },
+            }],
+        )
+        .unwrap();
+        let m = build_main_window(
+            Some(&db),
+            PopoverModel::empty(),
+            &[],
+            now,
+            &Settings::default(),
+        );
+        assert_eq!(m.projects[0].cost, "at least $2.00");
+    }
+
+    #[test]
     fn a_project_row_carries_finished_strings() {
         let db = open_in_memory().unwrap();
         seed_default_prices(&db).unwrap();
@@ -726,7 +772,7 @@ mod tests {
         let row = &m.projects[0];
         assert_eq!(row.name, "proj", "directory name, not the slug");
         assert_eq!(row.tokens, "2.0M");
-        assert_eq!(row.cost, "$30.00");
+        assert_eq!(row.cost, "$20.00");
         assert_eq!(row.session_count, "1 session", "singular");
         assert_eq!(row.last_active, "1h");
         assert!(
@@ -1106,13 +1152,13 @@ mod tests {
 
         let m = build_main_window(Some(&db), PopoverModel::empty(), &[], now, &settings);
         let row = &m.projects[0];
-        assert_eq!(row.cost, "$30.00");
-        assert!(row.subtitle.contains("$30.00"));
+        assert_eq!(row.cost, "$20.00");
+        assert!(row.subtitle.contains("$20.00"));
 
         let d = build_project_detail(&db, pid, &[], now, &settings).unwrap();
-        assert_eq!(d.cost, "$30.00");
-        assert_eq!(d.sessions[0].cost, "$30.00");
-        assert!(d.sessions[0].detail_line.contains("$30.00"));
+        assert_eq!(d.cost, "$20.00");
+        assert_eq!(d.sessions[0].cost, "$20.00");
+        assert!(d.sessions[0].detail_line.contains("$20.00"));
     }
 
     fn live_at(cwd: &str, id: &str, status: SessionStatus) -> LiveSession {

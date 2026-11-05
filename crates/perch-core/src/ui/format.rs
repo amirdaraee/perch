@@ -14,6 +14,19 @@ pub fn human_cost(usd: f64) -> String {
     format!("${usd:.2}")
 }
 
+/// A cost that says when it isn't the whole story. Tokens on a model with no
+/// price add nothing to a cost, so a bare figure would read as if they were free:
+/// "no price" when nothing could be priced, "at least $4.20" when part could.
+pub fn cost_label(usd: f64, unpriced_tokens: u64, total_tokens: u64) -> String {
+    if unpriced_tokens == 0 {
+        human_cost(usd)
+    } else if unpriced_tokens >= total_tokens {
+        "no price".to_string()
+    } else {
+        format!("at least {}", human_cost(usd))
+    }
+}
+
 /// "1 minute", never "1 minutes". One helper, in the one module every shell
 /// already formats through, because a second copy is how two spellings of the
 /// same duration appear -- and this app has shipped "1 seconds" twice. Every
@@ -70,6 +83,14 @@ pub fn elapsed_or_dash(now_ms: i64, since_ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cost_says_when_some_or_all_of_it_has_no_price() {
+        assert_eq!(cost_label(4.2, 0, 100), "$4.20");
+        assert_eq!(cost_label(0.0, 100, 100), "no price");
+        assert_eq!(cost_label(4.2, 40, 100), "at least $4.20");
+        assert_eq!(cost_label(0.0, 0, 0), "$0.00");
+    }
 
     #[test]
     fn tokens_are_compact() {

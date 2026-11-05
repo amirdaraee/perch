@@ -68,6 +68,17 @@ struct UsageView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
+            if let note = model.unpricedNote {
+                HStack(spacing: 8) {
+                    Text(note)
+                        .font(.callout)
+                        .foregroundStyle(Color.perchWaiting)
+                    Button("Open Settings") {
+                        (NSApp.delegate as? AppDelegate)?.showSettings()
+                    }
+                    .controlSize(.small)
+                }
+            }
         }
     }
 

@@ -49,6 +49,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         engine.start()
     }
 
+    @MainActor
+    func showSettings() {
+        settingsWindow?.show()
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         engine?.stop()
     }

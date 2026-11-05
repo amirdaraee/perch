@@ -308,13 +308,13 @@ mod tests {
     #[test]
     fn a_model_in_use_with_no_price_is_listed_for_the_user_to_fix() {
         let db = seeded_db();
-        db.insert_turns("s1", &[turn("claude-fable-5-1", 775_000_000)])
+        db.insert_turns("s1", &[turn("claude-future-1", 775_000_000)])
             .unwrap();
 
         let m = build_prices(&db).unwrap();
 
         assert_eq!(m.unpriced.len(), 1, "the gap must be visible, not implied");
-        assert_eq!(m.unpriced[0].model, "claude-fable-5-1");
+        assert_eq!(m.unpriced[0].model, "claude-future-1");
         assert_eq!(m.unpriced[0].tokens_label, "775.0M tokens");
         assert!(m.unpriced_summary.is_some());
     }
@@ -336,9 +336,9 @@ mod tests {
         db.insert_turns(
             "s1",
             &[
-                turn("claude-opus-4-7", 96_000_000),
-                turn("claude-fable-5-1", 775_000_000),
-                turn("claude-opus-4-8", 10_000_000),
+                turn("claude-future-2", 96_000_000),
+                turn("claude-future-1", 775_000_000),
+                turn("claude-future-3", 10_000_000),
             ],
         )
         .unwrap();
@@ -347,7 +347,7 @@ mod tests {
         let models: Vec<&str> = m.unpriced.iter().map(|u| u.model.as_str()).collect();
         assert_eq!(
             models,
-            ["claude-fable-5-1", "claude-opus-4-7", "claude-opus-4-8"]
+            ["claude-future-1", "claude-future-2", "claude-future-3"]
         );
     }
 
@@ -356,10 +356,7 @@ mod tests {
         let db = seeded_db();
         db.insert_turns(
             "s1",
-            &[
-                turn("claude-fable-5-1", 775_000_000),
-                turn("<synthetic>", 0),
-            ],
+            &[turn("claude-future-1", 775_000_000), turn("<synthetic>", 0)],
         )
         .unwrap();
         assert_eq!(
@@ -393,8 +390,8 @@ mod tests {
         let db = seeded_db();
         let m = build_prices(&db).unwrap();
         let opus = m.rows.iter().find(|r| r.model == "claude-opus-5").unwrap();
-        assert_eq!(opus.rates.input, "15");
-        assert_eq!(opus.rates.cache_write, "18.75");
+        assert_eq!(opus.rates.input, "5");
+        assert_eq!(opus.rates.cache_write, "6.25");
     }
 
     #[test]

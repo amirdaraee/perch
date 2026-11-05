@@ -13,46 +13,71 @@ pub struct ModelPrice {
     pub cache_write_per_mtok: f64,
 }
 
-/// USD per million tokens. These are estimates for display only and are
-/// user-editable at runtime; seeding never overwrites an existing row.
+const fn price(
+    model: &'static str,
+    input_per_mtok: f64,
+    output_per_mtok: f64,
+    cache_read_per_mtok: f64,
+    cache_write_per_mtok: f64,
+) -> (&'static str, ModelPrice) {
+    (
+        model,
+        ModelPrice {
+            input_per_mtok,
+            output_per_mtok,
+            cache_read_per_mtok,
+            cache_write_per_mtok,
+        },
+    )
+}
+
+/// USD per million tokens, from Anthropic's published pricing as of 2026-11-05
+/// (platform.claude.com/docs/en/about-claude/pricing). These are estimates for
+/// display only and are user-editable at runtime.
+///
+/// `cache_write_per_mtok` is the 5-minute rate. See [`ONE_HOUR_WRITE_MULTIPLE`].
+///
+/// Claude Haiku 5.5 has a higher rate above 100,000 prompt tokens. Usage is
+/// priced from sums rather than per request, so this uses the lower rate and can
+/// understate that model. Fast mode isn't recorded separately either.
 const DEFAULTS: &[(&str, ModelPrice)] = &[
-    (
-        "claude-fable-5",
-        ModelPrice {
-            input_per_mtok: 15.0,
-            output_per_mtok: 75.0,
-            cache_read_per_mtok: 1.5,
-            cache_write_per_mtok: 18.75,
-        },
-    ),
-    (
-        "claude-opus-5",
-        ModelPrice {
-            input_per_mtok: 15.0,
-            output_per_mtok: 75.0,
-            cache_read_per_mtok: 1.5,
-            cache_write_per_mtok: 18.75,
-        },
-    ),
-    (
-        "claude-sonnet-5",
-        ModelPrice {
-            input_per_mtok: 3.0,
-            output_per_mtok: 15.0,
-            cache_read_per_mtok: 0.3,
-            cache_write_per_mtok: 3.75,
-        },
-    ),
-    (
-        "claude-haiku-4-5-20251001",
-        ModelPrice {
-            input_per_mtok: 1.0,
-            output_per_mtok: 5.0,
-            cache_read_per_mtok: 0.1,
-            cache_write_per_mtok: 1.25,
-        },
-    ),
+    price("claude-fable-5-1", 10.0, 50.0, 0.25, 12.5),
+    price("claude-mythos-5-1", 10.0, 50.0, 0.25, 12.5),
+    price("claude-fable-5", 10.0, 50.0, 1.0, 12.5),
+    price("claude-mythos-5", 10.0, 50.0, 1.0, 12.5),
+    price("claude-opus-5-5", 4.0, 20.0, 0.2, 5.0),
+    price("claude-opus-5", 5.0, 25.0, 0.5, 6.25),
+    price("claude-opus-4-8", 5.0, 25.0, 0.5, 6.25),
+    price("claude-opus-4-7", 5.0, 25.0, 0.5, 6.25),
+    price("claude-opus-4-6", 5.0, 25.0, 0.5, 6.25),
+    price("claude-opus-4-5", 5.0, 25.0, 0.5, 6.25),
+    price("claude-opus-4-5-20251101", 5.0, 25.0, 0.5, 6.25),
+    price("claude-opus-4-1", 15.0, 75.0, 1.5, 18.75),
+    price("claude-opus-4-1-20250805", 15.0, 75.0, 1.5, 18.75),
+    price("claude-sonnet-5-5", 2.0, 10.0, 0.1, 2.5),
+    price("claude-sonnet-5", 2.0, 10.0, 0.2, 2.5),
+    price("claude-sonnet-4-6", 3.0, 15.0, 0.3, 3.75),
+    price("claude-sonnet-4-5", 3.0, 15.0, 0.3, 3.75),
+    price("claude-sonnet-4-5-20250929", 3.0, 15.0, 0.3, 3.75),
+    price("claude-haiku-5-5", 0.1, 0.5, 0.01, 0.125),
+    price("claude-haiku-4-5", 1.0, 5.0, 0.1, 1.25),
+    price("claude-haiku-4-5-20251001", 1.0, 5.0, 0.1, 1.25),
 ];
+
+/// Rates Perch used to ship. A row still holding one of these was never edited,
+/// so it follows the table above. Without this, a correction would only reach
+/// new installs, since seeding otherwise leaves existing rows alone. Add a line
+/// here whenever a rate above changes.
+const SUPERSEDED: &[(&str, ModelPrice)] = &[
+    price("claude-fable-5", 15.0, 75.0, 1.5, 18.75),
+    price("claude-opus-5", 15.0, 75.0, 1.5, 18.75),
+    price("claude-sonnet-5", 3.0, 15.0, 0.3, 3.75),
+];
+
+/// A 1-hour cache write costs this much more than a 5-minute one. It is the same
+/// on every model in the published table (twice the input rate against 1.25
+/// times), so it doesn't need a column of its own in a table people edit by hand.
+const ONE_HOUR_WRITE_MULTIPLE: f64 = 1.6;
 
 pub fn seed_default_prices(db: &Db) -> Result<()> {
     for (model, p) in DEFAULTS {
@@ -67,6 +92,28 @@ pub fn seed_default_prices(db: &Db) -> Result<()> {
                 p.output_per_mtok,
                 p.cache_read_per_mtok,
                 p.cache_write_per_mtok
+            ],
+        )?;
+    }
+    for (model, old) in SUPERSEDED {
+        let Some(new) = default_price(model) else {
+            continue;
+        };
+        db.conn().execute(
+            "UPDATE prices SET input_per_mtok = ?2, output_per_mtok = ?3,
+                 cache_read_per_mtok = ?4, cache_write_per_mtok = ?5
+             WHERE model = ?1 AND input_per_mtok = ?6 AND output_per_mtok = ?7
+                 AND cache_read_per_mtok = ?8 AND cache_write_per_mtok = ?9",
+            params![
+                model,
+                new.input_per_mtok,
+                new.output_per_mtok,
+                new.cache_read_per_mtok,
+                new.cache_write_per_mtok,
+                old.input_per_mtok,
+                old.output_per_mtok,
+                old.cache_read_per_mtok,
+                old.cache_write_per_mtok
             ],
         )?;
     }
@@ -196,13 +243,63 @@ pub fn cost_usd(price: &ModelPrice, usage: &TurnUsage) -> f64 {
     (usage.input as f64 / MTOK) * price.input_per_mtok
         + (usage.output as f64 / MTOK) * price.output_per_mtok
         + (usage.cache_read as f64 / MTOK) * price.cache_read_per_mtok
-        + (usage.cache_write_total() as f64 / MTOK) * price.cache_write_per_mtok
+        + (usage.cache_write_5m as f64 / MTOK) * price.cache_write_per_mtok
+        + (usage.cache_write_1h as f64 / MTOK)
+            * price.cache_write_per_mtok
+            * ONE_HOUR_WRITE_MULTIPLE
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::open_in_memory;
+
+    #[test]
+    fn a_one_hour_cache_write_costs_more_than_a_five_minute_one() {
+        let p = default_price("claude-opus-5-5").unwrap();
+        let five = TurnUsage {
+            cache_write_5m: 1_000_000,
+            ..TurnUsage::default()
+        };
+        let hour = TurnUsage {
+            cache_write_1h: 1_000_000,
+            ..TurnUsage::default()
+        };
+        assert!((cost_usd(&p, &five) - 5.0).abs() < 1e-9);
+        assert!((cost_usd(&p, &hour) - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_untouched_old_rate_is_corrected_and_an_edited_one_is_kept() {
+        let db = open_in_memory().unwrap();
+        let (_, old_opus) = SUPERSEDED
+            .iter()
+            .find(|(m, _)| *m == "claude-opus-5")
+            .unwrap();
+        set_price(&db, "claude-opus-5", *old_opus).unwrap();
+        let edited = ModelPrice {
+            input_per_mtok: 7.0,
+            output_per_mtok: 8.0,
+            cache_read_per_mtok: 0.9,
+            cache_write_per_mtok: 1.1,
+        };
+        set_price(&db, "claude-sonnet-5", edited).unwrap();
+
+        seed_default_prices(&db).unwrap();
+
+        assert_eq!(
+            price_for(&db, "claude-opus-5").unwrap(),
+            default_price("claude-opus-5")
+        );
+        assert_eq!(price_for(&db, "claude-sonnet-5").unwrap(), Some(edited));
+    }
+
+    #[test]
+    fn no_superseded_rate_is_still_a_current_one() {
+        for (model, old) in SUPERSEDED {
+            assert_ne!(default_price(model), Some(*old), "{model}");
+        }
+    }
 
     #[test]
     fn cost_prices_each_class_separately() {
@@ -221,10 +318,10 @@ mod tests {
             thinking: 900_000,
         };
         // Each class has a distinct token count, so a misassigned rate (e.g. swapping
-        // input and cache_read) would change the total: 20 + 50 + 0.4 + 1.25 = 71.65.
+        // input and cache_read) would change the total: 20 + 50 + 0.4 + 0.75 + 0.8 = 71.65.
         // cache_write_5m/1h are uneven (60k/40k) to prove cache_write_total() sums both
         // buckets rather than reading just one. thinking (900_000) must not add anything.
-        assert!((cost_usd(&p, &u) - 71.65).abs() < 1e-9);
+        assert!((cost_usd(&p, &u) - 71.95).abs() < 1e-9);
     }
 
     #[test]

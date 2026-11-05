@@ -121,7 +121,8 @@ fn list_projects(host: &dyn Host) -> ToolResult {
                 "description": readme::project_description(Path::new(&s.real_path)),
                 "sessions": s.sessions,
                 "tokens": s.usage.total_tokens(),
-                "cost_usd": usd(s.cost_usd),
+                "cost_usd": known_cost(s.cost_usd, s.unpriced_tokens, s.usage.total_tokens()),
+                "unpriced_tokens": s.unpriced_tokens,
                 "branch": branches.get(&s.id),
                 "last_active_at": iso(s.last_activity_at),
                 "running": running,
@@ -175,7 +176,12 @@ fn get_project(host: &dyn Host, arguments: &Value) -> ToolResult {
     let daily = query::daily_usage_for_project(&db, summary.id, settings.chart_days as usize, now)
         .map_err(read_error)?
         .into_iter()
-        .map(|d| json!({ "date": date(d.day_start_ms), "tokens": d.usage.total_tokens(), "cost_usd": usd(d.cost_usd) }))
+        .map(|d| {
+            json!({ "date": date(d.day_start_ms),
+            "tokens": d.usage.total_tokens(),
+            "cost_usd": known_cost(d.cost_usd, d.unpriced_tokens, d.usage.total_tokens()),
+            "unpriced_tokens": d.unpriced_tokens, })
+        })
         .collect::<Vec<_>>();
     let sessions = query::session_history(&db, summary.id)
         .map_err(read_error)?
@@ -190,7 +196,8 @@ fn get_project(host: &dyn Host, arguments: &Value) -> ToolResult {
                 "branch": h.git_branch.filter(|b| !b.trim().is_empty()),
                 "messages": h.message_count,
                 "tokens": h.usage.total_tokens(),
-                "cost_usd": usd(h.cost_usd),
+                "cost_usd": known_cost(h.cost_usd, h.unpriced_tokens, h.usage.total_tokens()),
+                "unpriced_tokens": h.unpriced_tokens,
             })
         })
         .collect::<Vec<_>>();
@@ -207,7 +214,8 @@ fn get_project(host: &dyn Host, arguments: &Value) -> ToolResult {
         "description": readme::project_description(Path::new(&summary.real_path)),
         "sessions_count": summary.sessions,
         "tokens": summary.usage.total_tokens(),
-        "cost_usd": usd(summary.cost_usd),
+        "cost_usd": known_cost(summary.cost_usd, summary.unpriced_tokens, summary.usage.total_tokens()),
+        "unpriced_tokens": summary.unpriced_tokens,
         "last_active_at": iso(summary.last_activity_at),
         "running": running,
         "waiting": waiting,
@@ -298,11 +306,17 @@ fn usage_summary(host: &dyn Host, arguments: &Value) -> ToolResult {
             v
         }).collect::<Vec<_>>(),
         "unpriced_models": unpriced,
-        "top_projects": top.iter().map(|(name, u, c)| json!({
-            "name": name, "tokens": u.total_tokens(), "cost_usd": usd(*c)
+        "top_projects": top.iter().map(|(name, s)| json!({
+            "name": name,
+            "tokens": s.usage.total_tokens(),
+            "cost_usd": known_cost(s.cost_usd, s.unpriced_tokens, s.usage.total_tokens()),
+            "unpriced_tokens": s.unpriced_tokens,
         })).collect::<Vec<_>>(),
         "daily": daily.iter().map(|d| json!({
-            "date": date(d.day_start_ms), "tokens": d.usage.total_tokens(), "cost_usd": usd(d.cost_usd)
+            "date": date(d.day_start_ms),
+            "tokens": d.usage.total_tokens(),
+            "cost_usd": known_cost(d.cost_usd, d.unpriced_tokens, d.usage.total_tokens()),
+            "unpriced_tokens": d.unpriced_tokens,
         })).collect::<Vec<_>>(),
     }))
 }
@@ -384,6 +398,17 @@ fn read_error(e: anyhow::Error) -> String {
 
 /// Estimated costs to a hundredth of a cent — more digits would claim a
 /// precision the price table does not have.
+/// A cost, or null when none of the tokens behind it have a price: that is "not
+/// known", and a zero would read as "free". Partly priced figures stay numbers,
+/// with `unpriced_tokens` beside them saying they are a lower bound.
+fn known_cost(cost: f64, unpriced_tokens: u64, total_tokens: u64) -> Value {
+    if unpriced_tokens > 0 && unpriced_tokens >= total_tokens {
+        Value::Null
+    } else {
+        json!(usd(cost))
+    }
+}
+
 fn usd(cost: f64) -> f64 {
     (cost * 10_000.0).round() / 10_000.0
 }
@@ -631,6 +656,29 @@ pub(crate) mod tests {
         assert!(call(&host, "usage_summary", &json!({ "days": 91 }))
             .unwrap()
             .is_err());
+    }
+
+    #[test]
+    fn a_project_whose_usage_has_no_price_has_a_null_cost() {
+        let host = FixtureHost::with_one_project();
+        {
+            let db = perch_core::db::open(&host.db_path).unwrap();
+            let rows: Vec<String> = db
+                .conn()
+                .prepare("SELECT DISTINCT model FROM turns")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            for model in rows {
+                pricing::remove_price(&db, &model).unwrap();
+            }
+        }
+        let projects = run(&host, "list_projects", json!({}));
+        let row = &projects["projects"][0];
+        assert!(row["cost_usd"].is_null(), "{row}");
+        assert!(row["unpriced_tokens"].as_u64().unwrap() > 0, "{row}");
     }
 
     #[test]

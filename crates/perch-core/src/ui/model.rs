@@ -3,7 +3,7 @@
 use crate::db::Db;
 use crate::live::{LiveSession, SessionStatus};
 use crate::settings::{MenuBarDisplay, MenuBarIcon, RowDensity, Settings};
-use crate::ui::format::{elapsed_or_dash, human_cost, human_elapsed, human_tokens};
+use crate::ui::format::{cost_label, elapsed_or_dash, human_elapsed, human_tokens};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Status {
@@ -185,10 +185,12 @@ fn stats_line(stats: &Stats) -> String {
         return String::new();
     }
     let week = format!("{} this week", stats.week_tokens);
-    if stats.day_cost.is_empty() {
-        week
-    } else {
-        format!("≈{} last 24h · {week}", stats.day_cost)
+    // A figure gets the "about" sign, since it's an estimate. A phrase like "at
+    // least $4.20" already hedges, and "no price" has no figure worth a line.
+    match stats.day_cost.as_str() {
+        "" | "no price" => week,
+        cost if cost.starts_with('$') => format!("≈{cost} last 24h · {week}"),
+        cost => format!("{cost} last 24h · {week}"),
     }
 }
 
@@ -329,13 +331,14 @@ impl PopoverModel {
 /// `db.rs` uses `anyhow::Result` throughout (no local `Result` alias), so this
 /// does too — the caller in `build_model` collapses any error to a dash.
 fn stats_from(db: &Db, now_ms: i64, show_cost: bool) -> anyhow::Result<Stats> {
-    use crate::query::usage_since;
+    use crate::query::{spend_since, usage_since};
     if db.turn_count()? == 0 {
         return Ok(dashed_stats(show_cost));
     }
     let (w, _) = usage_since(db, now_ms - FIVE_HOURS_MS)?;
     let (k, _) = usage_since(db, now_ms - WEEK_MS)?;
-    let (d, d_cost) = usage_since(db, now_ms - DAY_MS)?;
+    let day = spend_since(db, now_ms - DAY_MS)?;
+    let d = day.usage;
     Ok(Stats {
         window_tokens: human_tokens(w.total_tokens()),
         week_tokens: human_tokens(k.total_tokens()),
@@ -343,7 +346,7 @@ fn stats_from(db: &Db, now_ms: i64, show_cost: bool) -> anyhow::Result<Stats> {
         // Hidden means absent, not "$0.00" — a fabricated zero is the one
         // thing this model never emits.
         day_cost: if show_cost {
-            human_cost(d_cost)
+            cost_label(day.cost_usd, day.unpriced_tokens, d.total_tokens())
         } else {
             String::new()
         },
@@ -410,9 +413,13 @@ pub fn build_model(
         .map(|s| {
             let (status, status_label, since) = status_of(s);
             let (mut tokens, mut cost) =
-                match db.map(|d| crate::query::session_usage(d, &s.session_id)) {
-                    Some(Ok((u, c))) if u.total_tokens() > 0 => {
-                        (human_tokens(u.total_tokens()), human_cost(c))
+                match db.map(|d| crate::query::session_spend(d, &s.session_id)) {
+                    Some(Ok(spend)) if spend.usage.total_tokens() > 0 => {
+                        let total = spend.usage.total_tokens();
+                        (
+                            human_tokens(total),
+                            cost_label(spend.cost_usd, spend.unpriced_tokens, total),
+                        )
                     }
                     Some(Ok(_)) => (DASH.into(), DASH.into()),
                     Some(Err(_)) => {
@@ -762,6 +769,19 @@ mod tests {
             ..stats
         };
         assert_eq!(stats_line(&hidden), "3.2M this week");
+        let partial = Stats {
+            day_cost: "at least $4.20".into(),
+            ..hidden.clone()
+        };
+        assert_eq!(
+            stats_line(&partial),
+            "at least $4.20 last 24h · 3.2M this week"
+        );
+        let unpriced = Stats {
+            day_cost: "no price".into(),
+            ..hidden
+        };
+        assert_eq!(stats_line(&unpriced), "3.2M this week");
     }
 
     #[test]
@@ -926,9 +946,9 @@ mod tests {
         assert!(m.stats.has_data);
         assert!(m.stats.estimated);
         assert_eq!(m.stats.window_tokens, "2.0M");
-        assert_eq!(m.stats.day_cost, "$30.00");
+        assert_eq!(m.stats.day_cost, "$20.00");
         assert_eq!(m.live[0].tokens, "2.0M");
-        assert_eq!(m.live[0].cost, "$30.00");
+        assert_eq!(m.live[0].cost, "$20.00");
         assert_eq!(m.error, None, "the healthy path must not report an error");
     }
 
@@ -983,11 +1003,11 @@ mod tests {
             (None, false, "proj · interactive"),
             (Some(""), false, "proj · interactive"),
             (Some("2.1.251"), false, "proj · interactive · v2.1.251"),
-            (None, true, "proj · interactive · 2.0M · $30.00"),
+            (None, true, "proj · interactive · 2.0M · $20.00"),
             (
                 Some("2.1.251"),
                 true,
-                "proj · interactive · v2.1.251 · 2.0M · $30.00",
+                "proj · interactive · v2.1.251 · 2.0M · $20.00",
             ),
         ];
 

@@ -7,7 +7,7 @@ use crate::model::TurnUsage;
 use crate::process::ProcessStats;
 use crate::query::{self, SessionActivity};
 use crate::settings::Settings;
-use crate::ui::format::{human_bytes, human_cost, human_elapsed, human_tokens};
+use crate::ui::format::{cost_label, human_bytes, human_elapsed, human_tokens};
 use crate::ui::model::SessionRow;
 
 /// One labelled fact. Both halves are final strings; a shell puts them side
@@ -223,26 +223,19 @@ fn class_rows(usage: &TurnUsage, total_value: String) -> Vec<DetailRow> {
     out
 }
 
-/// "2.0M" on its own, or "2.0M · $3.10" when the user shows costs. The same
-/// separator and the same order the popover row composes its own usage
-/// segment with, because they are the same two numbers.
-fn tokens_and_cost(tokens: u64, cost_usd: f64, show_cost: bool) -> String {
-    let tokens = human_tokens(tokens);
+/// "2.0M" on its own, or "2.0M · $3.10" when the user shows costs, with the cost
+/// saying when part or all of it has no price. The same separator and the same
+/// order the popover row composes its own usage segment with, because they are
+/// the same two numbers.
+fn tokens_and_cost(tokens: u64, cost_usd: f64, unpriced_tokens: u64, show_cost: bool) -> String {
     if show_cost {
-        format!("{tokens} · {}", human_cost(cost_usd))
+        format!(
+            "{} · {}",
+            human_tokens(tokens),
+            cost_label(cost_usd, unpriced_tokens, tokens)
+        )
     } else {
-        tokens
-    }
-}
-
-/// [`tokens_and_cost`] for something that may have no price. A cost of zero
-/// only because Perch doesn't know the price says "no price", since Perch never
-/// shows a made-up zero. When part of it is priced, that part still shows.
-fn tokens_and_known_cost(tokens: u64, cost_usd: f64, unpriced: bool, show_cost: bool) -> String {
-    if show_cost && unpriced && cost_usd == 0.0 {
-        format!("{} · no price", human_tokens(tokens))
-    } else {
-        tokens_and_cost(tokens, cost_usd, show_cost)
+        human_tokens(tokens)
     }
 }
 
@@ -305,14 +298,15 @@ fn usage_section(ctx: &SessionContext) -> SessionUsage {
         return nothing("Perch could not read its index, so this session's usage is unknown.");
     };
     let id = &ctx.row.id;
-    let (Ok((totals, cost)), Ok(by_model), Ok(activity), Ok(subagents)) = (
-        query::session_usage(db, id),
+    let (Ok(spend), Ok(by_model), Ok(activity), Ok(subagents)) = (
+        query::session_spend(db, id),
         query::session_usage_by_model(db, id),
         query::session_activity(db, id, ACTIVITY_BUCKETS),
         query::session_subagents(db, id),
     ) else {
         return nothing("Perch could not read its index, so this session's usage is unknown.");
     };
+    let totals = spend.usage;
     // `session_activity` is `None` for a session the index has never seen a
     // turn for — which is the one case that deserves a sentence rather than a
     // breakdown of zeroes.
@@ -330,10 +324,14 @@ fn usage_section(ctx: &SessionContext) -> SessionUsage {
             .iter()
             .map(|(model, u, c)| DetailRow {
                 label: model.clone(),
-                value: tokens_and_known_cost(
+                value: tokens_and_cost(
                     u.total_tokens(),
                     *c,
-                    u.total_tokens() > 0 && !query::model_has_price(db, model).unwrap_or(true),
+                    if query::model_has_price(db, model).unwrap_or(true) {
+                        0
+                    } else {
+                        u.total_tokens()
+                    },
                     show_cost,
                 ),
             })
@@ -346,7 +344,12 @@ fn usage_section(ctx: &SessionContext) -> SessionUsage {
         heading,
         classes: class_rows(
             &totals,
-            tokens_and_cost(totals.total_tokens(), cost, show_cost),
+            tokens_and_cost(
+                totals.total_tokens(),
+                spend.cost_usd,
+                spend.unpriced_tokens,
+                show_cost,
+            ),
         ),
         models_heading: if by_model.is_empty() {
             String::new()
@@ -425,11 +428,11 @@ fn subagent_rows(
                     .unwrap_or_else(|| "Subagent".to_string()),
                 value: format!(
                     "{when} · {}",
-                    tokens_and_known_cost(
+                    tokens_and_cost(
                         s.usage.total_tokens(),
                         s.cost_usd,
-                        s.has_unpriced,
-                        show_cost
+                        s.unpriced_tokens,
+                        show_cost,
                     )
                 ),
             }
@@ -438,9 +441,10 @@ fn subagent_rows(
     if !rest.is_empty() {
         let tokens = rest.iter().map(|(_, s)| s.usage.total_tokens()).sum();
         let cost = rest.iter().map(|(_, s)| s.cost_usd).sum();
+        let unpriced = rest.iter().map(|(_, s)| s.unpriced_tokens).sum();
         out.push(DetailRow {
             label: format!("{} more", rest.len()),
-            value: tokens_and_cost(tokens, cost, show_cost),
+            value: tokens_and_cost(tokens, cost, unpriced, show_cost),
         });
     }
     (heading, out)
@@ -1183,8 +1187,8 @@ mod tests {
         // Priced at each model's own rate: fable's 2 MTok at $15.0/MTok and
         // sonnet's 1 MTok at $3.0/MTok. Pooling them under either rate — the
         // bug this guards — gives neither of these.
-        assert_eq!(m.usage.by_model[0].value, "2.0M · $30.00");
-        assert_eq!(m.usage.by_model[1].value, "1.0M · $3.00");
+        assert_eq!(m.usage.by_model[0].value, "2.0M · $20.00");
+        assert_eq!(m.usage.by_model[1].value, "1.0M · $2.00");
     }
 
     #[test]
@@ -1307,7 +1311,7 @@ mod tests {
         let m = menu_for(Some(&db), &Settings::default(), &s);
 
         assert_eq!(value(&m, "Tokens").as_deref(), Some("2.0M"));
-        assert_eq!(value(&m, "Cost").as_deref(), Some("$30.00"));
+        assert_eq!(value(&m, "Cost").as_deref(), Some("$20.00"));
     }
 
     // ---- the short version --------------------------------------------------

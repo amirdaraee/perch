@@ -4,7 +4,7 @@
 use crate::db::Db;
 use crate::query::{self, DAY_MS};
 use crate::settings::{BurnRate, Settings};
-use crate::ui::format::{human_cost, human_tokens, plural};
+use crate::ui::format::{cost_label, human_cost, human_tokens, plural};
 
 const WINDOW_MS: i64 = 5 * 3_600_000;
 const MIN_PROJECTABLE_MS: i64 = 30 * 60_000;
@@ -51,7 +51,20 @@ pub struct UsageModel {
     pub top_projects: Vec<RankedProject>,
     pub by_model: Vec<ModelUsage>,
     pub burn_rate: Option<String>,
+    /// "3 models have no price, so these costs leave them out.", or `None` when
+    /// every model is priced or costs are hidden.
+    pub unpriced_note: Option<String>,
     pub has_data: bool,
+}
+
+fn unpriced_note(models: usize) -> Option<String> {
+    match models {
+        0 => None,
+        1 => Some("1 model has no price, so these costs leave it out.".to_string()),
+        n => Some(format!(
+            "{n} models have no price, so these costs leave them out."
+        )),
+    }
 }
 
 /// "1 token", "999 tokens", "2.0M tokens". `plural` owns the singular/plural
@@ -90,12 +103,29 @@ fn burn_rate(
     show_cost: bool,
     window_tokens: u64,
     window_cost: f64,
+    window_unpriced: u64,
     elapsed_ms: i64,
 ) -> Option<String> {
     if mode == BurnRate::Off || window_tokens == 0 || elapsed_ms < MIN_PROJECTABLE_MS {
         return None;
     }
     let hours = elapsed_ms as f64 / 3_600_000.0;
+    // A pace worked out from part of the usage is only a lower bound, and from
+    // none of it is no pace at all.
+    let approximately = if window_unpriced == 0 {
+        "≈"
+    } else {
+        "at least "
+    };
+    let cost_is_unknown = show_cost
+        && window_unpriced >= window_tokens
+        && matches!(
+            mode,
+            BurnRate::CostPerHour | BurnRate::CostPerDay | BurnRate::ProjectedWindow
+        );
+    if cost_is_unknown {
+        return Some("Pace in dollars unknown: these models have no price".to_string());
+    }
 
     // A dollar-denominated mode with dollars switched off falls back to
     // tokens rather than to silence. Silence means one specific thing in this
@@ -117,17 +147,20 @@ fn burn_rate(
             "≈{} per hour at this pace",
             tokens_phrase((window_tokens as f64 / hours).round() as u64)
         ),
-        BurnRate::CostPerHour => format!("≈{}/hr at this pace", human_cost(window_cost / hours)),
+        BurnRate::CostPerHour => format!(
+            "{approximately}{}/hr at this pace",
+            human_cost(window_cost / hours)
+        ),
         BurnRate::CostPerDay => {
             format!(
-                "≈{}/day at this pace",
+                "{approximately}{}/day at this pace",
                 human_cost(window_cost / hours * 24.0)
             )
         }
         // The whole window's total at this pace, not a rate — and still only
         // ever offered from a window long enough to project from.
         BurnRate::ProjectedWindow => format!(
-            "≈{} by the end of this window",
+            "{approximately}{} by the end of this window",
             tokens_phrase(
                 (window_tokens as f64 * (WINDOW_MS as f64 / elapsed_ms as f64)).round() as u64
             )
@@ -152,15 +185,21 @@ fn observed_elapsed_ms(oldest_ts: Option<i64>, now_ms: i64) -> i64 {
 /// `top_projects_days` shape the ranked list.
 pub fn build_usage(db: &Db, now_ms: i64, settings: &Settings) -> anyhow::Result<UsageModel> {
     let window_since = now_ms - WINDOW_MS;
-    let (window, window_cost) = query::usage_since(db, window_since)?;
-    let (day, day_cost) = query::usage_since(db, now_ms - DAY_MS)?;
+    let window_spend = query::spend_since(db, window_since)?;
+    let day_spend = query::spend_since(db, now_ms - DAY_MS)?;
+    let window = window_spend.usage;
+    let day = day_spend.usage;
     let (week, _) = query::usage_since(db, now_ms - 7 * DAY_MS)?;
 
     // `show_cost` off means absent, not "$0.00": a fabricated zero would read
     // as a priced model that cost nothing.
-    let shown_cost = |usd: f64| {
+    let shown_cost = |spend: query::Spend| {
         if settings.show_cost {
-            human_cost(usd)
+            cost_label(
+                spend.cost_usd,
+                spend.unpriced_tokens,
+                spend.usage.total_tokens(),
+            )
         } else {
             String::new()
         }
@@ -196,11 +235,11 @@ pub fn build_usage(db: &Db, now_ms: i64, settings: &Settings) -> anyhow::Result<
         settings.top_projects_count as usize,
     )?
     .into_iter()
-    .map(|(name, u, cost)| RankedProject {
+    .map(|(name, spend)| RankedProject {
         name,
-        tokens: u.total_tokens(),
-        tokens_label: human_tokens(u.total_tokens()),
-        cost: shown_cost(cost),
+        tokens: spend.usage.total_tokens(),
+        tokens_label: human_tokens(spend.usage.total_tokens()),
+        cost: shown_cost(spend),
     })
     .collect();
 
@@ -216,13 +255,20 @@ pub fn build_usage(db: &Db, now_ms: i64, settings: &Settings) -> anyhow::Result<
     });
     let by_model = by_model_rows
         .into_iter()
-        .map(|(model, u, cost)| ModelUsage {
-            model,
-            tokens: u.total_tokens(),
-            tokens_label: human_tokens(u.total_tokens()),
-            cost: shown_cost(cost),
+        .map(|(model, u, cost)| {
+            let priced = query::model_has_price(db, &model)?;
+            Ok(ModelUsage {
+                tokens: u.total_tokens(),
+                tokens_label: human_tokens(u.total_tokens()),
+                cost: shown_cost(query::Spend {
+                    usage: u,
+                    cost_usd: cost,
+                    unpriced_tokens: if priced { 0 } else { u.total_tokens() },
+                }),
+                model,
+            })
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     let elapsed_in_window =
         observed_elapsed_ms(query::oldest_turn_since(db, window_since)?, now_ms);
@@ -231,7 +277,7 @@ pub fn build_usage(db: &Db, now_ms: i64, settings: &Settings) -> anyhow::Result<
         HeroStat {
             label: "5-hour window".into(),
             value: human_tokens(window.total_tokens()),
-            caption: settings.show_cost.then(|| human_cost(window_cost)),
+            caption: settings.show_cost.then(|| shown_cost(window_spend)),
         },
         HeroStat {
             label: "Week".into(),
@@ -241,7 +287,7 @@ pub fn build_usage(db: &Db, now_ms: i64, settings: &Settings) -> anyhow::Result<
         HeroStat {
             label: "24 hours".into(),
             value: human_tokens(day.total_tokens()),
-            caption: settings.show_cost.then(|| human_cost(day_cost)),
+            caption: settings.show_cost.then(|| shown_cost(day_spend)),
         },
     ];
 
@@ -251,9 +297,15 @@ pub fn build_usage(db: &Db, now_ms: i64, settings: &Settings) -> anyhow::Result<
             settings.burn_rate,
             settings.show_cost,
             window.total_tokens(),
-            window_cost,
+            window_spend.cost_usd,
+            window_spend.unpriced_tokens,
             elapsed_in_window,
         ),
+        unpriced_note: if settings.show_cost {
+            unpriced_note(crate::ui::prices::unpriced_count(db)?)
+        } else {
+            None
+        },
         hero,
         daily,
         top_projects,
@@ -393,7 +445,7 @@ mod tests {
         );
         assert_eq!(m.by_model[0].tokens, 2_000_000, "chart value is a number");
         assert_eq!(m.by_model[0].tokens_label, "2.0M");
-        assert_eq!(m.by_model[0].cost, "$30.00");
+        assert_eq!(m.by_model[0].cost, "$20.00");
     }
 
     /// This scenario is deliberately built so the rejected `rem_euclid`-based
@@ -487,7 +539,7 @@ mod tests {
             now - 3_600_000, // an hour of observed history
             "claude-fable-5",
             TurnUsage {
-                input: 2_000_000, // $15/Mtok → $30.00 over that hour
+                input: 2_000_000, // $15/Mtok → $20.00 over that hour
                 ..Default::default()
             },
         );
@@ -511,6 +563,37 @@ mod tests {
             },
         );
         (db, now)
+    }
+
+    #[test]
+    fn a_pace_never_reads_as_free_when_models_have_no_price() {
+        let hour = 3_600_000;
+        let unknown = burn_rate(BurnRate::CostPerHour, true, 1_000, 0.0, 1_000, hour).unwrap();
+        assert!(!unknown.contains('$'), "{unknown}");
+        assert!(unknown.contains("no price"), "{unknown}");
+
+        let partial = burn_rate(BurnRate::CostPerHour, true, 1_000, 5.0, 400, hour).unwrap();
+        assert_eq!(partial, "at least $5.00/hr at this pace");
+
+        let whole = burn_rate(BurnRate::CostPerHour, true, 1_000, 5.0, 0, hour).unwrap();
+        assert_eq!(whole, "≈$5.00/hr at this pace");
+
+        // A token pace doesn't depend on prices at all.
+        let tokens = burn_rate(BurnRate::TokensPerHour, true, 1_000, 0.0, 1_000, hour).unwrap();
+        assert!(tokens.contains("token"), "{tokens}");
+    }
+
+    #[test]
+    fn the_note_counts_unpriced_models_in_words() {
+        assert_eq!(unpriced_note(0), None);
+        assert_eq!(
+            unpriced_note(1).unwrap(),
+            "1 model has no price, so these costs leave it out."
+        );
+        assert_eq!(
+            unpriced_note(3).unwrap(),
+            "3 models have no price, so these costs leave them out."
+        );
     }
 
     #[test]
@@ -554,8 +637,8 @@ mod tests {
                 BurnRate::TokensPerHour,
                 "≈2.0M tokens per hour at this pace",
             ),
-            (BurnRate::CostPerHour, "≈$30.00/hr at this pace"),
-            (BurnRate::CostPerDay, "≈$720.00/day at this pace"),
+            (BurnRate::CostPerHour, "≈$20.00/hr at this pace"),
+            (BurnRate::CostPerDay, "≈$480.00/day at this pace"),
             (
                 BurnRate::ProjectedWindow,
                 "≈10.0M tokens by the end of this window",
@@ -637,8 +720,8 @@ mod tests {
     fn showing_cost_still_shows_it() {
         let (db, now) = busy_db();
         let m = build_usage(&db, now, &Settings::default()).unwrap();
-        assert_eq!(m.hero[0].caption.as_deref(), Some("$30.00"));
-        assert_eq!(m.top_projects[0].cost, "$30.00");
-        assert_eq!(m.by_model[0].cost, "$30.00");
+        assert_eq!(m.hero[0].caption.as_deref(), Some("$20.00"));
+        assert_eq!(m.top_projects[0].cost, "$20.00");
+        assert_eq!(m.by_model[0].cost, "$20.00");
     }
 }
