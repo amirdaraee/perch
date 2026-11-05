@@ -334,7 +334,7 @@ impl Default for Settings {
             // Today's popover shows all three sections.
             show_waiting: true,
             show_working: true,
-            show_recent: true,
+            show_recent: false,
             // Today's `ui::model::RECENT_LIMIT`.
             recent_limit: 3,
             // Today's layout.
@@ -758,7 +758,7 @@ mod tests {
         assert_eq!(s.stale_after_minutes, 5);
         assert!(s.show_waiting);
         assert!(s.show_working);
-        assert!(s.show_recent);
+        assert!(!s.show_recent, "off to keep the menu short");
         assert_eq!(s.recent_limit, 3, "today's RECENT_LIMIT");
         assert_eq!(s.row_density, RowDensity::Comfortable);
         assert!(!s.show_row_folder, "not shown today");

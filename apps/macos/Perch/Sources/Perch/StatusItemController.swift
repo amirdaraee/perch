@@ -16,14 +16,20 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// One per session, keyed by session id. An `NSMenuItem` holds its target
     /// and its submenu's delegate weakly, so the controller has to be held
     /// here or a submenu would go inert the moment it was built.
-    ///
-    /// Kept *across* renders rather than rebuilt with the rows, because the
-    /// model re-emits at least every `poll_seconds` — including while the
-    /// menu is open and a submenu is being read. Rebuilding these wholesale
-    /// would drop the controller a user is pointing at, and their click would
-    /// land on nothing. Entries are pruned when their session stops being
-    /// drawn, so this tracks the live set rather than growing.
     private var submenus: [String: SessionSubmenu] = [:]
+
+    /// The newest model. Most ticks only store this: the menu is closed nearly
+    /// all the time, and nobody can see a menu being rebuilt.
+    private var latest: PopoverModel?
+    private var isOpen = false
+    /// The items no longer match `latest`, so rebuild them before the next open.
+    private var needsRebuild = true
+    /// The items that can change while the menu is open, updated in place.
+    /// Removing an item would close the submenu hanging off it under the
+    /// pointer, which is why the menu is never rebuilt while it is open.
+    private var rowItems: [String: NSMenuItem] = [:]
+    private var summaryItem: NSMenuItem?
+    private var statsItem: NSMenuItem?
 
     /// Set by `AppDelegate`. The status item owns the menu, not the window's
     /// lifetime, so it just asks for the window to be shown.
@@ -39,27 +45,61 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         statusItem.button?.imagePosition = .imageLeading
         engine.$model
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] in self?.render($0) }
+            .sink { [weak self] in self?.receive($0) }
             .store(in: &cancellables)
-        render(nil)
+        // AppKit won't open an empty menu, so it can't wait for the first open.
+        rebuild()
+    }
+
+    /// Sent just before the menu shows, which is when its items have to be
+    /// right, and the one moment they can safely all be replaced.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        if needsRebuild { rebuild() }
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        isOpen = true
         engine.refresh()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        isOpen = false
+    }
+
+    private func receive(_ model: PopoverModel?) {
+        latest = model
+        needsRebuild = true
+        statusItem.button?.title = model?.trayTitle ?? ""
+        applyIcon(model)
+        if isOpen, let model { updateInPlace(model) }
+    }
+
+    /// Refresh what's on screen without adding or removing anything. A session
+    /// that started or ended since the menu opened shows up on the next open.
+    private func updateInPlace(_ model: PopoverModel) {
+        summaryItem?.attributedTitle = lineTitle(model.summaryLine, primary: true)
+        statsItem?.attributedTitle = lineTitle(model.statsLine, primary: false)
+        for row in model.live {
+            guard let item = rowItems[row.id] else { continue }
+            style(item, for: row, density: model.rowDensity.metrics)
+        }
     }
 
     /// Every display choice below arrives on the model — which sections to
     /// draw, how tight a row is, whether a row carries its folder. None of it
     /// is read out of `Settings` here: two readers of one preference is how a
     /// window and a menu come to disagree about what is on screen.
-    private func render(_ model: PopoverModel?) {
-        statusItem.button?.title = model?.trayTitle ?? ""
-        applyIcon(model)
+    private func rebuild() {
+        let model = latest
+        needsRebuild = false
         // Detach every submenu from the item that carried it before the items
         // go: an `NSMenu` may belong to one menu item at a time, and these
-        // menus outlive the items, being reattached to next render's rows.
+        // menus outlive the items, being reattached to the new rows.
         for item in menu.items { item.submenu = nil }
         menu.removeAllItems()
+        rowItems = [:]
+        summaryItem = nil
+        statsItem = nil
         // The density the *current* model asks for, handed to every card
         // hosted below. Before the first model there is none, so `add` falls
         // back to the environment default, which is the shipped one.
@@ -75,23 +115,23 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             return
         }
 
-        add(StatsCard(stats: model.stats))
         if let err = model.error { add(EmptyCard(title: "Index unavailable", detail: err)) }
-        menu.addItem(.separator())
-
-        // The banner is Rust's decision, not a section: it reports that
-        // something is blocked on the user, which stays true whether or not
-        // they keep the waiting list on screen.
-        if let banner = model.waitingBanner {
-            add(EmptyCard(title: banner, detail: nil))
+        if model.summaryLine.isEmpty {
+            add(EmptyCard(title: "No sessions running", detail: nil))
+        } else {
+            summaryItem = addLine(model.summaryLine, primary: true)
         }
-        addLiveSections(model)
+        addSessions(model)
         // `show_recent == false` already leaves `recent` empty — the section
         // is not even queried — so there is nothing to re-filter here. The
         // flag decides only whether the header is drawn.
         if model.showRecent && !model.recent.isEmpty {
             menu.addItem(.separator())
             add(RecentCard(rows: model.recent))
+        }
+        if !model.statsLine.isEmpty {
+            menu.addItem(.separator())
+            statsItem = addLine(model.statsLine, primary: false)
         }
         menu.addItem(.separator())
         addOpenWindow()
@@ -100,49 +140,123 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         addQuit()
     }
 
-    /// The two live sections, each drawn only if the user kept it. A session
-    /// belongs to exactly one of them — waiting, or everything still open —
-    /// so no session can fall through both toggles and become undrawable.
-    private func addLiveSections(_ model: PopoverModel) {
-        let waiting = model.live.filter { $0.status == .waiting }
-        let working = model.live.filter { $0.status != .waiting }
-
+    /// One row per session, most urgent first (Rust's order), each drawn only if
+    /// the user kept its section. A session belongs to exactly one of them —
+    /// waiting, or everything still open — so no session can fall through both
+    /// toggles and become undrawable.
+    private func addSessions(_ model: PopoverModel) {
         // A session that is no longer live has no row to hang a submenu off,
-        // so its controller goes. Done before the rows are added, never
-        // after: the reuse below is what keeps the survivors.
+        // so its controller goes.
         let liveIds = Set(model.live.map(\.id))
         submenus = submenus.filter { liveIds.contains($0.key) }
 
-        if model.live.isEmpty {
-            add(EmptyCard(title: "No sessions running", detail: nil))
-            return
-        }
-        if model.showWaiting && !waiting.isEmpty {
-            add(SectionHeaderCard(title: "Waiting on you"))
-            for row in waiting { addSession(row) }
-        }
-        if model.showWorking && !working.isEmpty {
-            add(SectionHeaderCard(title: "Working"))
-            for row in working { addSession(row) }
-        }
+        let shown = model.live.filter { $0.status == .waiting ? model.showWaiting : model.showWorking }
+        if shown.isEmpty { return }
+        menu.addItem(.separator())
+        for row in shown { addSession(row, density: model.rowDensity.metrics) }
     }
 
-    /// One session row, plus the side menu of that session's own detail and
-    /// actions. The row keeps its hosting view — which is why `SessionRowView`
-    /// draws its own chevron, AppKit drawing no disclosure arrow for a
-    /// view-backed item — and the submenu fills itself in when the pointer
-    /// gets there, so its facts are read at the moment they are shown.
-    private func addSession(_ row: SessionRow) {
-        let item = add(SessionRowView(row: row))
-        let metrics = density ?? .comfortable
-        // Reused when this session already had one, so a submenu being read
-        // right now survives the re-render underneath it. Its contents are
-        // composed afresh on every open regardless, so nothing stale is kept
-        // — only the pid and the density it draws at, which are updated here.
+    /// One session row, plus its side menu. A plain menu item rather than a
+    /// hosted view, which gets it AppKit's own highlight, disclosure arrow and
+    /// hover behaviour, and lets it change while the menu is open. The submenu
+    /// fills itself in when the pointer gets there, so its facts are read at
+    /// the moment they are shown.
+    private func addSession(_ row: SessionRow, density metrics: PerchDensityMetrics) {
+        let item = NSMenuItem()
+        style(item, for: row, density: metrics)
+        // Reused when this session already had one. Its contents are composed
+        // afresh on every open, so nothing stale is kept — only the pid and the
+        // density it draws at, which are updated here.
         let submenu = submenus[row.id] ?? SessionSubmenu(engine: engine, row: row, density: metrics)
         submenu.adopt(row: row, density: metrics)
         submenus[row.id] = submenu
         item.submenu = submenu.menu
+        menu.addItem(item)
+        rowItems[row.id] = item
+    }
+
+    private func style(_ item: NSMenuItem, for row: SessionRow, density metrics: PerchDensityMetrics) {
+        item.image = Self.dot(for: row.status)
+        item.attributedTitle = rowTitle(row, density: metrics)
+    }
+
+    /// `name    Working 12s`, the state lined up at the right edge, with the
+    /// folder underneath if the user asked for it. Every word is Rust's.
+    private func rowTitle(_ row: SessionRow, density metrics: PerchDensityMetrics) -> NSAttributedString {
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.tabStops = [NSTextTab(textAlignment: .right, location: RowMetrics.stateEdge)]
+        paragraph.paragraphSpacingBefore = metrics.row / 2
+        paragraph.paragraphSpacing = metrics.row / 2
+
+        let title = NSMutableAttributedString(
+            string: row.menuName,
+            attributes: [.font: NSFont.menuFont(ofSize: 0), .paragraphStyle: paragraph]
+        )
+        title.append(NSAttributedString(
+            string: "\t" + row.glance,
+            attributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular),
+                .foregroundColor: row.status == .waiting ? NSColor(Color.perchWaiting) : NSColor.secondaryLabelColor,
+                .paragraphStyle: paragraph,
+            ]
+        ))
+        // Blank means the user turned "Show project folder" off.
+        if !row.folder.isEmpty {
+            title.append(NSAttributedString(
+                string: "\n" + row.folder,
+                attributes: [
+                    .font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize),
+                    .foregroundColor: NSColor.tertiaryLabelColor,
+                ]
+            ))
+        }
+        return title
+    }
+
+    /// A line of plain information. Disabled, because there's nothing to do with
+    /// it, with its colour set so it doesn't get drawn dimmed as well.
+    private func addLine(_ text: String, primary: Bool) -> NSMenuItem {
+        let item = NSMenuItem()
+        item.attributedTitle = lineTitle(text, primary: primary)
+        item.isEnabled = false
+        menu.addItem(item)
+        return item
+    }
+
+    private func lineTitle(_ text: String, primary: Bool) -> NSAttributedString {
+        NSAttributedString(
+            string: text,
+            attributes: primary
+                ? [
+                    .font: NSFont.menuFont(ofSize: 0).withWeight(.semibold),
+                    .foregroundColor: NSColor.labelColor,
+                ]
+                : [
+                    .font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                ]
+        )
+    }
+
+    /// The status dot. Drawn on demand so it follows the appearance and matches
+    /// the colours used everywhere else in the app.
+    private static func dot(for status: Status) -> NSImage {
+        let color: NSColor = switch status {
+        case .waiting: NSColor(Color.perchWaiting)
+        case .working: NSColor(Color.perchWorking)
+        case .idle: NSColor(Color.perchWorking.opacity(0.55))
+        case .background: NSColor(Color.perchBackground)
+        }
+        return NSImage(size: NSSize(width: 8, height: 8), flipped: false) { rect in
+            color.setFill()
+            NSBezierPath(ovalIn: rect).fill()
+            return true
+        }
+    }
+
+    private enum RowMetrics {
+        /// Where the state lines up: enough for a full-length name beside it.
+        static let stateEdge: CGFloat = 370
     }
 
     /// Draw the glyph the model chose, dimmed when the data behind it has
@@ -200,6 +314,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func openWindow() { onOpenWindow?() }
     @objc private func openSettings() { onOpenSettings?() }
     @objc private func quit() { NSApp.terminate(nil) }
+}
+
+private extension NSFont {
+    func withWeight(_ weight: NSFont.Weight) -> NSFont {
+        let traits = [NSFontDescriptor.TraitKey.weight: weight]
+        let descriptor = fontDescriptor.addingAttributes([.traits: traits])
+        return NSFont(descriptor: descriptor, size: pointSize) ?? self
+    }
 }
 
 /// The SF Symbol each menu-bar variant draws as. This mapping lives in Swift

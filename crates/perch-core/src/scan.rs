@@ -4,7 +4,7 @@ use crate::model::{SessionMeta, Turn};
 use crate::transcript::parse_line;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::Path;
 
 #[derive(Debug, Clone, Default)]
@@ -45,36 +45,33 @@ pub fn scan_from(path: &Path, offset: u64) -> std::io::Result<ScanOutcome> {
 
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(start))?;
-    let mut buf = Vec::with_capacity((len - start) as usize);
-    file.read_to_end(&mut buf)?;
-
-    // Consume only through the final newline.
-    let last_newline = match buf.iter().rposition(|b| *b == b'\n') {
-        Some(i) => i,
-        None => {
-            // No complete line in the new bytes yet.
-            return Ok(ScanOutcome {
-                new_offset: start,
-                restarted,
-                ..Default::default()
-            });
-        }
-    };
-    let complete = &buf[..=last_newline];
-    let new_offset = start + complete.len() as u64;
+    // One line at a time rather than the whole file: a transcript can run to
+    // hundreds of megabytes, and memory given back to the allocator after a
+    // read that size mostly stays with the process.
+    let mut reader = BufReader::new(file);
+    let mut raw = Vec::new();
 
     let mut out = ScanOutcome {
-        new_offset,
+        new_offset: start,
         restarted,
         ..Default::default()
     };
     let mut turn_for_message: HashMap<String, usize> = HashMap::new();
 
-    for raw in complete.split(|b| *b == b'\n') {
+    loop {
+        raw.clear();
+        let read = reader.read_until(b'\n', &mut raw)?;
+        // Consume only through the final newline. No newline means the end of
+        // the file, and a line that is still being written.
+        if read == 0 || raw.last() != Some(&b'\n') {
+            break;
+        }
+        out.new_offset += read as u64;
+        raw.pop();
         if raw.is_empty() {
             continue;
         }
-        let text = match std::str::from_utf8(raw) {
+        let text = match std::str::from_utf8(&raw) {
             Ok(t) => t,
             Err(_) => {
                 out.lines_skipped += 1;

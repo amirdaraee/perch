@@ -217,7 +217,12 @@ fn init(conn: Connection) -> Result<Db> {
     let existing_version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     conn.execute_batch(SCHEMA)?;
     migrate(&conn, existing_version)?;
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    // Only when it differs: this runs every time the index is opened, which is
+    // several times a tick, and setting it is a write to disk even when the
+    // value is the same.
+    if existing_version != SCHEMA_VERSION {
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
     Ok(Db { conn })
 }
 
@@ -451,6 +456,30 @@ impl Db {
                 })
             },
         )?)
+    }
+
+    /// Every project's id and notification override, keyed by its real path.
+    /// One read of `projects` alone, because this runs on every tick.
+    pub fn notify_overrides_by_path(
+        &self,
+    ) -> Result<std::collections::HashMap<String, (i64, NotifyOverride)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, real_path, notify_mode, notify_after_minutes FROM projects")?;
+        let rows = stmt
+            .query_map([], |r| {
+                let mode: String = r.get(2)?;
+                let after_minutes: Option<i64> = r.get(3)?;
+                Ok((
+                    r.get::<_, String>(1)?,
+                    (
+                        r.get::<_, i64>(0)?,
+                        NotifyOverride::from_columns(&mode, after_minutes),
+                    ),
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     /// Set the per-project notification override. `notify_mode` and
@@ -1499,6 +1528,41 @@ mod tests {
         db.insert_turns("s1", &[response("msg_1", 5)]).unwrap();
         db.insert_turns("s1", &[response("msg_1", 5)]).unwrap();
         assert_eq!(db.turn_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn notify_overrides_match_what_each_project_has_set() {
+        let db = open_in_memory().unwrap();
+        let a = db.upsert_project("-a", "/a", false).unwrap();
+        let b = db.upsert_project("-b", "/b", false).unwrap();
+        db.set_notify_override(b, &NotifyOverride::Custom { after_minutes: 9 })
+            .unwrap();
+
+        let got = db.notify_overrides_by_path().unwrap();
+
+        assert_eq!(got["/a"], (a, NotifyOverride::Default));
+        assert_eq!(got["/b"], (b, NotifyOverride::Custom { after_minutes: 9 }));
+    }
+
+    #[test]
+    fn opening_an_up_to_date_index_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("i.db");
+        drop(open(&p).unwrap());
+        let version_of = |c: &Connection| -> i64 {
+            c.query_row("PRAGMA data_version", [], |r| r.get(0))
+                .unwrap()
+        };
+        let watcher = Connection::open(&p).unwrap();
+        let before = version_of(&watcher);
+
+        drop(open(&p).unwrap());
+
+        assert_eq!(
+            version_of(&watcher),
+            before,
+            "another open changed the file"
+        );
     }
 
     fn response(message_id: &str, output: u64) -> Turn {

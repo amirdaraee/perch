@@ -49,6 +49,8 @@ pub struct SessionRow {
     pub cost: String,
     pub folder: String,
     pub detail_line: String,
+    pub menu_name: String,
+    pub glance: String,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -119,6 +121,8 @@ pub struct PopoverModel {
     pub tray_title: String,
     pub error: Option<String>,
     pub waiting_banner: Option<String>,
+    pub summary_line: String,
+    pub stats_line: String,
     pub staleness: Option<Staleness>,
     pub show_waiting: bool,
     pub show_working: bool,
@@ -197,6 +201,8 @@ impl From<core_model::SessionRow> for SessionRow {
             cost,
             folder,
             detail_line,
+            menu_name,
+            glance,
         } = r;
         SessionRow {
             id,
@@ -212,6 +218,8 @@ impl From<core_model::SessionRow> for SessionRow {
             cost,
             folder,
             detail_line,
+            menu_name,
+            glance,
         }
     }
 }
@@ -246,6 +254,8 @@ impl From<core_model::PopoverModel> for PopoverModel {
             tray_title,
             error,
             waiting_banner,
+            summary_line,
+            stats_line,
             staleness,
             show_waiting,
             show_working,
@@ -260,6 +270,8 @@ impl From<core_model::PopoverModel> for PopoverModel {
             tray_title,
             error,
             waiting_banner,
+            summary_line,
+            stats_line,
             staleness: staleness.map(|s| Staleness { label: s.label }),
             show_waiting,
             show_working,
@@ -325,6 +337,7 @@ pub struct SessionUsage {
 /// Mirrors `perch_core::ui::session_menu::SessionMenu`.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct SessionMenu {
+    pub glance: Vec<DetailRow>,
     pub detail: Vec<DetailRow>,
     pub usage: SessionUsage,
     pub actions: Vec<MenuAction>,
@@ -412,6 +425,7 @@ impl From<core_session_menu::SessionUsage> for SessionUsage {
 impl From<core_session_menu::SessionMenu> for SessionMenu {
     fn from(m: core_session_menu::SessionMenu) -> Self {
         let core_session_menu::SessionMenu {
+            glance,
             detail,
             usage,
             actions,
@@ -419,6 +433,7 @@ impl From<core_session_menu::SessionMenu> for SessionMenu {
             session_id,
         } = m;
         SessionMenu {
+            glance: glance.into_iter().map(Into::into).collect(),
             detail: detail.into_iter().map(Into::into).collect(),
             usage: usage.into(),
             actions: actions.into_iter().map(Into::into).collect(),
@@ -1974,9 +1989,8 @@ impl ThisPerch {
     /// One database round trip per tick, not one per session: both of
     /// `decide`'s lookups below are pure map lookups over this.
     ///
-    /// The id rides along with the override rather than costing a second
-    /// query because `project_summaries` already carries it — it is what a
-    /// finished notification points at, so a click routes to the project the
+    /// The id rides along with the override because it is what a finished
+    /// notification points at, so a click routes to the project the
     /// alert was about rather than to whichever indexed project happens to
     /// share its directory name.
     ///
@@ -1992,24 +2006,7 @@ impl ThisPerch {
         let Ok(database) = db::open(&self.db_path) else {
             return HashMap::new();
         };
-        // One `project_meta` query per *project*, not per session (that's the
-        // shape the brief asked to avoid: an N+1 against live session count).
-        // This is still an N+1 against project count, run once per tick —
-        // a deliberate choice at today's scale, not an oversight: `Db` has no
-        // "every project's meta in one query" method yet, and adding one
-        // purely for this cache would be new surface for a cost that isn't
-        // showing up. Revisit if this is ever measured against hundreds of
-        // projects.
-        query::project_summaries(&database)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|s| {
-                database
-                    .project_meta(s.id)
-                    .ok()
-                    .map(|m| (s.real_path, (s.id, m.notify)))
-            })
-            .collect()
+        database.notify_overrides_by_path().unwrap_or_default()
     }
 
     /// This tick's edge-triggered notifications (see `notify::decide`),

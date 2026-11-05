@@ -54,6 +54,11 @@ pub struct SessionRow {
     /// separately — and are blanked the same way, so the two can never
     /// disagree about what is on show.
     pub detail_line: String,
+    /// `name`, cut to a length that fits one menu row.
+    pub menu_name: String,
+    /// The state and how long it has lasted, like "Waiting 4m": what the menu
+    /// shows beside the name so a row reads at a glance.
+    pub glance: String,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -88,6 +93,12 @@ pub struct PopoverModel {
     /// nothing is waiting. A shell renders this verbatim — it must not count
     /// or pluralise itself (spec: Rust owns everything except drawing).
     pub waiting_banner: Option<String>,
+    /// "2 waiting · 3 working · 5 idle", or empty with no sessions. Counts of
+    /// zero are left out.
+    pub summary_line: String,
+    /// "≈$12.40 last 24h · 3.2M this week", or empty when the index has nothing
+    /// to report. Leaves out the cost when the user hides costs.
+    pub stats_line: String,
     /// `Some` once the index has not been read successfully for longer than
     /// `stale_after_minutes`, and never when `dim_when_stale` is off.
     pub staleness: Option<Staleness>,
@@ -113,6 +124,73 @@ const DASH: &str = "—";
 const FIVE_HOURS_MS: i64 = 5 * 60 * 60 * 1000;
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 const WEEK_MS: i64 = 7 * DAY_MS;
+
+/// How long a session's name can be in a menu row before it's cut. A menu is as
+/// wide as its widest row, so one long title would widen the whole thing.
+const MENU_NAME_CHARS: usize = 40;
+
+fn menu_name_of(name: &str) -> String {
+    if name.chars().count() <= MENU_NAME_CHARS {
+        name.to_string()
+    } else {
+        let kept: String = name.chars().take(MENU_NAME_CHARS - 1).collect();
+        format!("{}…", kept.trim_end())
+    }
+}
+
+/// "Waiting 4m" from a status label like "waiting · permission" and an elapsed
+/// time. The reason stays in the session's submenu.
+fn glance_of(status_label: &str, elapsed: &str) -> String {
+    let word = status_label.split(" · ").next().unwrap_or(status_label);
+    let mut chars = word.chars();
+    let word = match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect::<String>(),
+        None => String::new(),
+    };
+    if elapsed.is_empty() || elapsed == DASH {
+        word
+    } else {
+        format!("{word} {elapsed}")
+    }
+}
+
+/// What most needs attention first. The sort that uses this is stable, so
+/// sessions in one state keep their order and rows don't jump around.
+fn status_rank(status: &Status) -> u8 {
+    match status {
+        Status::Waiting => 0,
+        Status::Working => 1,
+        Status::Idle => 2,
+        Status::Background => 3,
+    }
+}
+
+fn summary_line(rows: &[SessionRow]) -> String {
+    let count = |wanted: Status| rows.iter().filter(|r| r.status == wanted).count();
+    [
+        (count(Status::Waiting), "waiting"),
+        (count(Status::Working), "working"),
+        (count(Status::Idle), "idle"),
+        (count(Status::Background), "background"),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, word)| format!("{n} {word}"))
+    .collect::<Vec<_>>()
+    .join(" · ")
+}
+
+fn stats_line(stats: &Stats) -> String {
+    if !stats.has_data {
+        return String::new();
+    }
+    let week = format!("{} this week", stats.week_tokens);
+    if stats.day_cost.is_empty() {
+        week
+    } else {
+        format!("≈{} last 24h · {week}", stats.day_cost)
+    }
+}
 
 fn project_of(cwd: &str) -> String {
     std::path::Path::new(cwd)
@@ -236,6 +314,8 @@ impl PopoverModel {
             tray_title: String::new(),
             error: None,
             waiting_banner: None,
+            summary_line: String::new(),
+            stats_line: String::new(),
             staleness: None,
             show_waiting: defaults.show_waiting,
             show_working: defaults.show_working,
@@ -325,7 +405,7 @@ pub fn build_model(
     // specific message `stats_from` may already have set.
     let mut data_error = false;
 
-    let rows: Vec<SessionRow> = live
+    let mut rows: Vec<SessionRow> = live
         .iter()
         .map(|s| {
             let (status, status_label, since) = status_of(s);
@@ -374,26 +454,30 @@ pub fn build_model(
             .flatten()
             .collect::<Vec<_>>()
             .join(" · ");
+            // The indexed title first: a live record carries Claude Code's
+            // `<project>-<id>` slug, which is not what a human named this work.
+            // The slug is the fallback, and the id prefix the fallback's
+            // fallback.
+            let name = titles.get(&s.session_id).cloned().unwrap_or_else(|| {
+                if s.name.is_empty() {
+                    s.session_id.chars().take(8).collect()
+                } else {
+                    s.name.clone()
+                }
+            });
+            let elapsed = elapsed_or_dash(now_ms, since);
             SessionRow {
                 id: s.session_id.clone(),
                 pid: s.pid,
-                // The indexed title first: a live record carries Claude
-                // Code's `<project>-<id>` slug, which is not what a human
-                // named this work. The slug is the fallback, and the id
-                // prefix the fallback's fallback.
-                name: titles.get(&s.session_id).cloned().unwrap_or_else(|| {
-                    if s.name.is_empty() {
-                        s.session_id.chars().take(8).collect()
-                    } else {
-                        s.name.clone()
-                    }
-                }),
+                menu_name: menu_name_of(&name),
+                glance: glance_of(&status_label, &elapsed),
+                name,
                 project,
                 kind,
                 version,
                 status,
                 status_label,
-                elapsed: elapsed_or_dash(now_ms, since),
+                elapsed,
                 tokens,
                 cost,
                 folder: if settings.show_row_folder {
@@ -405,6 +489,7 @@ pub fn build_model(
             }
         })
         .collect();
+    rows.sort_by_key(|r| status_rank(&r.status));
 
     let live_ids: Vec<String> = live.iter().map(|s| s.session_id.clone()).collect();
     let recent: Vec<RecentRow> =
@@ -474,6 +559,8 @@ pub fn build_model(
 
     let waiting = rows.iter().filter(|r| r.status == Status::Waiting).count();
 
+    let summary_line = summary_line(&rows);
+    let stats_line = stats_line(&stats);
     PopoverModel {
         stats,
         live: rows,
@@ -481,6 +568,8 @@ pub fn build_model(
         tray_title: tray_title(live, settings.menu_bar_display),
         error,
         waiting_banner: waiting_banner(waiting),
+        summary_line,
+        stats_line,
         staleness: staleness(settings, last_read_ms, now_ms),
         show_waiting: settings.show_waiting,
         show_working: settings.show_working,
@@ -499,11 +588,12 @@ mod tests {
 
     /// The settings these tests ran against before `build_model` took a
     /// `&Settings`: defaults everywhere except `menu_bar_display`, which each
-    /// call used to pass explicitly. Every other assertion here is therefore
-    /// unchanged by the switch.
+    /// call used to pass explicitly, and the Recent section, which most of these
+    /// tests are about and which is off by default.
     fn count_and_waiting() -> Settings {
         Settings {
             menu_bar_display: MenuBarDisplay::CountAndWaiting,
+            show_recent: true,
             ..Settings::default()
         }
     }
@@ -608,6 +698,70 @@ mod tests {
             Status::Waiting,
             "a blocked bg session is still blocked"
         );
+    }
+
+    #[test]
+    fn a_long_name_is_cut_for_the_menu_and_a_short_one_is_not() {
+        assert_eq!(menu_name_of("short"), "short");
+        let cut = menu_name_of(&"x".repeat(100));
+        assert_eq!(cut.chars().count(), MENU_NAME_CHARS);
+        assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    fn glance_is_the_state_and_its_age_without_the_reason() {
+        assert_eq!(glance_of("waiting · permission", "4m"), "Waiting 4m");
+        assert_eq!(glance_of("working", "12s"), "Working 12s");
+        assert_eq!(glance_of("idle", DASH), "Idle");
+    }
+
+    #[test]
+    fn rows_put_what_needs_attention_first_and_are_summed_up_in_one_line() {
+        let idle = live(1, "i", "i", "/x", SessionStatus::Idle, "interactive");
+        let work = live(2, "w", "w", "/x", SessionStatus::Working, "interactive");
+        let mut wait = live(3, "a", "a", "/x", SessionStatus::Working, "interactive");
+        wait.status = SessionStatus::Waiting {
+            reason: None,
+            since_ms: 1,
+        };
+        let work2 = live(4, "x", "x", "/x", SessionStatus::Working, "interactive");
+
+        let m = build_model(
+            None,
+            &[idle, work, wait, work2],
+            65_000,
+            None,
+            &Settings::default(),
+        );
+
+        let order: Vec<&str> = m.live.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(order, vec!["a", "w", "x", "i"]);
+        assert_eq!(m.summary_line, "1 waiting · 2 working · 1 idle");
+    }
+
+    #[test]
+    fn with_no_sessions_or_no_data_the_lines_are_empty_not_zeroes() {
+        let m = build_model(None, &[], 65_000, None, &Settings::default());
+        assert_eq!(m.summary_line, "");
+        assert_eq!(m.stats_line, "");
+    }
+
+    #[test]
+    fn the_stats_line_leaves_out_a_hidden_cost() {
+        let stats = Stats {
+            window_tokens: "1k".into(),
+            week_tokens: "3.2M".into(),
+            day_tokens: "2k".into(),
+            day_cost: "$12.40".into(),
+            estimated: true,
+            has_data: true,
+        };
+        assert_eq!(stats_line(&stats), "≈$12.40 last 24h · 3.2M this week");
+        let hidden = Stats {
+            day_cost: String::new(),
+            ..stats
+        };
+        assert_eq!(stats_line(&hidden), "3.2M this week");
     }
 
     #[test]
@@ -971,6 +1125,7 @@ mod tests {
 
         let two = Settings {
             recent_limit: 2,
+            show_recent: true,
             ..Settings::default()
         };
         assert_eq!(
@@ -978,7 +1133,7 @@ mod tests {
             2
         );
         assert_eq!(
-            build_model(Some(&db), &[], 10_000, None, &Settings::default())
+            build_model(Some(&db), &[], 10_000, None, &count_and_waiting())
                 .recent
                 .len(),
             3,
@@ -1403,6 +1558,13 @@ mod title_tests {
     use crate::db::open_in_memory;
     use crate::model::SessionRecord;
 
+    fn with_recent() -> Settings {
+        Settings {
+            show_recent: true,
+            ..Settings::default()
+        }
+    }
+
     /// A session's own title is the point of having indexed one. The popover
     /// showed Claude Code's `<project>-<id>` slug for live rows and, worse,
     /// the *project* name for recent ones — so three sessions in one project
@@ -1489,7 +1651,7 @@ mod title_tests {
             10,
         );
         seed(&db, "b", "/work/api", Some("ci.yml security hardening"), 20);
-        let m = build_model(Some(&db), &[], 100, None, &Settings::default());
+        let m = build_model(Some(&db), &[], 100, None, &with_recent());
         let names: Vec<&str> = m.recent.iter().map(|r| r.name.as_str()).collect();
         assert!(
             names.contains(&"Pricing module security review"),
@@ -1509,7 +1671,7 @@ mod title_tests {
     fn an_untitled_recent_row_still_names_its_project() {
         let db = open_in_memory().unwrap();
         seed(&db, "a", "/work/api", None, 10);
-        let m = build_model(Some(&db), &[], 100, None, &Settings::default());
+        let m = build_model(Some(&db), &[], 100, None, &with_recent());
         assert_eq!(m.recent[0].name, "api");
     }
 }

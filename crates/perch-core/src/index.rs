@@ -79,6 +79,14 @@ pub fn index_all(db: &Db, projects_root: &Path) -> Result<IndexStats> {
             // rows already stored.
             let restarted = outcome.restarted;
 
+            // Nothing new, as for nearly every session on nearly every pass:
+            // rewriting its row would only be disk writes for no change.
+            if offset > 0 && outcome.new_offset == offset && !restarted {
+                stats.sessions += 1;
+                index_subagents(db, session_id, file, &mut stats)?;
+                continue;
+            }
+
             stats.sessions += 1;
             stats.new_turns += outcome.turns.len();
             stats.bytes_read +=

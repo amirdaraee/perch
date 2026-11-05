@@ -2,8 +2,8 @@ import AppKit
 import SwiftUI
 import PerchFFI
 
-/// The side menu that hangs off one session row: that session's own facts,
-/// and the four things a user can do to it.
+/// The side menu that hangs off one session row: how that session is doing, the
+/// four things a user can do to it, and everything else under "Details".
 ///
 /// One of these per drawn row, owned by `StatusItemController` for exactly as
 /// long as the row it belongs to is on screen. It is the menu's delegate, so
@@ -74,17 +74,8 @@ final class SessionSubmenu: NSObject, NSMenuDelegate {
             return
         }
 
-        menu.addItem(card(SessionDetailCard(rows: model.detail)))
+        menu.addItem(card(SessionDetailCard(rows: model.glance)))
         menu.addItem(.separator())
-
-        // Empty in every field is how Rust says the user turned these numbers
-        // off, and a section the user hid is no section at all — not a
-        // heading with nothing under it, and not a separator with nothing
-        // between.
-        if !isHidden(model.usage) {
-            menu.addItem(card(SessionUsageCard(usage: model.usage)))
-            menu.addItem(.separator())
-        }
 
         for action in model.actions {
             menu.addItem(item(for: action))
@@ -92,6 +83,27 @@ final class SessionSubmenu: NSObject, NSMenuDelegate {
                 menu.addItem(explanation(reason))
             }
         }
+
+        menu.addItem(.separator())
+        let details = NSMenuItem(title: "Details", action: nil, keyEquivalent: "")
+        details.submenu = detailsMenu(model)
+        menu.addItem(details)
+    }
+
+    /// Everything the short list leaves out, one level further in.
+    private func detailsMenu(_ model: SessionMenu) -> NSMenu {
+        let details = NSMenu()
+        details.autoenablesItems = false
+        details.addItem(card(SessionDetailCard(rows: model.detail)))
+        // Empty in every field is how Rust says the user turned these numbers
+        // off, and a section the user hid is no section at all — not a
+        // heading with nothing under it, and not a separator with nothing
+        // between.
+        if !isHidden(model.usage) {
+            details.addItem(.separator())
+            details.addItem(card(SessionUsageCard(usage: model.usage)))
+        }
+        return details
     }
 
     // MARK: - Items

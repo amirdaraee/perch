@@ -89,6 +89,9 @@ pub struct SessionUsage {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SessionMenu {
+    /// What the submenu shows first: only what tells you how this session is
+    /// doing. `detail` and `usage` hold everything else, behind "Details".
+    pub glance: Vec<DetailRow>,
     pub detail: Vec<DetailRow>,
     pub usage: SessionUsage,
     pub actions: Vec<MenuAction>,
@@ -191,9 +194,11 @@ const MAX_SUBAGENT_ROWS: usize = 8;
 /// finished strings; it applies the very same two preferences, and a test
 /// holds the two readings together.
 pub fn build_session_menu(ctx: &SessionContext) -> SessionMenu {
+    let usage = usage_section(ctx);
     SessionMenu {
+        glance: glance_rows(ctx, &usage),
         detail: detail_rows(ctx),
-        usage: usage_section(ctx),
+        usage,
         actions: actions(ctx),
         folder_path: ctx.cwd.to_string(),
         session_id: ctx.row.id.clone(),
@@ -441,6 +446,38 @@ fn subagent_rows(
     (heading, out)
 }
 
+fn glance_rows(ctx: &SessionContext, usage: &SessionUsage) -> Vec<DetailRow> {
+    let row = ctx.row;
+    let mut out = Vec::new();
+    let status = if row.elapsed.is_empty() || row.elapsed == DASH {
+        or_dash(&row.status_label).to_string()
+    } else {
+        format!("{} · {}", row.status_label, row.elapsed)
+    };
+    push(&mut out, "Status", &status);
+    // Absent rather than a dash when unknown: this list is for what is known,
+    // and the full list behind "Details" says what isn't.
+    push(&mut out, "Branch", ctx.branch.unwrap_or(""));
+    let spent = match (row.tokens.as_str(), row.cost.as_str()) {
+        ("", _) | (DASH, _) => String::new(),
+        (t, "") => t.to_string(),
+        (t, c) => format!("{t} · {c}"),
+    };
+    push(&mut out, "Usage", &spent);
+    if !usage.subagents_heading.is_empty() {
+        let count = usage
+            .subagents_heading
+            .replace(" subagents", "")
+            .replace(" subagent", "");
+        push(&mut out, "Subagents", &count);
+    }
+    if let Some(stats) = &ctx.process {
+        push(&mut out, "CPU", &cpu_text(stats));
+        push(&mut out, "Memory", &human_bytes(stats.memory_bytes));
+    }
+    out
+}
+
 fn detail_rows(ctx: &SessionContext) -> Vec<DetailRow> {
     let row = ctx.row;
     let mut out = Vec::new();
@@ -473,6 +510,14 @@ fn detail_rows(ctx: &SessionContext) -> Vec<DetailRow> {
     out
 }
 
+fn cpu_text(stats: &ProcessStats) -> String {
+    if stats.cpu_percent > 0.0 && stats.cpu_percent < 1.0 {
+        "<1%".to_string()
+    } else {
+        format!("{:.0}%", stats.cpu_percent)
+    }
+}
+
 /// The values of the CPU and Memory rows. They say when they include child
 /// processes, because a session running a build reads very differently from one
 /// that is using that much by itself.
@@ -480,11 +525,7 @@ fn process_rows(stats: Option<&ProcessStats>) -> (String, String) {
     let Some(stats) = stats else {
         return (DASH.to_string(), DASH.to_string());
     };
-    let cpu = if stats.cpu_percent > 0.0 && stats.cpu_percent < 1.0 {
-        "<1%".to_string()
-    } else {
-        format!("{:.0}%", stats.cpu_percent)
-    };
+    let cpu = cpu_text(stats);
     let memory = human_bytes(stats.memory_bytes);
     match stats.child_processes {
         0 => (cpu, memory),
@@ -1267,6 +1308,56 @@ mod tests {
 
         assert_eq!(value(&m, "Tokens").as_deref(), Some("2.0M"));
         assert_eq!(value(&m, "Cost").as_deref(), Some("$30.00"));
+    }
+
+    // ---- the short version --------------------------------------------------
+
+    #[test]
+    fn the_glance_holds_only_what_says_how_the_session_is_doing() {
+        let s = live("/Users/a/proj", Some("2.1.251"));
+        let settings = Settings::default();
+        let db = indexed(&[(1_000, "claude-fable-5", spread(10, 10, 0, 0))]);
+        add_subagent(&db, "a", Some("Explore"), NOW - 5_000, 1);
+        let row = row_from(Some(&db), &s, &settings);
+        let m = build_session_menu(&SessionContext {
+            row: &row,
+            cwd: &s.cwd,
+            branch: Some("main"),
+            owning_app: None,
+            db: Some(&db),
+            settings: &settings,
+            now_ms: NOW,
+            process: Some(stats(12.4, 310_000_000, 3)),
+        });
+
+        let labels: Vec<&str> = m.glance.iter().map(|d| d.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["Status", "Branch", "Usage", "Subagents", "CPU", "Memory"]
+        );
+        let get = |l: &str| {
+            m.glance
+                .iter()
+                .find(|d| d.label == l)
+                .unwrap()
+                .value
+                .clone()
+        };
+        assert_eq!(get("Subagents"), "1 · 1 active");
+        assert_eq!(get("CPU"), "12%");
+        assert_eq!(get("Memory"), "310.0 MB");
+    }
+
+    #[test]
+    fn the_glance_leaves_out_what_is_unknown_or_hidden() {
+        let s = live("/Users/a/proj", None);
+        let settings = Settings {
+            show_row_usage: false,
+            ..Settings::default()
+        };
+        let m = menu_in(None, &settings, &row_for(&s, &settings), &s.cwd, None, None);
+        let labels: Vec<&str> = m.glance.iter().map(|d| d.label.as_str()).collect();
+        assert_eq!(labels, vec!["Status"]);
     }
 
     // ---- cpu and memory -------------------------------------------------------

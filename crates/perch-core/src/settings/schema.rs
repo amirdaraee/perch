@@ -571,7 +571,7 @@ fn popover_pane(s: &Settings, cx: &SchemaContext) -> SettingsPane {
                     s,
                     SettingKey::ShowRowUsage,
                     "Show tokens and cost",
-                    "Show each session's token count and estimated cost on its row.",
+                    "Show each session's token count and estimated cost when you open it.",
                     Control::Toggle {
                         on: s.show_row_usage,
                     },
