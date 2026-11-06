@@ -120,11 +120,12 @@ struct ProjectCard: View {
             ForEach(row.sparkline, id: \.dayIndex) { point in
                 BarMark(
                     x: .value("Day", point.dayIndex),
-                    y: .value("Tokens", point.tokens)
+                    y: .value("Responses", point.responses)
                 )
                 .foregroundStyle(Color.perchWorking.opacity(0.85))
-                // `label` is Rust's already-final day label — never formatted here.
+                // Both are Rust's finished strings, never formatted here.
                 .accessibilityLabel(point.label)
+                .accessibilityValue(point.valueLabel)
             }
             PerchChartBaseline()
         }

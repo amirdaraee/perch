@@ -561,95 +561,113 @@ pub fn session_history(db: &Db, project_id: i64) -> Result<Vec<HistorySession>> 
     Ok(out)
 }
 
+/// One calendar day in the user's time zone. Two measures answer different
+/// questions, and neither is total tokens, which is almost all cache reads and
+/// so mostly shows how long the conversations had grown:
+/// - `responses` is how active the day was. It needs no price and cache size
+///   doesn't move it.
+/// - `cost_usd` is what the day would cost, with `usage.output` as the stand-in
+///   when nothing has a price.
 #[derive(Debug, Clone)]
 pub struct DayUsage {
-    pub day_start_ms: i64,
+    pub date: chrono::NaiveDate,
+    /// API responses, subagents' included.
+    pub responses: u64,
     pub usage: TurnUsage,
     pub cost_usd: f64,
     pub unpriced_tokens: u64,
 }
 
-fn day_start(ts_ms: i64) -> i64 {
-    ts_ms - ts_ms.rem_euclid(DAY_MS)
+/// A `WITH` clause naming the window's days, so one query can group by them.
+/// A day's length varies, so SQL can't work out which day a turn is in from its
+/// timestamp alone. Every value is an integer computed here, never user input.
+fn days_table(window: &[crate::days::Day]) -> String {
+    let rows = window
+        .iter()
+        .enumerate()
+        .map(|(i, d)| format!("({i},{},{})", d.start_ms, d.end_ms))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("WITH days(i, lo, hi) AS (VALUES {rows})")
 }
 
 /// Shared by `daily_usage` and `daily_usage_for_project`: everything except
 /// which turns are in scope (all of them, or one project's) is identical.
-fn daily_usage_grouped(
+pub(crate) fn daily_usage_in<Tz: chrono::TimeZone>(
     db: &Db,
+    tz: &Tz,
     days: usize,
     now_ms: i64,
     project_filter: Option<i64>,
 ) -> Result<Vec<DayUsage>> {
-    let last = day_start(now_ms);
-    let first = last - (days as i64 - 1).max(0) * DAY_MS;
-    // Exclusive upper bound: one day past `last`, so turns newer than the
-    // requested window are never fetched, priced, or grouped in the first
-    // place (rather than being computed and then discarded).
-    let upper = last + DAY_MS;
-
-    let mut per_day: std::collections::HashMap<i64, Spend> = std::collections::HashMap::new();
+    let window = crate::days::window(tz, days, now_ms);
+    if window.is_empty() {
+        return Ok(Vec::new());
+    }
     let scope = match project_filter {
-        Some(_) => "AND session_id IN (SELECT id FROM sessions WHERE project_id = ?3)",
+        Some(_) => "AND t.session_id IN (SELECT id FROM sessions WHERE project_id = ?1)",
         None => "",
     };
+    // `CROSS JOIN` keeps SQLite walking day by day through the `ts` index, so
+    // turns outside the window are never read.
     let sql = format!(
-        // `ts % D` in SQLite is a C-style remainder, already in [0, D) for
-        // non-negative `ts`; the outer `(+ D) % D` only matters for negative
-        // `ts` (pre-1970), pulling a negative remainder back into [0, D) so
-        // this agrees with Rust's `ts.rem_euclid(D)` in `day_start` above.
-        "SELECT (ts - (ts % {DAY_MS} + {DAY_MS}) % {DAY_MS}) AS day, model, {SUMS}
-         FROM turns WHERE ts >= ?1 AND ts < ?2 {scope} GROUP BY day, model"
+        "{} SELECT d.i, t.model, COUNT(*), {SUMS}
+         FROM days d CROSS JOIN turns t
+         WHERE t.ts >= d.lo AND t.ts < d.hi {scope}
+         GROUP BY d.i, t.model",
+        days_table(&window)
     );
     let mut stmt = db.conn().prepare(&sql)?;
     let rows = if let Some(project_id) = project_filter {
-        stmt.query_map(params![first, upper, project_id], day_model_usage_row)?
+        stmt.query_map(params![project_id], day_model_usage_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?
     } else {
-        stmt.query_map(params![first, upper], day_model_usage_row)?
+        stmt.query_map([], day_model_usage_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?
     };
-    for (day, model, u) in rows {
-        per_day.entry(day).or_default().add(db, &model, &u)?;
-    }
 
-    Ok((0..days)
-        .map(|i| {
-            let day_start_ms = first + i as i64 * DAY_MS;
-            let spend = per_day.get(&day_start_ms).copied().unwrap_or_default();
-            DayUsage {
-                day_start_ms,
-                usage: spend.usage,
-                cost_usd: spend.cost_usd,
-                unpriced_tokens: spend.unpriced_tokens,
-            }
+    let mut per_day = vec![(Spend::default(), 0u64); window.len()];
+    for (slot, model, responses, u) in rows {
+        per_day[slot].0.add(db, &model, &u)?;
+        per_day[slot].1 += responses;
+    }
+    Ok(window
+        .iter()
+        .zip(per_day)
+        .map(|(day, (spend, responses))| DayUsage {
+            date: day.date,
+            responses,
+            usage: spend.usage,
+            cost_usd: spend.cost_usd,
+            unpriced_tokens: spend.unpriced_tokens,
         })
         .collect())
 }
 
-fn day_model_usage_row(r: &rusqlite::Row) -> rusqlite::Result<(i64, String, TurnUsage)> {
+fn day_model_usage_row(r: &rusqlite::Row) -> rusqlite::Result<(usize, String, u64, TurnUsage)> {
     Ok((
-        r.get::<_, i64>(0)?,
+        r.get::<_, i64>(0)? as usize,
         r.get::<_, String>(1)?,
+        r.get::<_, i64>(2)? as u64,
         TurnUsage {
-            input: r.get::<_, i64>(2)? as u64,
-            output: r.get::<_, i64>(3)? as u64,
-            cache_read: r.get::<_, i64>(4)? as u64,
-            cache_write_5m: r.get::<_, i64>(5)? as u64,
-            cache_write_1h: r.get::<_, i64>(6)? as u64,
-            thinking: r.get::<_, i64>(7)? as u64,
+            input: r.get::<_, i64>(3)? as u64,
+            output: r.get::<_, i64>(4)? as u64,
+            cache_read: r.get::<_, i64>(5)? as u64,
+            cache_write_5m: r.get::<_, i64>(6)? as u64,
+            cache_write_1h: r.get::<_, i64>(7)? as u64,
+            thinking: r.get::<_, i64>(8)? as u64,
         },
     ))
 }
 
-/// `days` consecutive days ending with the one containing `now_ms`, oldest first.
-/// Quiet days are present and zeroed: a bar chart with gaps silently lies about
-/// the shape of the week.
+/// `days` consecutive local days ending with the one containing `now_ms`, oldest
+/// first. Quiet days are present and zeroed: a bar chart with gaps silently lies
+/// about the shape of the week.
 pub fn daily_usage(db: &Db, days: usize, now_ms: i64) -> Result<Vec<DayUsage>> {
-    daily_usage_grouped(db, days, now_ms, None)
+    daily_usage_in(db, &chrono::Local, days, now_ms, None)
 }
 
-/// Same shape as `daily_usage`, scoped to one project — the main window's
+/// Same shape as `daily_usage`, scoped to one project: the main window's
 /// per-project sparkline must not silently show every project's activity on
 /// a single project's page.
 pub fn daily_usage_for_project(
@@ -658,52 +676,52 @@ pub fn daily_usage_for_project(
     days: usize,
     now_ms: i64,
 ) -> Result<Vec<DayUsage>> {
-    daily_usage_grouped(db, days, now_ms, Some(project_id))
+    daily_usage_in(db, &chrono::Local, days, now_ms, Some(project_id))
 }
 
-/// Every project's tokens per day over the same window `daily_usage_for_project`
-/// covers — one grouped query rather than one per project, for the overview's
-/// cards. Each vector is `days` long, oldest first, quiet days zeroed; a project
-/// with no turns in the window is simply absent from the map.
-pub fn daily_tokens_by_project(
+/// Every project's responses per local day over the same window as
+/// `daily_usage_for_project`: one grouped query rather than one per project, for
+/// the overview's cards. Each vector is `days` long, oldest first, quiet days
+/// zeroed; a project with no turns in the window is simply absent from the map.
+pub fn daily_responses_by_project(
     db: &Db,
     days: usize,
     now_ms: i64,
 ) -> Result<std::collections::HashMap<i64, Vec<u64>>> {
-    let last = day_start(now_ms);
-    let first = last - (days as i64 - 1).max(0) * DAY_MS;
-    let upper = last + DAY_MS;
+    daily_responses_by_project_in(db, &chrono::Local, days, now_ms)
+}
+
+fn daily_responses_by_project_in<Tz: chrono::TimeZone>(
+    db: &Db,
+    tz: &Tz,
+    days: usize,
+    now_ms: i64,
+) -> Result<std::collections::HashMap<i64, Vec<u64>>> {
+    let mut out: std::collections::HashMap<i64, Vec<u64>> = std::collections::HashMap::new();
+    let window = crate::days::window(tz, days, now_ms);
+    if window.is_empty() {
+        return Ok(out);
+    }
     let mut stmt = db.conn().prepare(&format!(
-        "SELECT (t.ts - (t.ts % {DAY_MS} + {DAY_MS}) % {DAY_MS}) AS day, s.project_id, {SUMS}
-         FROM turns t JOIN sessions s ON s.id = t.session_id
-         WHERE t.ts >= ?1 AND t.ts < ?2
-         GROUP BY day, s.project_id"
+        "{} SELECT d.i, s.project_id, COUNT(*)
+         FROM days d CROSS JOIN turns t
+         JOIN sessions s ON s.id = t.session_id
+         WHERE t.ts >= d.lo AND t.ts < d.hi
+         GROUP BY d.i, s.project_id",
+        days_table(&window)
     ))?;
     let rows = stmt
-        .query_map(params![first, upper], |r| {
+        .query_map([], |r| {
             Ok((
-                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(0)? as usize,
                 r.get::<_, i64>(1)?,
-                TurnUsage {
-                    input: r.get::<_, i64>(2)? as u64,
-                    output: r.get::<_, i64>(3)? as u64,
-                    cache_read: r.get::<_, i64>(4)? as u64,
-                    cache_write_5m: r.get::<_, i64>(5)? as u64,
-                    cache_write_1h: r.get::<_, i64>(6)? as u64,
-                    thinking: r.get::<_, i64>(7)? as u64,
-                },
+                r.get::<_, i64>(2)? as u64,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-
-    let mut out: std::collections::HashMap<i64, Vec<u64>> = std::collections::HashMap::new();
-    for (day, project_id, usage) in rows {
-        let slot = ((day - first) / DAY_MS) as usize;
-        if slot < days {
-            // `total_tokens` is the one definition of a token total, so these
-            // bars can never disagree with the project page's sparkline.
-            out.entry(project_id).or_insert_with(|| vec![0; days])[slot] += usage.total_tokens();
-        }
+    for (slot, project_id, responses) in rows {
+        out.entry(project_id)
+            .or_insert_with(|| vec![0; window.len()])[slot] = responses;
     }
     Ok(out)
 }
@@ -1398,10 +1416,18 @@ mod tests {
         seed_session(&db, pid, "s10", "/a/p", 10 * DAY + 1, 1_000_000);
         seed_session(&db, pid, "s8", "/a/p", 8 * DAY + 1, 3_000_000);
 
-        let days = daily_usage(&db, 3, now).unwrap();
+        let days = daily_usage_in(&db, &chrono::Utc, 3, now, None).unwrap();
         assert_eq!(days.len(), 3, "exactly the window requested");
-        assert_eq!(days[0].day_start_ms, 8 * DAY, "oldest first");
-        assert_eq!(days[2].day_start_ms, 10 * DAY);
+        assert_eq!(
+            days[0]
+                .date
+                .and_time(chrono::NaiveTime::MIN)
+                .and_utc()
+                .timestamp_millis(),
+            8 * DAY,
+            "oldest first"
+        );
+        assert_eq!(days[1].date.succ_opt(), Some(days[2].date));
         assert_eq!(days[0].usage.input, 3_000_000);
         assert_eq!(
             days[1].usage.total_tokens(),
@@ -1409,7 +1435,67 @@ mod tests {
             "a quiet day is present and zeroed"
         );
         assert_eq!(days[1].cost_usd, 0.0);
+        assert_eq!(days[1].responses, 0);
         assert_eq!(days[2].usage.input, 1_000_000);
+        assert_eq!(days[2].responses, 1);
+    }
+
+    #[test]
+    fn a_turn_counts_on_the_local_day_it_happened() {
+        use crate::days::test_zones::Zone;
+        use chrono::{NaiveDate, TimeZone};
+
+        let ms = |tz: &Zone, m, d, h, min| {
+            tz.with_ymd_and_hms(2026, m, d, h, min, 0)
+                .unwrap()
+                .timestamp_millis()
+        };
+        let date = |m, d| NaiveDate::from_ymd_opt(2026, m, d).unwrap();
+
+        // (zone, the turn's month, day, hour and minute). Each is on a different
+        // UTC date from its local one, or on a day with a clock change.
+        for (tz, m, d, h, min) in [
+            (Zone::Havana, 1, 15, 23, 30),  // already the 16th in UTC
+            (Zone::Berlin, 1, 15, 0, 30),   // still the 14th in UTC
+            (Zone::Berlin, 3, 29, 23, 30),  // 23-hour day
+            (Zone::Berlin, 3, 29, 0, 30),   // before the clocks go forward
+            (Zone::Berlin, 10, 25, 23, 30), // 25-hour day
+            (Zone::Havana, 3, 8, 23, 30),   // a day with no midnight
+        ] {
+            let db = open_in_memory().unwrap();
+            seed_default_prices(&db).unwrap();
+            let pid = db.upsert_project("-a-p", "/a/p", false).unwrap();
+            let ts = ms(&tz, m, d, h, min);
+            seed_session(&db, pid, "s", "/a/p", ts, 1_000);
+
+            // Read from the next day, so the turn's own day is mid-window.
+            let now = ms(&tz, m, d, 12, 0) + DAY;
+            let days = daily_usage_in(&db, &tz, 3, now, None).unwrap();
+            let counted: Vec<_> = days
+                .iter()
+                .filter(|day| day.responses > 0)
+                .map(|day| day.date)
+                .collect();
+            assert_eq!(counted, vec![date(m, d)], "{tz:?} {m}/{d} {h}:{min}");
+
+            let by_project = daily_responses_by_project_in(&db, &tz, 3, now).unwrap();
+            let per_day: Vec<u64> = days.iter().map(|day| day.responses).collect();
+            assert_eq!(by_project[&pid], per_day, "both queries pick the same day");
+        }
+    }
+
+    #[test]
+    fn responses_ignore_how_big_the_conversation_had_grown() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let pid = db.upsert_project("-a-p", "/a/p", false).unwrap();
+        let now = 10 * DAY + 3_600_000;
+        seed_session(&db, pid, "huge", "/a/p", 9 * DAY + 1, 90_000_000);
+        seed_session(&db, pid, "small", "/a/p", 10 * DAY + 1, 10);
+
+        let days = daily_usage_in(&db, &chrono::Utc, 2, now, None).unwrap();
+        assert_eq!(days[0].responses, days[1].responses);
+        assert!(days[0].usage.total_tokens() > days[1].usage.total_tokens());
     }
 
     #[test]
@@ -1422,7 +1508,7 @@ mod tests {
         seed_session(&db, a, "sa", "/a/a", 10 * DAY + 1, 1_000_000);
         seed_session(&db, b, "sb", "/a/b", 10 * DAY + 1, 9_000_000);
 
-        let days = daily_usage_for_project(&db, a, 3, now).unwrap();
+        let days = daily_usage_in(&db, &chrono::Utc, 3, now, Some(a)).unwrap();
         assert_eq!(days.len(), 3, "exactly the window requested");
         assert_eq!(
             days[2].usage.input, 1_000_000,
@@ -1431,12 +1517,12 @@ mod tests {
 
         // Workspace-wide `daily_usage` still sees both, so the two functions
         // are not accidentally the same query.
-        let workspace = daily_usage(&db, 3, now).unwrap();
+        let workspace = daily_usage_in(&db, &chrono::Utc, 3, now, None).unwrap();
         assert_eq!(workspace[2].usage.input, 10_000_000);
     }
 
     #[test]
-    fn daily_tokens_by_project_agrees_with_each_projects_own_sparkline() {
+    fn daily_responses_by_project_agrees_with_each_projects_own_sparkline() {
         let db = open_in_memory().unwrap();
         seed_default_prices(&db).unwrap();
         let a = db.upsert_project("-a-a", "/a/a", false).unwrap();
@@ -1449,16 +1535,16 @@ mod tests {
         // Outside the window: must not be folded into day 0.
         seed_session(&db, quiet, "sq", "/a/q", 2 * DAY, 5_000);
 
-        let all = daily_tokens_by_project(&db, 3, now).unwrap();
+        let all = daily_responses_by_project_in(&db, &chrono::Utc, 3, now).unwrap();
         for pid in [a, b] {
-            let own: Vec<u64> = daily_usage_for_project(&db, pid, 3, now)
+            let own: Vec<u64> = daily_usage_in(&db, &chrono::Utc, 3, now, Some(pid))
                 .unwrap()
                 .iter()
-                .map(|d| d.usage.total_tokens())
+                .map(|d| d.responses)
                 .collect();
             assert_eq!(all[&pid], own, "project {pid}");
         }
-        assert_eq!(all[&a], vec![700, 0, 1_000]);
+        assert_eq!(all[&a], vec![1, 0, 1]);
         assert!(
             !all.contains_key(&quiet),
             "no turns in the window, no entry"

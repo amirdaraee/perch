@@ -474,8 +474,9 @@ pub struct ProjectRow {
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct SparkPoint {
     pub day_index: i32,
-    pub tokens: u64,
+    pub responses: u64,
     pub label: String,
+    pub value_label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -500,6 +501,7 @@ pub struct ProjectDetail {
     pub tokens: String,
     pub cost: String,
     pub session_count: String,
+    pub chart_title: String,
     pub sparkline: Vec<SparkPoint>,
     pub sessions: Vec<SessionHistoryRow>,
     pub pinned: bool,
@@ -542,6 +544,8 @@ pub struct DailyBar {
     pub cache_write: u64,
     pub thinking: u64,
     pub total_label: String,
+    pub spend: f64,
+    pub spend_label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -563,6 +567,8 @@ pub struct ModelUsage {
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct UsageModel {
     pub hero: Vec<HeroStat>,
+    pub chart_title: String,
+    pub spend_caption: String,
     pub daily: Vec<DailyBar>,
     pub top_projects: Vec<RankedProject>,
     pub by_model: Vec<ModelUsage>,
@@ -635,13 +641,15 @@ impl From<main_window::SparkPoint> for SparkPoint {
     fn from(p: main_window::SparkPoint) -> Self {
         let main_window::SparkPoint {
             day_index,
-            tokens,
+            responses,
             label,
+            value_label,
         } = p;
         SparkPoint {
             day_index,
-            tokens,
+            responses,
             label,
+            value_label,
         }
     }
 }
@@ -683,6 +691,7 @@ impl From<main_window::ProjectDetail> for ProjectDetail {
             tokens,
             cost,
             session_count,
+            chart_title,
             sparkline,
             sessions,
             pinned,
@@ -700,6 +709,7 @@ impl From<main_window::ProjectDetail> for ProjectDetail {
             tokens,
             cost,
             session_count,
+            chart_title,
             sparkline: sparkline.into_iter().map(Into::into).collect(),
             sessions: sessions.into_iter().map(Into::into).collect(),
             notify: notify.into(),
@@ -753,6 +763,8 @@ impl From<core_usage::DailyBar> for DailyBar {
             cache_write,
             thinking,
             total_label,
+            spend,
+            spend_label,
         } = b;
         DailyBar {
             day_index,
@@ -763,6 +775,8 @@ impl From<core_usage::DailyBar> for DailyBar {
             cache_write,
             thinking,
             total_label,
+            spend,
+            spend_label,
         }
     }
 }
@@ -805,6 +819,8 @@ impl From<core_usage::UsageModel> for UsageModel {
     fn from(m: core_usage::UsageModel) -> Self {
         let core_usage::UsageModel {
             hero,
+            chart_title,
+            spend_caption,
             daily,
             top_projects,
             by_model,
@@ -814,6 +830,8 @@ impl From<core_usage::UsageModel> for UsageModel {
         } = m;
         UsageModel {
             hero: hero.into_iter().map(Into::into).collect(),
+            chart_title,
+            spend_caption,
             daily: daily.into_iter().map(Into::into).collect(),
             top_projects: top_projects.into_iter().map(Into::into).collect(),
             by_model: by_model.into_iter().map(Into::into).collect(),

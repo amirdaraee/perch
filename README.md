@@ -107,6 +107,10 @@ wasn't: no such process, that pid isn't `claude`, or the record wouldn't parse.
   counted. If a model has no price, Perch counts its tokens and says "no price"
   or "at least $4.20" rather than showing you a zero. Prices for new models
   arrive with Perch updates, since Perch never goes online to fetch them.
+* **Charts count responses, not tokens.** Cache reads are nearly all of the
+  token total, so a chart of it mostly shows how long a conversation had grown.
+  The small charts count API responses per day instead. Days follow your local
+  time zone, including across daylight saving changes.
 * **The fullscreen behaviour is right by construction, not by testing.** A
   tracked `NSMenu` is the documented way to stay visible over a fullscreen app,
   and two spikes confirmed the alternatives don't work. Nobody has actually

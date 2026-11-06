@@ -80,6 +80,11 @@ pub fn elapsed_or_dash(now_ms: i64, since_ms: i64) -> String {
     }
 }
 
+/// "Last 14 days": the heading over a chart of `days` days.
+pub fn last_days_title(days: u32) -> String {
+    format!("Last {days} days")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

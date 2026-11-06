@@ -227,16 +227,17 @@ struct ProjectDetailPane: View {
     private func sparkline(_ detail: ProjectDetail) -> some View {
         if !detail.sparkline.isEmpty {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Last 14 days").font(.caption2).foregroundStyle(.secondary).textCase(.uppercase)
+                Text(detail.chartTitle).font(.caption2).foregroundStyle(.secondary).textCase(.uppercase)
                 Chart {
                     ForEach(detail.sparkline, id: \.dayIndex) { point in
                         BarMark(
                             x: .value("Day", point.dayIndex),
-                            y: .value("Tokens", point.tokens)
+                            y: .value("Responses", point.responses)
                         )
                         .foregroundStyle(Color.perchWorking)
-                        // `label` is Rust's already-final day label — never formatted here.
+                        // Both are Rust's finished strings, never formatted here.
                         .accessibilityLabel(point.label)
+                        .accessibilityValue(point.valueLabel)
                     }
                     PerchChartBaseline()
                 }

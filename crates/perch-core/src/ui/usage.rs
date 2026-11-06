@@ -4,7 +4,7 @@
 use crate::db::Db;
 use crate::query::{self, DAY_MS};
 use crate::settings::{BurnRate, Settings};
-use crate::ui::format::{cost_label, human_cost, human_tokens, plural};
+use crate::ui::format::{cost_label, human_cost, human_tokens, last_days_title, plural};
 
 const WINDOW_MS: i64 = 5 * 3_600_000;
 const MIN_PROJECTABLE_MS: i64 = 30 * 60_000;
@@ -26,6 +26,11 @@ pub struct DailyBar {
     pub cache_write: u64,
     pub thinking: u64,
     pub total_label: String,
+    /// The day's height on a spend chart, in whatever `UsageModel::spend_caption`
+    /// says: dollars, or output tokens when dollars can't answer.
+    pub spend: f64,
+    /// `spend`, formatted.
+    pub spend_label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -47,6 +52,10 @@ pub struct ModelUsage {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct UsageModel {
     pub hero: Vec<HeroStat>,
+    /// "Last 14 days", the heading over `daily`.
+    pub chart_title: String,
+    /// What each day's `spend` is.
+    pub spend_caption: String,
     pub daily: Vec<DailyBar>,
     pub top_projects: Vec<RankedProject>,
     pub by_model: Vec<ModelUsage>,
@@ -179,6 +188,53 @@ fn observed_elapsed_ms(oldest_ts: Option<i64>, now_ms: i64) -> i64 {
     }
 }
 
+/// What a spend chart can plot. One choice for the whole window, because bars in
+/// two different units can't share an axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpendMeasure {
+    Cost,
+    /// Costs are hidden in Settings.
+    OutputCostHidden,
+    /// There are tokens in the window and none of them has a price.
+    OutputNoPrices,
+}
+
+impl SpendMeasure {
+    fn for_window(days: &[query::DayUsage], show_cost: bool) -> Self {
+        let tokens: u64 = days.iter().map(|d| d.usage.total_tokens()).sum();
+        let unpriced: u64 = days.iter().map(|d| d.unpriced_tokens).sum();
+        if !show_cost {
+            Self::OutputCostHidden
+        } else if tokens > 0 && unpriced >= tokens {
+            Self::OutputNoPrices
+        } else {
+            Self::Cost
+        }
+    }
+
+    fn value(self, day: &query::DayUsage) -> f64 {
+        match self {
+            Self::Cost => day.cost_usd,
+            Self::OutputCostHidden | Self::OutputNoPrices => day.usage.output as f64,
+        }
+    }
+
+    fn label(self, day: &query::DayUsage) -> String {
+        match self {
+            Self::Cost => cost_label(day.cost_usd, day.unpriced_tokens, day.usage.total_tokens()),
+            Self::OutputCostHidden | Self::OutputNoPrices => human_tokens(day.usage.output),
+        }
+    }
+
+    fn caption(self) -> &'static str {
+        match self {
+            Self::Cost => "Estimated cost per day",
+            Self::OutputCostHidden => "Output tokens per day",
+            Self::OutputNoPrices => "Output tokens per day, because these models have no price",
+        }
+    }
+}
+
 /// `settings.chart_days` spans the daily chart — the same field
 /// `build_project_detail`'s sparkline uses, so the two can never disagree
 /// about their own date range — while `top_projects_count` and
@@ -207,6 +263,7 @@ pub fn build_usage(db: &Db, now_ms: i64, settings: &Settings) -> anyhow::Result<
 
     let chart_days = settings.chart_days as usize;
     let days = query::daily_usage(db, chart_days, now_ms)?;
+    let measure = SpendMeasure::for_window(&days, settings.show_cost);
     let daily: Vec<DailyBar> = days
         .iter()
         .enumerate()
@@ -225,6 +282,8 @@ pub fn build_usage(db: &Db, now_ms: i64, settings: &Settings) -> anyhow::Result<
                 cache_write: d.usage.cache_write_total(),
                 thinking: d.usage.thinking,
                 total_label: human_tokens(d.usage.total_tokens()),
+                spend: measure.value(d),
+                spend_label: measure.label(d),
             }
         })
         .collect();
@@ -292,6 +351,8 @@ pub fn build_usage(db: &Db, now_ms: i64, settings: &Settings) -> anyhow::Result<
     ];
 
     Ok(UsageModel {
+        chart_title: last_days_title(settings.chart_days),
+        spend_caption: measure.caption().to_string(),
         has_data: db.turn_count()? > 0,
         burn_rate: burn_rate(
             settings.burn_rate,
@@ -360,15 +421,92 @@ mod tests {
         assert_eq!(m.daily.len(), 14, "the window is still drawn, just empty");
     }
 
+    fn spend_case(models: &[&str], settings: &Settings) -> (String, f64, String) {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let now = 100 * DAY_MS;
+        for (i, model) in models.iter().enumerate() {
+            seed(
+                &db,
+                &format!("s{i}"),
+                now,
+                model,
+                TurnUsage {
+                    output: 1_000_000,
+                    ..TurnUsage::default()
+                },
+            );
+        }
+        let m = build_usage(&db, now, settings).unwrap();
+        let today = m.daily.last().unwrap();
+        (m.spend_caption, today.spend, today.spend_label.clone())
+    }
+
+    #[test]
+    fn spend_is_dollars_when_anything_has_a_price() {
+        let (caption, spend, label) = spend_case(&["claude-sonnet-5"], &Settings::default());
+        assert_eq!(caption, "Estimated cost per day");
+        assert!(spend > 0.0);
+        assert_eq!(label, human_cost(spend));
+    }
+
+    #[test]
+    fn a_partly_priced_day_stays_in_dollars_and_says_at_least() {
+        let (caption, spend, label) = spend_case(
+            &["claude-sonnet-5", "claude-future-1"],
+            &Settings::default(),
+        );
+        assert_eq!(caption, "Estimated cost per day");
+        assert_eq!(label, format!("at least {}", human_cost(spend)));
+    }
+
+    #[test]
+    fn with_nothing_priced_spend_falls_back_to_output_tokens_and_says_so() {
+        let (caption, spend, label) = spend_case(&["claude-future-1"], &Settings::default());
+        assert_eq!(
+            caption,
+            "Output tokens per day, because these models have no price"
+        );
+        assert_eq!(spend, 1_000_000.0);
+        assert_eq!(label, human_tokens(1_000_000));
+    }
+
+    #[test]
+    fn hidden_costs_never_reach_the_spend_chart() {
+        let settings = Settings {
+            show_cost: false,
+            ..Settings::default()
+        };
+        let (caption, spend, label) = spend_case(&["claude-sonnet-5"], &settings);
+        assert_eq!(caption, "Output tokens per day");
+        assert_eq!(spend, 1_000_000.0);
+        assert!(!label.contains('$'), "{label}");
+    }
+
+    #[test]
+    fn the_chart_title_follows_the_setting() {
+        let db = open_in_memory().unwrap();
+        let settings = Settings {
+            chart_days: 30,
+            ..Settings::default()
+        };
+        assert_eq!(
+            build_usage(&db, 100 * DAY_MS, &settings)
+                .unwrap()
+                .chart_title,
+            "Last 30 days"
+        );
+    }
+
     #[test]
     fn daily_bars_carry_each_token_class_separately() {
         let db = open_in_memory().unwrap();
         seed_default_prices(&db).unwrap();
-        let now = 100 * DAY_MS + 3_600_000;
+        let now = 100 * DAY_MS;
         seed(
             &db,
             "s1",
-            100 * DAY_MS + 1,
+            now,
             "claude-fable-5",
             TurnUsage {
                 input: 10,

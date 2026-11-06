@@ -6,7 +6,9 @@ use crate::live::{LiveSession, SessionStatus};
 use crate::query;
 use crate::readme;
 use crate::settings::Settings;
-use crate::ui::format::{cost_label, elapsed_or_dash, human_elapsed, human_tokens, plural};
+use crate::ui::format::{
+    cost_label, elapsed_or_dash, human_elapsed, human_tokens, last_days_title, plural,
+};
 use crate::ui::model::PopoverModel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -33,7 +35,7 @@ pub struct ProjectRow {
     /// The overview card's opening paragraph from the project's own README or
     /// CLAUDE.md; `None` when neither says anything or the folder is gone.
     pub description: Option<String>,
-    /// Tokens per day over `settings.chart_days`, oldest first — the same
+    /// Responses per day over `settings.chart_days`, oldest first — the same
     /// window and labels as the project page's sparkline.
     pub sparkline: Vec<SparkPoint>,
     /// "2 running", or `None` when nothing runs in this project.
@@ -49,8 +51,12 @@ pub struct ProjectRow {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SparkPoint {
     pub day_index: i32,
-    pub tokens: u64,
+    /// What the bar's height comes from.
+    pub responses: u64,
+    /// "13d" or "Today".
     pub label: String,
+    /// "12 responses".
+    pub value_label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -75,6 +81,8 @@ pub struct ProjectDetail {
     pub tokens: String,
     pub cost: String,
     pub session_count: String,
+    /// "Last 14 days", the heading over `sparkline`.
+    pub chart_title: String,
     pub sparkline: Vec<SparkPoint>,
     pub sessions: Vec<SessionHistoryRow>,
     pub pinned: bool,
@@ -169,7 +177,7 @@ pub fn build_main_window(
     let loaded = query::project_summaries(db).and_then(|s| {
         Ok((
             s,
-            query::daily_tokens_by_project(db, chart_days, now_ms)?,
+            query::daily_responses_by_project(db, chart_days, now_ms)?,
             query::latest_branches(db)?,
         ))
     });
@@ -244,7 +252,7 @@ pub fn build_main_window(
                 .flatten()
                 .collect::<Vec<_>>()
                 .join(" · ");
-            let tokens_per_day = daily
+            let responses_per_day = daily
                 .get(&s.id)
                 .cloned()
                 .unwrap_or_else(|| vec![0; chart_days]);
@@ -272,7 +280,7 @@ pub fn build_main_window(
                 last_active,
                 live_session_count,
                 description: readme::project_description(std::path::Path::new(&s.real_path)),
-                sparkline: spark_points(&tokens_per_day),
+                sparkline: spark_points(&responses_per_day),
                 live_label: (live_session_count > 0)
                     .then(|| format!("{live_session_count} running")),
                 waiting_label: (waiting > 0).then(|| format!("{waiting} waiting")),
@@ -304,16 +312,17 @@ pub fn build_main_window(
 /// `ui::usage`'s daily chart over the identical window — "Today", "1d" … — not
 /// `human_elapsed`, which caps at hours and would read "313h ago" for day 0.
 /// Shared by the overview card and the project page so the two never disagree.
-fn spark_points(tokens_per_day: &[u64]) -> Vec<SparkPoint> {
-    let n = tokens_per_day.len();
-    tokens_per_day
+fn spark_points(responses_per_day: &[u64]) -> Vec<SparkPoint> {
+    let n = responses_per_day.len();
+    responses_per_day
         .iter()
         .enumerate()
-        .map(|(i, &tokens)| {
+        .map(|(i, &responses)| {
             let days_ago = n - 1 - i;
             SparkPoint {
                 day_index: i as i32,
-                tokens,
+                responses,
+                value_label: plural(responses as i64, "response", "responses"),
                 label: if days_ago == 0 {
                     "Today".to_string()
                 } else {
@@ -391,12 +400,7 @@ pub fn build_project_detail(
 
     let chart_days = settings.chart_days as usize;
     let days = query::daily_usage_for_project(db, project_id, chart_days, now_ms)?;
-    let sparkline = spark_points(
-        &days
-            .iter()
-            .map(|d| d.usage.total_tokens())
-            .collect::<Vec<_>>(),
-    );
+    let sparkline = spark_points(&days.iter().map(|d| d.responses).collect::<Vec<_>>());
 
     let sessions = query::session_history(db, project_id)?
         .into_iter()
@@ -464,6 +468,7 @@ pub fn build_project_detail(
             String::new()
         },
         session_count: plural(summary.sessions, "session", "sessions"),
+        chart_title: last_days_title(settings.chart_days),
         sparkline,
         sessions,
         pinned: meta.pinned,
@@ -829,11 +834,10 @@ mod tests {
     fn project_detail_has_a_full_fourteen_day_sparkline_even_when_quiet() {
         let db = open_in_memory().unwrap();
         seed_default_prices(&db).unwrap();
-        // Mid-day, not a day boundary: `100 * DAY` is exactly midnight, so an
-        // activity timestamp `1000`ms earlier would land in the *previous*
-        // calendar day and this test would wrongly see "today" as quiet.
-        let now = 100 * DAY + 3_600_000;
-        let pid = project_with_session(&db, "-a-p", "/a/proj", "s1", now - 1000, 1_000_000);
+        // The turn is at `now` exactly: any gap could cross local midnight in
+        // some time zone, and this test would wrongly see "today" as quiet.
+        let now = 100 * DAY;
+        let pid = project_with_session(&db, "-a-p", "/a/proj", "s1", now, 1_000_000);
 
         let d = build_project_detail(&db, pid, &[], now, &Settings::default()).unwrap();
         assert_eq!(d.sparkline.len(), 14);
@@ -842,8 +846,8 @@ mod tests {
             "indices are 0..13, oldest first"
         );
         assert_eq!(d.sparkline[13].day_index, 13);
-        assert!(d.sparkline[13].tokens > 0, "today has the activity");
-        assert!(d.sparkline[0].tokens == 0, "thirteen days ago was quiet");
+        assert!(d.sparkline[13].responses > 0, "today has the activity");
+        assert!(d.sparkline[0].responses == 0, "thirteen days ago was quiet");
         assert_eq!(
             d.sparkline[0].label, "13d",
             "oldest day reads as a day count, not \"313h ago\""
@@ -862,14 +866,23 @@ mod tests {
         let db = open_in_memory().unwrap();
         seed_default_prices(&db).unwrap();
         let now = 100 * DAY;
-        let quiet = project_with_session(&db, "-a-quiet", "/a/quiet", "s1", now - 1000, 0);
-        project_with_session(&db, "-a-noisy", "/a/noisy", "s2", now - 1000, 5_000_000);
+        let quiet = project_with_session(&db, "-a-quiet", "/a/quiet", "s1", now - 60 * DAY, 0);
+        let noisy = project_with_session(&db, "-a-noisy", "/a/noisy", "s2", now - 1000, 5_000_000);
+        let responses = |id| {
+            build_project_detail(&db, id, &[], now, &Settings::default())
+                .unwrap()
+                .sparkline
+                .iter()
+                .map(|p| p.responses)
+                .sum::<u64>()
+        };
 
-        let d = build_project_detail(&db, quiet, &[], now, &Settings::default()).unwrap();
         assert_eq!(
-            d.sparkline[13].tokens, 0,
-            "the other project's tokens must not appear on this one's sparkline"
+            responses(quiet),
+            0,
+            "the other project's activity must not appear on this one's sparkline"
         );
+        assert_eq!(responses(noisy), 1);
     }
 
     #[test]
@@ -1184,7 +1197,7 @@ mod tests {
         std::fs::write(dir.path().join("README.md"), "# X\n\nDoes a useful thing.").unwrap();
         let path = dir.path().to_string_lossy().into_owned();
         let now = 100 * DAY + 3_600_000;
-        let pid = project_with_session(&db, "-x", &path, "s1", now - 60_000, 2_000);
+        let pid = project_with_session(&db, "-x", &path, "s1", now, 2_000);
         let quiet = project_with_session(&db, "-q", "/gone/perch/quiet", "s2", now - 60 * DAY, 5);
 
         let live = vec![
@@ -1212,7 +1225,8 @@ mod tests {
             card.sparkline.len(),
             Settings::default().chart_days as usize
         );
-        assert_eq!(card.sparkline.last().unwrap().tokens, 2_000);
+        assert_eq!(card.sparkline.last().unwrap().responses, 1);
+        assert_eq!(card.sparkline.last().unwrap().value_label, "1 response");
         assert_eq!(card.sparkline.last().unwrap().label, "Today");
         assert_eq!(card.live_label.as_deref(), Some("2 running"));
         assert_eq!(card.waiting_label.as_deref(), Some("1 waiting"));
@@ -1238,7 +1252,7 @@ mod tests {
             !q.sparkline.is_empty(),
             "quiet is drawn as zero bars, not nothing"
         );
-        assert!(q.sparkline.iter().all(|p| p.tokens == 0));
+        assert!(q.sparkline.iter().all(|p| p.responses == 0));
     }
 
     #[test]

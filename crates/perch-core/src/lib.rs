@@ -2,6 +2,7 @@
 
 pub mod actions;
 pub mod config;
+pub mod days;
 pub mod db;
 pub mod discovery;
 pub mod index;

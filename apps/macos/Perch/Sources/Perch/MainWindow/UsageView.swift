@@ -97,7 +97,7 @@ struct UsageView: View {
     @ViewBuilder
     private func dailyBlock(_ model: UsageModel) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Last 14 days").font(.caption2).foregroundStyle(.secondary).textCase(.uppercase)
+            Text(model.chartTitle).font(.caption2).foregroundStyle(.secondary).textCase(.uppercase)
             if model.daily.isEmpty {
                 Text("No daily usage yet").foregroundStyle(.secondary)
             } else {

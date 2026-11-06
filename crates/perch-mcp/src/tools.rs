@@ -39,7 +39,7 @@ pub fn definitions() -> Value {
         {
             "name": "get_project",
             "title": "Get one project",
-            "description": "One project in full, by id (from list_projects) or by folder path: its note, pinned/archived state, daily tokens over the configured chart window, and every session with title, branch, tokens, cost and whether it is live.",
+            "description": "One project in full, by id (from list_projects) or by folder path: its note, pinned/archived state, each local day's responses, tokens and cost over the configured chart window, and every session with title, branch, tokens, cost and whether it is live.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -177,7 +177,8 @@ fn get_project(host: &dyn Host, arguments: &Value) -> ToolResult {
         .map_err(read_error)?
         .into_iter()
         .map(|d| {
-            json!({ "date": date(d.day_start_ms),
+            json!({ "date": d.date.to_string(),
+            "responses": d.responses,
             "tokens": d.usage.total_tokens(),
             "cost_usd": known_cost(d.cost_usd, d.unpriced_tokens, d.usage.total_tokens()),
             "unpriced_tokens": d.unpriced_tokens, })
@@ -313,7 +314,8 @@ fn usage_summary(host: &dyn Host, arguments: &Value) -> ToolResult {
             "unpriced_tokens": s.unpriced_tokens,
         })).collect::<Vec<_>>(),
         "daily": daily.iter().map(|d| json!({
-            "date": date(d.day_start_ms),
+            "date": d.date.to_string(),
+            "responses": d.responses,
             "tokens": d.usage.total_tokens(),
             "cost_usd": known_cost(d.cost_usd, d.unpriced_tokens, d.usage.total_tokens()),
             "unpriced_tokens": d.unpriced_tokens,
@@ -419,12 +421,6 @@ fn iso(ms: Option<i64>) -> Value {
         .map_or(Value::Null, |t| {
             json!(t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
         })
-}
-
-fn date(day_start_ms: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(day_start_ms)
-        .map(|t| t.format("%Y-%m-%d").to_string())
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
