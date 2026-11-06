@@ -126,8 +126,12 @@ def user_line(when: datetime, cwd: str, branch: str) -> str:
     })
 
 
-def build(root: Path, code: Path, seed: int) -> list[tuple[str, str, str]]:
-    """Write the demo tree. Returns (name, cwd, branch) per project."""
+def build(root: Path, code: Path, seed: int,
+          history: int = 0) -> list[tuple[str, str, str]]:
+    """Write the demo tree. Returns (name, cwd, branch) per project.
+
+    `history` adds sparser sessions going back that many days, so the activity
+    heatmap has a year to show and its pre-tracking days a start date."""
     rng = random.Random(seed)
     claude = root / "claude"
     for d in (claude / "projects", claude / "sessions", code, root / "perch-data"):
@@ -147,11 +151,19 @@ def build(root: Path, code: Path, seed: int) -> list[tuple[str, str, str]]:
         project_dir = claude / "projects" / slug
         project_dir.mkdir(parents=True, exist_ok=True)
 
-        for day in range(active_days):
+        for day in range(max(active_days, history)):
             # Not every day has a session: a sparkline of identical bars looks
             # synthetic, which is exactly what it would be.
             if day > 0 and rng.random() < 0.25:
                 continue
+            if day >= active_days:
+                # Older history: quieter, quieter still at weekends, and in
+                # bursts rather than evenly spread.
+                weekend = (now - timedelta(days=day)).weekday() >= 5
+                burst = (day // 21) % 3 != 2
+                odds = (0.22 if burst else 0.05) * weight * (0.3 if weekend else 1)
+                if rng.random() > odds:
+                    continue
             sessions_today = 1 if rng.random() < 0.7 else 2
             for s in range(sessions_today):
                 # Offset backwards from now rather than picking a clock time on
@@ -286,6 +298,9 @@ def main() -> int:
                          "Default: <root>/code")
     ap.add_argument("--seed", type=int, default=7,
                     help="random seed, so a rebuild reproduces the same data")
+    ap.add_argument("--history", type=int, default=0, metavar="DAYS",
+                    help="add sparser sessions going back DAYS days, for the "
+                         "activity heatmap (default: none)")
     ap.add_argument("--keep", action="store_true",
                     help="add to an existing tree instead of wiping it")
     ap.add_argument("--wait", action="store_true",
@@ -306,7 +321,7 @@ def main() -> int:
 
     code = (Path(args.code_root).expanduser().resolve()
             if args.code_root else root / "code")
-    projects = build(root, code, args.seed)
+    projects = build(root, code, args.seed, args.history)
 
     procs = start_live(root, projects) if args.live else []
 

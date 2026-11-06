@@ -58,6 +58,16 @@ final class PerchEngine: ObservableObject {
         }.value
     }
 
+    /// A year of activity, for every project (`nil`) or one. Weeks start on
+    /// the locale's first weekday.
+    func activity(projectId: Int64? = nil) async -> Result<Heatmap, Error> {
+        guard let perch else { return .failure(EngineUnavailable()) }
+        let firstWeekday = UInt8(Calendar.current.firstWeekday)
+        return await Task.detached(priority: .userInitiated) {
+            Result { try perch.activity(projectId: projectId, firstWeekday: firstWeekday) }
+        }.value
+    }
+
     func usage() async -> Result<UsageModel, Error> {
         guard let perch else { return .failure(EngineUnavailable()) }
         return await Task.detached(priority: .userInitiated) {

@@ -178,6 +178,9 @@ struct NowPane: View {
     let projects: [ProjectRow]
     let onOpenProject: (Int64) -> Void
 
+    /// Loaded once each time Overview is shown, never on the live tick.
+    @State private var activity: Heatmap?
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
@@ -198,6 +201,10 @@ struct NowPane: View {
                     }
                     // Each card already says what runs in its project, so the
                     // live sessions are not listed a second time above them.
+                    if let activity, activity.hasData {
+                        ActivityHeatmap(model: activity)
+                            .padding(.bottom, 8)
+                    }
                     if projects.isEmpty {
                         Text("No sessions running").foregroundStyle(.secondary)
                     }
@@ -210,6 +217,11 @@ struct NowPane: View {
             }
             .padding(20)
             .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .task {
+            // A failure leaves the heatmap out rather than showing an empty
+            // year, which would read as no activity.
+            if case .success(let h) = await engine.activity() { activity = h }
         }
     }
 }

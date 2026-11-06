@@ -188,6 +188,23 @@ pub fn oldest_turn_since(db: &Db, since_ms: i64) -> Result<Option<i64>> {
     Ok(ts)
 }
 
+/// When the index's records begin: its oldest turn overall, or one project's.
+/// Days before it are unknown, not idle.
+pub fn first_turn_at(db: &Db, project_id: Option<i64>) -> Result<Option<i64>> {
+    let ts: Option<i64> = match project_id {
+        Some(id) => db.conn().query_row(
+            "SELECT MIN(ts) FROM turns
+             WHERE session_id IN (SELECT id FROM sessions WHERE project_id = ?1)",
+            params![id],
+            |r| r.get(0),
+        )?,
+        None => db
+            .conn()
+            .query_row("SELECT MIN(ts) FROM turns", [], |r| r.get(0))?,
+    };
+    Ok(ts)
+}
+
 /// [`usage_by_model`] restricted to turns at or after `since_ms`.
 pub fn usage_by_model_since(db: &Db, since_ms: i64) -> Result<Vec<(String, TurnUsage, f64)>> {
     let per_model = usage_rows(
@@ -573,6 +590,8 @@ pub struct DayUsage {
     pub date: chrono::NaiveDate,
     /// API responses, subagents' included.
     pub responses: u64,
+    /// Sessions with at least one response that day.
+    pub sessions: u64,
     pub usage: TurnUsage,
     pub cost_usd: f64,
     pub unpriced_tokens: u64,
@@ -605,59 +624,79 @@ pub(crate) fn daily_usage_in<Tz: chrono::TimeZone>(
         return Ok(Vec::new());
     }
     let scope = match project_filter {
-        Some(_) => "AND t.session_id IN (SELECT id FROM sessions WHERE project_id = ?1)",
+        Some(_) => "AND session_id IN (SELECT id FROM sessions WHERE project_id = ?3)",
         None => "",
     };
-    // `CROSS JOIN` keeps SQLite walking day by day through the `ts` index, so
-    // turns outside the window are never read.
-    let sql = format!(
-        "{} SELECT d.i, t.model, COUNT(*), {SUMS}
-         FROM days d CROSS JOIN turns t
-         WHERE t.ts >= d.lo AND t.ts < d.hi {scope}
-         GROUP BY d.i, t.model",
-        days_table(&window)
-    );
-    let mut stmt = db.conn().prepare(&sql)?;
-    let rows = if let Some(project_id) = project_filter {
-        stmt.query_map(params![project_id], day_model_usage_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-    } else {
-        stmt.query_map([], day_model_usage_row)?
-            .collect::<std::result::Result<Vec<_>, _>>()?
+    // One range scan, grouped here rather than in SQL: a year of turns is too
+    // many for SQLite to sort into days quickly, and a day's length varies, so
+    // SQL can't tell which day a turn is in from its timestamp alone.
+    let mut stmt = db.conn().prepare(&format!(
+        "SELECT ts, model, session_id, input, output, cache_read, cache_write_5m,
+                cache_write_1h, thinking
+         FROM turns WHERE ts >= ?1 AND ts < ?2 {scope}"
+    ))?;
+    let lo = window[0].start_ms;
+    let hi = window[window.len() - 1].end_ms;
+    let mut rows = match project_filter {
+        Some(project_id) => stmt.query(params![lo, hi, project_id])?,
+        None => stmt.query(params![lo, hi])?,
     };
 
-    let mut per_day = vec![(Spend::default(), 0u64); window.len()];
-    for (slot, model, responses, u) in rows {
-        per_day[slot].0.add(db, &model, &u)?;
-        per_day[slot].1 += responses;
+    struct Slot {
+        responses: u64,
+        by_model: Vec<(String, TurnUsage)>,
+        sessions: std::collections::HashSet<String>,
     }
-    Ok(window
+    let mut slots: Vec<Slot> = window
         .iter()
-        .zip(per_day)
-        .map(|(day, (spend, responses))| DayUsage {
-            date: day.date,
-            responses,
-            usage: spend.usage,
-            cost_usd: spend.cost_usd,
-            unpriced_tokens: spend.unpriced_tokens,
+        .map(|_| Slot {
+            responses: 0,
+            by_model: Vec::new(),
+            sessions: std::collections::HashSet::new(),
         })
-        .collect())
-}
-
-fn day_model_usage_row(r: &rusqlite::Row) -> rusqlite::Result<(usize, String, u64, TurnUsage)> {
-    Ok((
-        r.get::<_, i64>(0)? as usize,
-        r.get::<_, String>(1)?,
-        r.get::<_, i64>(2)? as u64,
-        TurnUsage {
+        .collect();
+    while let Some(r) = rows.next()? {
+        let ts: i64 = r.get(0)?;
+        let slot = &mut slots[window.partition_point(|d| d.end_ms <= ts)];
+        let model = r.get_ref(1)?.as_str()?;
+        let session = r.get_ref(2)?.as_str()?;
+        let usage = TurnUsage {
             input: r.get::<_, i64>(3)? as u64,
             output: r.get::<_, i64>(4)? as u64,
             cache_read: r.get::<_, i64>(5)? as u64,
             cache_write_5m: r.get::<_, i64>(6)? as u64,
             cache_write_1h: r.get::<_, i64>(7)? as u64,
             thinking: r.get::<_, i64>(8)? as u64,
-        },
-    ))
+        };
+        slot.responses += 1;
+        match slot.by_model.iter_mut().find(|(m, _)| m == model) {
+            Some((_, total)) => *total = total.plus(&usage),
+            None => slot.by_model.push((model.to_owned(), usage)),
+        }
+        if !slot.sessions.contains(session) {
+            slot.sessions.insert(session.to_owned());
+        }
+    }
+    drop(rows);
+
+    window
+        .iter()
+        .zip(slots)
+        .map(|(day, slot)| {
+            let mut spend = Spend::default();
+            for (model, usage) in &slot.by_model {
+                spend.add(db, model, usage)?;
+            }
+            Ok(DayUsage {
+                date: day.date,
+                responses: slot.responses,
+                sessions: slot.sessions.len() as u64,
+                usage: spend.usage,
+                cost_usd: spend.cost_usd,
+                unpriced_tokens: spend.unpriced_tokens,
+            })
+        })
+        .collect()
 }
 
 /// `days` consecutive local days ending with the one containing `now_ms`, oldest
@@ -1438,6 +1477,7 @@ mod tests {
         assert_eq!(days[1].responses, 0);
         assert_eq!(days[2].usage.input, 1_000_000);
         assert_eq!(days[2].responses, 1);
+        assert_eq!(days[2].sessions, 1);
     }
 
     #[test]

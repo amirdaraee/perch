@@ -4,9 +4,9 @@
 use perch_core::db::Db;
 use perch_core::platform::RealProcessProbe;
 use perch_core::ui::{
-    advanced as core_advanced, diagnostics as core_diagnostics, main_window, model as core_model,
-    prices as core_prices, session_menu as core_session_menu, settings as core_ui_settings,
-    usage as core_usage, watcher,
+    advanced as core_advanced, diagnostics as core_diagnostics, heatmap as core_heatmap,
+    main_window, model as core_model, prices as core_prices, session_menu as core_session_menu,
+    settings as core_ui_settings, usage as core_usage, watcher,
 };
 use perch_core::{config, db, discovery, index, live, notify, pricing, query, settings, terminals};
 use std::collections::{HashMap, HashSet};
@@ -469,6 +469,87 @@ pub struct ProjectRow {
     pub waiting_label: Option<String>,
     pub stats_line: String,
     pub activity_line: String,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct Heatmap {
+    pub columns: u32,
+    pub cells: Vec<HeatCell>,
+    pub months: Vec<AxisLabel>,
+    pub weekdays: Vec<AxisLabel>,
+    pub summary: String,
+    pub tracking_note: Option<String>,
+    pub legend_less: String,
+    pub legend_more: String,
+    pub legend_untracked: String,
+    pub has_data: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Record)]
+pub struct HeatCell {
+    pub column: u32,
+    pub row: u32,
+    pub level: u8,
+    pub before_tracking: bool,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Record)]
+pub struct AxisLabel {
+    pub index: u32,
+    pub label: String,
+}
+
+impl From<core_heatmap::Heatmap> for Heatmap {
+    fn from(h: core_heatmap::Heatmap) -> Self {
+        let core_heatmap::Heatmap {
+            columns,
+            cells,
+            months,
+            weekdays,
+            summary,
+            tracking_note,
+            legend_less,
+            legend_more,
+            legend_untracked,
+            has_data,
+        } = h;
+        let axis = |labels: Vec<core_heatmap::AxisLabel>| {
+            labels
+                .into_iter()
+                .map(|core_heatmap::AxisLabel { index, label }| AxisLabel { index, label })
+                .collect()
+        };
+        Heatmap {
+            columns,
+            cells: cells
+                .into_iter()
+                .map(
+                    |core_heatmap::HeatCell {
+                         column,
+                         row,
+                         level,
+                         before_tracking,
+                         label,
+                     }| HeatCell {
+                        column,
+                        row,
+                        level,
+                        before_tracking,
+                        label,
+                    },
+                )
+                .collect(),
+            months: axis(months),
+            weekdays: axis(weekdays),
+            summary,
+            tracking_note,
+            legend_less,
+            legend_more,
+            legend_untracked,
+            has_data,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -2262,6 +2343,26 @@ impl Perch {
     pub fn project_detail(&self, project_id: i64) -> Result<ProjectDetail, PerchError> {
         let database = self.open_db()?;
         self.detail(&database, project_id)
+    }
+
+    /// A year of activity, for every project or one. `first_weekday` is the
+    /// locale's first day of the week, 1 for Sunday through 7 for Saturday.
+    pub fn activity(
+        &self,
+        project_id: Option<i64>,
+        first_weekday: u8,
+    ) -> Result<Heatmap, PerchError> {
+        let database = self.open_db()?;
+        let loaded_settings = settings::store::load(&self.config_path).settings;
+        core_heatmap::build_heatmap(
+            &database,
+            project_id,
+            now_ms(),
+            first_weekday,
+            loaded_settings.show_cost,
+        )
+        .map(Into::into)
+        .map_err(db_err)
     }
 
     /// The Usage tab's view-model.

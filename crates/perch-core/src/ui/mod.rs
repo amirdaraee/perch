@@ -3,6 +3,7 @@
 pub mod advanced;
 pub mod diagnostics;
 pub mod format;
+pub mod heatmap;
 pub mod main_window;
 pub mod model;
 pub mod prices;

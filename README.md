@@ -67,7 +67,8 @@ Perch sits in the menu bar with no Dock icon and shows how many sessions are
 live. Clicking it opens a menu with your usage and a row per session. It's a
 real `NSMenu`, which is what keeps it visible when you're in a fullscreen app.
 
-**Open Perch** opens the main window. You get a card per project with its
+**Open Perch** opens the main window. Overview starts with a year of activity
+as a calendar grid, like GitHub's, and then a card per project with its
 README blurb, session count, tokens, spend, a two week chart, and whether
 anything is running or waiting right now. Click through for that project's
 sessions, your own notes, and its totals. There's a separate Usage view with
