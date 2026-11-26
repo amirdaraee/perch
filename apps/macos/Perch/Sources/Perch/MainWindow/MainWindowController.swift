@@ -10,35 +10,15 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
     private let engine: PerchEngine
 
-    /// Reports whether some other top-level window (the settings window) is
-    /// still open. Without this, closing whichever of the two regular
-    /// windows closes last is fine, but closing one while the other is still
-    /// up would wrongly flip the app back to `.accessory` — hiding the Dock
-    /// icon out from under a window still on screen.
-    private let isAnotherWindowOpen: () -> Bool
-
     /// Bumped every time `show()` (re)presents the window. `MainWindowRoot`
     /// keys its `.task` on this, so reopening the same `NSHostingView`
     /// reloads the project list instead of showing whatever was current the
     /// first time the view appeared — see `Sidebar.swift`.
     private var refreshToken = 0
 
-    init(engine: PerchEngine, isAnotherWindowOpen: @escaping () -> Bool) {
+    init(engine: PerchEngine) {
         self.engine = engine
-        self.isAnotherWindowOpen = isAnotherWindowOpen
         super.init()
-    }
-
-    /// Read by `SettingsWindowController` (via `AppDelegate`) so *it* knows
-    /// not to drop the activation policy while this window is still open.
-    /// `isVisible` alone is false for a *miniaturized* window, which is
-    /// still very much open: minimize this one, close the other, and the app
-    /// would drop to `.accessory` — leaving a window in the Dock with no Dock
-    /// icon or Cmd-Tab entry left to restore it by, exactly what the guard
-    /// this feeds exists to prevent.
-    var isWindowOpen: Bool {
-        guard let window else { return false }
-        return window.isVisible || window.isMiniaturized
     }
 
     /// `selectingProjectId` is a clicked "waiting on you" notification's
@@ -49,8 +29,28 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     /// the index has never seen — leaves whatever selection was already
     /// showing.
     func show(selectingProjectId id: Int64? = nil) {
-        refreshToken += 1
+        present(MainWindowRoot(engine: engine, refreshToken: nextToken(), selectProjectId: id, setTitle: setTitle))
+    }
 
+    /// Opens the window on Settings, on `pane` when one is named, otherwise
+    /// on whichever pane was showing last.
+    func showSettings(pane: PaneId? = nil) {
+        if let pane {
+            UserDefaults.standard.set(pane.key, forKey: SettingsRootView.paneDefaultsKey)
+        }
+        present(MainWindowRoot(engine: engine, refreshToken: nextToken(), openSettings: true, setTitle: setTitle))
+    }
+
+    private func nextToken() -> Int {
+        refreshToken += 1
+        return refreshToken
+    }
+
+    private var setTitle: @MainActor (String) -> Void {
+        { [weak self] title in self?.window?.title = title }
+    }
+
+    private func present(_ root: MainWindowRoot) {
         if let window {
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
@@ -61,8 +61,7 @@ final class MainWindowController: NSObject, NSWindowDelegate {
                 window.deminiaturize(nil)
             }
             window.makeKeyAndOrderFront(nil)
-            (window.contentView as? NSHostingView<MainWindowRoot>)?.rootView =
-                MainWindowRoot(engine: engine, refreshToken: refreshToken, selectProjectId: id)
+            (window.contentViewController as? NSHostingController<MainWindowRoot>)?.rootView = root
             return
         }
 
@@ -74,14 +73,20 @@ final class MainWindowController: NSObject, NSWindowDelegate {
         )
         w.title = "Perch"
         w.titlebarAppearsTransparent = false
-        w.minSize = NSSize(width: 820, height: 520)
-        w.center()
         w.isReleasedWhenClosed = false
         w.delegate = self
-        w.contentView = NSHostingView(
-            rootView: MainWindowRoot(engine: engine, refreshToken: refreshToken, selectProjectId: id)
-        )
         window = w
+        // A hosting *controller* with no sizing options, as Settings needed
+        // when it was its own window: a bare hosting view sizes the window to
+        // its content, and a settings pane's content is far taller than the
+        // window, which hung the top of it out of sight.
+        let host = NSHostingController(rootView: root)
+        host.sizingOptions = []
+        w.contentViewController = host
+        // After the controller, which would otherwise resize the window.
+        w.minSize = NSSize(width: 820, height: 520)
+        w.setContentSize(NSSize(width: 1000, height: 660))
+        w.center()
 
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
@@ -89,16 +94,10 @@ final class MainWindowController: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
-        // Guarded even though there is exactly one window/delegate here:
-        // without it, a second window sharing this delegate would flip the
-        // activation policy back to .accessory when *it* closed, even while
-        // this controller's own window was still open.
+        // Guarded so a sheet or panel sharing this delegate can't flip the
+        // activation policy while the window itself stays open.
         guard notification.object as? NSWindow === window else { return }
-        // Back to a pure menu-bar app: no Dock icon, no Cmd-Tab entry — but
-        // only if the settings window isn't still up; otherwise that window
-        // would be left on screen with no Dock icon or Cmd-Tab entry to
-        // reach it by.
-        guard !isAnotherWindowOpen() else { return }
+        // Back to a pure menu-bar app: no Dock icon, no Cmd-Tab entry.
         NSApp.setActivationPolicy(.accessory)
     }
 }

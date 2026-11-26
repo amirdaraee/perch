@@ -583,7 +583,7 @@ fn popover_pane(s: &Settings, cx: &SchemaContext) -> SettingsPane {
 
     SettingsPane {
         id: PaneId::Popover,
-        title: "Popover".to_string(),
+        title: "Menu".to_string(),
         icon: IconId::Popover,
         attention: None,
         preview: Some(popover_preview(cx)),

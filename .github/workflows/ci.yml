@@ -581,7 +581,7 @@ jobs:
             exit 1
           fi
           # And interpolating a user's search query into a sentence — which
-          # SettingsWindow.swift really does — is a string, not a number.
+          # SettingsView.swift really does — is a string, not a number.
           printf 'Text("No setting matches \\u{201C}\\(query)\\u{201D}.")\n' > /tmp/swift-text-query-selftest.swift
           if grep -nHE "$NUMBER_IN_TEXT|$COUNTED_NOUN_IN_TEXT" /tmp/swift-text-query-selftest.swift > /dev/null; then
             echo "::error::Guard self-test failed: the pattern now flags a string interpolated into a sentence."

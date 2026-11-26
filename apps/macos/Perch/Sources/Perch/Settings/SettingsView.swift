@@ -3,125 +3,10 @@ import SwiftUI
 import UserNotifications
 import PerchFFI
 
-/// Hosts the settings window, following `MainWindowController`'s established
-/// pattern: `isReleasedWhenClosed = false`, a `notification.object === window`
-/// guard in `windowWillClose`, and the activation-policy flip so the window
-/// can take focus while the app stays a menu-bar app.
-///
-/// One addition over `MainWindowController`: this app can now have *two*
-/// regular windows open at once (main + settings), so closing either one
-/// must check whether the other is still up before dropping the app back to
-/// `.accessory` — see `isAnotherWindowOpen`.
-@MainActor
-final class SettingsWindowController: NSObject, NSWindowDelegate {
-    private var window: NSWindow?
-    private let engine: PerchEngine
-    private let isAnotherWindowOpen: () -> Bool
-
-    /// Bumped every time `show()` (re)presents the window, the same trick
-    /// `MainWindowController` uses to make `.task(id:)` reload on reopen
-    /// rather than showing whatever was current when the view first
-    /// appeared.
-    private var refreshToken = 0
-
-    init(engine: PerchEngine, isAnotherWindowOpen: @escaping () -> Bool) {
-        self.engine = engine
-        self.isAnotherWindowOpen = isAnotherWindowOpen
-        super.init()
-    }
-
-    /// Read by `MainWindowController` (via `AppDelegate`) for the same reason
-    /// in reverse.
-    /// `isVisible` alone is false for a *miniaturized* window, which is
-    /// still very much open: minimize this one, close the other, and the app
-    /// would drop to `.accessory` — leaving a window in the Dock with no Dock
-    /// icon or Cmd-Tab entry left to restore it by, exactly what the guard
-    /// this feeds exists to prevent.
-    var isWindowOpen: Bool {
-        guard let window else { return false }
-        return window.isVisible || window.isMiniaturized
-    }
-
-    func show() {
-        refreshToken += 1
-
-        if let window {
-            NSApp.setActivationPolicy(.regular)
-            NSApp.activate(ignoringOtherApps: true)
-            if window.isMiniaturized {
-                window.deminiaturize(nil)
-            }
-            window.makeKeyAndOrderFront(nil)
-            (window.contentViewController as? NSHostingController<SettingsRootView>)?
-                .rootView = rootView()
-            return
-        }
-
-        let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 880, height: 640),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        w.title = "Settings"
-        w.titlebarAppearsTransparent = false
-        w.isReleasedWhenClosed = false
-        w.delegate = self
-        window = w
-        // A *controller*, not a bare `NSHostingView` set as `contentView`.
-        // The view sizes itself to fit its content, and AppKit's origin is
-        // bottom-left — so a tree taller than the content area hangs off the
-        // *top* of the window. That is not theoretical: it shipped. The
-        // sidebar's nine rows and the detail's first two groups were all
-        // above the visible frame, leaving an empty column beside a pane
-        // that began halfway down. A hosting controller is constrained to
-        // the window, and the scrollable parts scroll instead.
-        let host = NSHostingController(rootView: rootView())
-        // Measured, not guessed: without this the split view laid out at its
-        // *content* height — 1465pt inside a 640pt window, at y = -386.5 —
-        // so 438pt of it sat above the visible top. The sidebar's rows and
-        // the detail's first groups were all up there, which is why the
-        // column read as empty and every pane opened halfway down.
-        host.sizingOptions = []
-        w.contentViewController = host
-
-        // Sized *after* the controller is installed: assigning one resizes
-        // the window to the controller's preferred size, which would discard
-        // both the intended size and any frame the user had dragged to.
-        w.minSize = NSSize(width: 720, height: 480)
-        w.setContentSize(NSSize(width: 880, height: 640))
-        w.center()
-        w.setFrameAutosaveName("PerchSettingsWindow")
-
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
-        w.makeKeyAndOrderFront(nil)
-    }
-
-    /// The window's title names the pane the user is looking at, so the
-    /// title bar says where they are rather than repeating the app's name at
-    /// them. SwiftUI's `navigationTitle` does not reach an `NSWindow` this
-    /// view was merely dropped into, so the view hands the string back here.
-    private func rootView() -> SettingsRootView {
-        SettingsRootView(
-            engine: engine,
-            refreshToken: refreshToken,
-            setTitle: { [weak self] title in self?.window?.title = title }
-        )
-    }
-
-    func windowWillClose(_ notification: Notification) {
-        guard notification.object as? NSWindow === window else { return }
-        // Back to a pure menu-bar app — but only if the main window isn't
-        // still up; otherwise that window would be left on screen with no
-        // Dock icon or Cmd-Tab entry to reach it by.
-        guard !isAnotherWindowOpen() else { return }
-        NSApp.setActivationPolicy(.accessory)
-    }
-}
-
-/// The settings window's content: a sidebar of panes over a detail side that
-/// draws whichever one is selected.
+/// The Settings section of the main window: a sidebar of panes over a detail
+/// side that draws whichever one is selected. It takes over the whole window
+/// while it is showing, so the project list stays uncluttered; the row at the
+/// top of its sidebar goes back.
 ///
 /// **The sidebar is the schema's, not Swift's.** Every pane, its title, its
 /// icon, its attention phrase and all of its rows arrive from
@@ -139,6 +24,8 @@ struct SettingsRootView: View {
     let engine: PerchEngine
     let refreshToken: Int
     let setTitle: @MainActor (String) -> Void
+    /// Leaves Settings for wherever the window was before.
+    let onExit: () -> Void
 
     /// Observed, not merely read: `Notifier` re-reads macOS's authorization
     /// on every delivery, so a permission granted or revoked while this
@@ -147,10 +34,16 @@ struct SettingsRootView: View {
     @ObservedObject private var notifier: Notifier
 
     @MainActor
-    init(engine: PerchEngine, refreshToken: Int, setTitle: @escaping @MainActor (String) -> Void) {
+    init(
+        engine: PerchEngine,
+        refreshToken: Int,
+        setTitle: @escaping @MainActor (String) -> Void,
+        onExit: @escaping () -> Void
+    ) {
         self.engine = engine
         self.refreshToken = refreshToken
         self.setTitle = setTitle
+        self.onExit = onExit
         _notifier = ObservedObject(wrappedValue: engine.notifier)
     }
 
@@ -183,11 +76,15 @@ struct SettingsRootView: View {
 
     /// Per-viewer window state, not settings: neither belongs in
     /// `config.toml`, which is the user's own hand-editable file.
-    @AppStorage("settings.selectedPane") private var storedPaneKey: String = "general"
+    @AppStorage(SettingsRootView.paneDefaultsKey) private var storedPaneKey: String = "general"
 
     /// `List(selection:)` needs an optional; `@AppStorage` will not hold one.
     /// Kept in sync with `storedPaneKey` so the choice survives a reopen.
     @State private var selectedPaneKey: String?
+
+    /// Where the last-viewed pane is remembered. Anything that opens Settings
+    /// on a particular pane writes that pane's key here first.
+    static let paneDefaultsKey = "settings.selectedPane"
 
     var body: some View {
         NavigationSplitView {
@@ -197,6 +94,12 @@ struct SettingsRootView: View {
             // and fed `ideal:` a width the sidebar itself reported back; the
             // column then rendered nothing at all.
             List(selection: $selectedPaneKey) {
+                Button(action: onExit) {
+                    Label("Back", systemImage: "chevron.backward")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .help("Back to Overview, Usage and your projects")
                 if panes.isEmpty {
                     emptySidebarNotice
                 } else {
@@ -215,10 +118,13 @@ struct SettingsRootView: View {
         // view reported its content's height as its own ideal — 1465pt —
         // and the host centred that inside 640pt, hanging 438pt off the top.
         .frame(
-            minWidth: 720, idealWidth: 880, maxWidth: .infinity,
-            minHeight: 480, idealHeight: 640, maxHeight: .infinity
+            minWidth: 820, idealWidth: 1000, maxWidth: .infinity,
+            minHeight: 520, idealHeight: 660, maxHeight: .infinity
         )
-        .task(id: refreshToken) { await load() }
+        .task(id: refreshToken) {
+            selectedPaneKey = storedPaneKey
+            await load()
+        }
         .onChange(of: query) { _, q in search(q) }
         .onChange(of: currentPane?.title) { _, title in
             setTitle(title ?? "Settings")
@@ -230,7 +136,9 @@ struct SettingsRootView: View {
             if let key { storedPaneKey = key }
         }
         .onAppear {
-            if selectedPaneKey == nil { selectedPaneKey = storedPaneKey }
+            // Always the stored pane: whatever opened Settings on a
+            // particular pane wrote it there first.
+            selectedPaneKey = storedPaneKey
             setTitle(currentPane?.title ?? "Settings")
         }
     }
@@ -577,7 +485,7 @@ struct SettingsRootView: View {
 
     /// Runs once per `refreshToken` — i.e. once per fresh presentation of the
     /// window, including a reopen after it was previously closed.
-    /// `SettingsWindowController.show()` reuses the same `NSHostingView` and
+    /// `MainWindowController` reuses the same hosting controller and
     /// only swaps `.rootView`, so SwiftUI preserves this view's `@State`
     /// across a close/reopen (the same reuse that makes `refreshToken`
     /// necessary at all) — without clearing `actionError` here, a write that
@@ -739,7 +647,7 @@ struct SettingsRootView: View {
     }
 }
 
-private extension PaneId {
+extension PaneId {
     /// A stable string for `@AppStorage` and for list selection. Never shown
     /// to the user — every visible pane name is `SettingsPane.title`, which
     /// Rust writes.

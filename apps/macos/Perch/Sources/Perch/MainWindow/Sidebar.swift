@@ -1,7 +1,8 @@
 import SwiftUI
 import PerchFFI
 
-/// The main window's content: Overview and Usage, then every project, grouped.
+/// The main window's content: Overview, Usage and Settings, then every
+/// project, grouped. Settings takes over the whole window while it shows.
 ///
 /// `refreshToken` is bumped by `MainWindowController.show()` each time the
 /// window is (re)shown, so `.task(id:)` re-runs even though the hosting view
@@ -21,6 +22,12 @@ struct MainWindowRoot: View {
     /// Applied once `reload()` has the project list; `nil` for an ordinary
     /// open.
     var selectProjectId: Int64? = nil
+    /// Set when this presentation should open on Settings (`⌘,`, the menu's
+    /// "Settings…", or a link to a particular pane).
+    var openSettings = false
+    /// Names the window after where it is, since SwiftUI's titles don't reach
+    /// an `NSWindow` hosted this way.
+    var setTitle: @MainActor (String) -> Void = { _ in }
 
     @State private var model: MainWindowModel?
     /// Distinguishes "still loading" from "loaded and empty" — both render
@@ -33,13 +40,64 @@ struct MainWindowRoot: View {
     @State private var history: [Selection] = [.overview]
     @State private var cursor = 0
 
-    enum Selection: Hashable { case overview, usage, project(Int64) }
+    enum Selection: Hashable { case overview, usage, project(Int64), settings }
 
     var body: some View {
+        Group {
+            if selection == .settings {
+                SettingsRootView(
+                    engine: engine,
+                    refreshToken: refreshToken,
+                    setTitle: setTitle,
+                    onExit: leaveSettings
+                )
+                .toolbar { navigationButtons }
+            } else {
+                main
+            }
+        }
+        .onChange(of: selection) { old, new in
+            record(new)
+            if old == .settings, new != .settings { setTitle("Perch") }
+        }
+        .task(id: refreshToken) {
+            if openSettings { selection = .settings }
+            await reload()
+        }
+        .frame(minWidth: 820, minHeight: 520)
+    }
+
+    /// Back to wherever the window was before Settings, or Overview.
+    private func leaveSettings() {
+        let before = history[..<cursor].last { $0 != .settings }
+        selection = before ?? .overview
+    }
+
+    @ToolbarContentBuilder
+    private var navigationButtons: some ToolbarContent {
+        ToolbarItemGroup(placement: .navigation) {
+            Button(action: goBack) {
+                Label("Back", systemImage: "chevron.left")
+            }
+            .keyboardShortcut("[", modifiers: .command)
+            .disabled(cursor == 0)
+            .help("Back")
+
+            Button(action: goForward) {
+                Label("Forward", systemImage: "chevron.right")
+            }
+            .keyboardShortcut("]", modifiers: .command)
+            .disabled(cursor >= history.count - 1)
+            .help("Forward")
+        }
+    }
+
+    private var main: some View {
         NavigationSplitView {
             List(selection: $selection) {
                 Label("Overview", systemImage: "square.grid.2x2").tag(Selection.overview)
                 Label("Usage", systemImage: "chart.bar").tag(Selection.usage)
+                Label("Settings", systemImage: "gearshape").tag(Selection.settings)
                 if let model {
                     ForEach(ProjectGroups.ordered, id: \.title) { entry in
                         section(entry.title, entry.group, model)
@@ -56,27 +114,8 @@ struct MainWindowRoot: View {
             .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 360)
         } detail: {
             detailPane
-                .toolbar {
-                    ToolbarItemGroup(placement: .navigation) {
-                        Button(action: goBack) {
-                            Label("Back", systemImage: "chevron.left")
-                        }
-                        .keyboardShortcut("[", modifiers: .command)
-                        .disabled(cursor == 0)
-                        .help("Back")
-
-                        Button(action: goForward) {
-                            Label("Forward", systemImage: "chevron.right")
-                        }
-                        .keyboardShortcut("]", modifiers: .command)
-                        .disabled(cursor >= history.count - 1)
-                        .help("Forward")
-                    }
-                }
+                .toolbar { navigationButtons }
         }
-        .onChange(of: selection) { _, new in record(new) }
-        .task(id: refreshToken) { await reload() }
-        .frame(minWidth: 820, minHeight: 520)
     }
 
     /// A step through history sets `selection` to the entry already under the
@@ -125,6 +164,9 @@ struct MainWindowRoot: View {
         case .project(let id):
             ProjectDetailPane(engine: engine, projectId: id, onChanged: { await reload() })
                 .id(id)
+        case .settings:
+            // Drawn by `body` in place of the whole split view.
+            EmptyView()
         }
     }
 

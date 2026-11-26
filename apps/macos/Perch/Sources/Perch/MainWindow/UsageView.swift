@@ -75,7 +75,7 @@ struct UsageView: View {
                         .font(.callout)
                         .foregroundStyle(Color.perchWaiting)
                     Button("Open Settings") {
-                        (NSApp.delegate as? AppDelegate)?.showSettings()
+                        (NSApp.delegate as? AppDelegate)?.showSettings(pane: .prices)
                     }
                     .controlSize(.small)
                 }

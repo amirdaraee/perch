@@ -89,8 +89,9 @@ want. Any project can have its own limit, or none at all. macOS asks for
 notification permission at that point rather than at launch, and if you say no
 the toggle says so instead of quietly doing nothing.
 
-**Settings** (⌘,) has nine panes and a search box, so you can find a setting by
-what it does instead of guessing which pane it's in. Each pane shows what your
+**Settings** (⌘,) lives in the main window's sidebar. It has nine panes and a
+search box, so you can find a setting by what it does instead of guessing which
+pane it's in. Each pane shows what your
 current settings actually produce in your own data. Settings live in Perch's own
 `config.toml`, which is watched, so editing it by hand works without a restart.
 
