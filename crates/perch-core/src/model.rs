@@ -61,6 +61,11 @@ pub struct SessionMeta {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRecord {
+    /// Which tool wrote the session: [`crate::provider::CLAUDE_CODE`], or
+    /// another provider's id. Any other provider's `id` starts with
+    /// `"{provider}:"`, so two tools' sessions can't collide.
+    #[serde(default = "crate::provider::claude_code")]
+    pub provider: String,
     pub id: String,
     pub project_id: i64,
     pub file_path: String,

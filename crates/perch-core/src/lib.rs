@@ -1,4 +1,5 @@
-//! Perch core: reads Claude Code's on-disk data. Never writes to it.
+//! Perch core: reads AI coding tools' on-disk data, Claude Code's first.
+//! Never writes to it.
 
 pub mod actions;
 pub mod config;
@@ -12,6 +13,7 @@ pub mod notify;
 pub mod platform;
 pub mod pricing;
 pub mod process;
+pub mod provider;
 pub mod query;
 pub mod readme;
 pub mod scan;

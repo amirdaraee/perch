@@ -467,6 +467,7 @@ pub(crate) mod tests {
                     ("s-new", NOW - 60_000, 4_000u64, "feature"),
                 ] {
                     db.upsert_session(&SessionRecord {
+                        provider: perch_core::provider::CLAUDE_CODE.into(),
                         id: id.into(),
                         project_id: pid,
                         file_path: format!("/tmp/{id}.jsonl"),

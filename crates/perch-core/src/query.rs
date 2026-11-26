@@ -880,6 +880,7 @@ mod tests {
             .upsert_project("-Users-a-one", "/Users/a/one", false)
             .unwrap();
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: "s1".into(),
             project_id: pid,
             file_path: "/tmp/s1.jsonl".into(),
@@ -1019,6 +1020,7 @@ mod tests {
 
     fn seed_session(db: &Db, pid: i64, id: &str, cwd: &str, last: i64, input: u64) {
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: id.into(),
             project_id: pid,
             file_path: format!("/tmp/{id}.jsonl"),
@@ -1065,6 +1067,7 @@ mod tests {
             ("s-blank", Some("   ".to_string())),
         ] {
             db.upsert_session(&SessionRecord {
+                provider: crate::provider::CLAUDE_CODE.into(),
                 id: id.into(),
                 project_id: pid,
                 file_path: format!("/tmp/{id}.jsonl"),
@@ -1105,6 +1108,7 @@ mod tests {
             .upsert_project("-Users-a-one", "/Users/a/one", false)
             .unwrap();
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: "s-a".into(),
             project_id: pid,
             file_path: "/tmp/s-a.jsonl".into(),
@@ -1161,6 +1165,7 @@ mod tests {
             .upsert_project("-Users-a-one", "/Users/a/one", false)
             .unwrap();
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: id.into(),
             project_id: pid,
             file_path: format!("/tmp/{id}.jsonl"),
@@ -1393,6 +1398,7 @@ mod tests {
         let pid = db.upsert_project("-a-p", "/a/p", false).unwrap();
         seed_session(&db, pid, "titled", "/a/p", 1_000, 1);
         let mut s = crate::model::SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: "titled".into(),
             project_id: pid,
             file_path: "/tmp/titled.jsonl".into(),
@@ -1438,6 +1444,7 @@ mod tests {
         // dated session rather than first (NULL DESC would otherwise put it
         // first) and rather than being dropped.
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: "undated".into(),
             project_id: pid,
             file_path: "/tmp/undated.jsonl".into(),
@@ -1622,6 +1629,7 @@ mod tests {
             ("bare", bare, 5_000, None),
         ] {
             db.upsert_session(&SessionRecord {
+                provider: crate::provider::CLAUDE_CODE.into(),
                 id: id.into(),
                 project_id: pid,
                 file_path: format!("/tmp/{id}.jsonl"),

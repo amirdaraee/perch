@@ -1011,6 +1011,7 @@ mod tests {
             .upsert_project("-Users-a-proj", "/Users/a/proj", false)
             .unwrap();
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: "0f2c-9a11".into(),
             project_id: pid,
             file_path: "/tmp/0f2c-9a11.jsonl".into(),

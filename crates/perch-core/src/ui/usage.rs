@@ -305,6 +305,7 @@ mod tests {
     fn seed(db: &Db, sid: &str, ts: i64, model: &str, u: TurnUsage) {
         let pid = db.upsert_project("-a-p", "/a/proj", false).unwrap();
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: sid.into(),
             project_id: pid,
             file_path: format!("/tmp/{sid}.jsonl"),

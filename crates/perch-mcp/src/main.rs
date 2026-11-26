@@ -15,7 +15,7 @@ mod tools;
 
 use perch_core::config;
 use perch_core::db::{self, Db};
-use perch_core::live::{self, LiveSession};
+use perch_core::live::LiveSession;
 use perch_core::platform::RealProcessProbe;
 use perch_core::settings::{store, Settings};
 use std::path::{Path, PathBuf};
@@ -53,8 +53,11 @@ impl tools::Host for RealHost {
         } else {
             Some(PathBuf::from(configured))
         };
-        dir.map(|d| live::live_sessions(&config::sessions_dir(&d), &RealProcessProbe))
-            .unwrap_or_default()
+        dir.map(|d| {
+            let claude = perch_core::provider::ClaudeCode::new(d);
+            perch_core::provider::live_sessions(&[&claude], &RealProcessProbe)
+        })
+        .unwrap_or_default()
     }
 
     fn settings(&self) -> Settings {

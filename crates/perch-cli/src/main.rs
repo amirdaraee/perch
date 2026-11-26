@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use perch_core::ui::format::{elapsed_or_dash, human_cost, human_tokens};
-use perch_core::{config, db, index, pricing, query};
+use perch_core::{config, db, pricing, query};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -47,9 +47,9 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Index => {
-            let root = config::projects_dir(&config_dir);
+            let claude = perch_core::provider::ClaudeCode::new(&config_dir);
             let started = std::time::Instant::now();
-            let stats = index::index_all(&database, &root)?;
+            let stats = perch_core::provider::index_all(&database, &[&claude])?;
             println!(
                 "indexed {} projects, {} sessions, {} new turns, {} new bytes, {} lines skipped, {} sessions skipped, {} subagents, {} subagents skipped in {:.2}s",
                 stats.projects,
@@ -131,11 +131,11 @@ fn main() -> Result<()> {
             }
         }
         Command::Sessions => {
-            use perch_core::live::{live_sessions, SessionStatus};
+            use perch_core::live::SessionStatus;
             use perch_core::platform::RealProcessProbe;
 
-            let probe = RealProcessProbe;
-            let sessions = live_sessions(&config::sessions_dir(&config_dir), &probe);
+            let claude = perch_core::provider::ClaudeCode::new(&config_dir);
+            let sessions = perch_core::provider::live_sessions(&[&claude], &RealProcessProbe);
             let now = chrono::Utc::now().timestamp_millis();
 
             if sessions.is_empty() {

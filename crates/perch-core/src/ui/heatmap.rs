@@ -381,6 +381,7 @@ mod tests {
         for (i, (d, model)) in turns.iter().enumerate() {
             let id = format!("s{i}");
             db.upsert_session(&SessionRecord {
+                provider: crate::provider::CLAUDE_CODE.into(),
                 id: id.clone(),
                 project_id: pid,
                 file_path: format!("/tmp/{id}.jsonl"),

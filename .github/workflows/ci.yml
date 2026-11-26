@@ -137,6 +137,36 @@ jobs:
 
           echo "no raw sockets found in crates/*/src"
 
+      - name: Assert no provider code names a credentials file
+        run: |
+          set -uo pipefail
+
+          # Several AI coding tools keep a login token beside their sessions
+          # (Codex's auth.json, for one). A provider reads the files it names
+          # and never walks a tool's home, so the only way to read one of
+          # these is to name it. The production half of every crate is
+          # searched for any such name in a string; comments are skipped,
+          # since provider docs say what not to read.
+          CREDENTIAL_NAMES='"[^"]*(auth\.json|credentials|\.netrc|oauth[_-]?token|access[_-]?token|api[_-]?key|keychain|\.pem)[^"]*"'
+          prod() { awk '/^#\[cfg\(test\)\]/{exit} {print FILENAME ":" FNR ": " $0}' "$1"; }
+
+          printf 'let p = home.join("auth.json");\n' > /tmp/credential-selftest.rs
+          if ! prod /tmp/credential-selftest.rs | grep -iE "$CREDENTIAL_NAMES" > /dev/null; then
+            echo "::error::Guard self-test failed: a credentials file name in a string is no longer caught."
+            exit 1
+          fi
+
+          hits=$(find crates -path '*/src/*' -name '*.rs' -print0 \
+            | while IFS= read -r -d '' f; do prod "$f"; done \
+            | grep -v -E '^[^:]+:[0-9]+:[[:space:]]*//' \
+            | grep -iE "$CREDENTIAL_NAMES" || true)
+          if [ -n "$hits" ]; then
+            printf '%s\n' "$hits"
+            echo "::error::Source names a credentials file. Providers read only session and usage files they name, never a tool's login."
+            exit 1
+          fi
+          echo "no credentials file is named in crates/*/src"
+
       - name: Assert perch-core, perch-ffi and perch-mcp never write to the filesystem
         run: |
           set -uo pipefail

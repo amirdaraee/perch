@@ -105,6 +105,7 @@ pub fn index_all(db: &Db, projects_root: &Path) -> Result<IndexStats> {
             // storing the new turns must all happen or none of them must.
             db.apply_scan(
                 &SessionRecord {
+                    provider: crate::provider::CLAUDE_CODE.into(),
                     id: session_id.to_string(),
                     project_id,
                     file_path: file.to_string_lossy().into_owned(),

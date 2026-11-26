@@ -3,12 +3,13 @@
 
 use perch_core::db::Db;
 use perch_core::platform::RealProcessProbe;
+use perch_core::provider::{self, ClaudeCode, Provider};
 use perch_core::ui::{
     advanced as core_advanced, daily_chart as core_daily_chart, diagnostics as core_diagnostics,
     heatmap as core_heatmap, main_window, model as core_model, prices as core_prices,
     session_menu as core_session_menu, settings as core_ui_settings, usage as core_usage, watcher,
 };
-use perch_core::{config, db, discovery, index, live, notify, pricing, query, settings, terminals};
+use perch_core::{config, db, discovery, live, notify, pricing, query, settings, terminals};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
@@ -1975,6 +1976,19 @@ pub trait PerchListener: Send + Sync {
     fn on_notifications(&self, items: Vec<WaitingNotification>);
 }
 
+/// The tools Perch reads, in the order their sessions are listed. Claude
+/// Code is the only one so far.
+fn providers_for(config_dir: &std::path::Path) -> Vec<Box<dyn Provider>> {
+    vec![Box::new(ClaudeCode::new(config_dir))]
+}
+
+/// Every provider's running sessions right now.
+fn live_now(config_dir: &std::path::Path) -> Vec<live::LiveSession> {
+    let providers = providers_for(config_dir);
+    let providers: Vec<&dyn Provider> = providers.iter().map(|p| p.as_ref()).collect();
+    provider::live_sessions(&providers, &RealProcessProbe)
+}
+
 #[derive(uniffi::Object)]
 pub struct Perch {
     /// Mutable at runtime: a settings-file hand-edit (or a `save_settings`
@@ -2192,7 +2206,9 @@ impl ThisPerch {
                 db::open(&self.db_path).map_err(|e| format!("could not open index: {e}"))?;
             pricing::seed_default_prices(&database)
                 .map_err(|e| format!("could not seed prices: {e}"))?;
-            index::index_all(&database, &config::projects_dir(&self.config_dir()))
+            let providers = providers_for(&self.config_dir());
+            let providers: Vec<&dyn Provider> = providers.iter().map(|p| p.as_ref()).collect();
+            provider::index_all(&database, &providers)
                 .map_err(|e| format!("could not index sessions: {e}"))?;
             Ok(())
         })();
@@ -2356,8 +2372,7 @@ impl Perch {
 
     /// Synchronous snapshot: sessions from disk, stats from the index if it opens.
     pub fn current(&self) -> PopoverModel {
-        let sessions =
-            live::live_sessions(&config::sessions_dir(&self.config_dir()), &RealProcessProbe);
+        let sessions = live_now(&self.config_dir());
         self.model_for(sessions)
     }
 
@@ -2442,8 +2457,7 @@ impl Perch {
     /// and a database that fails to open still yields a window — with the
     /// reason attached to `error` — rather than nothing.
     pub fn main_window(&self) -> MainWindowModel {
-        let sessions =
-            live::live_sessions(&config::sessions_dir(&self.config_dir()), &RealProcessProbe);
+        let sessions = live_now(&self.config_dir());
         let now = self.core_model_for(sessions.clone());
         let db = db::open(&self.db_path).ok();
         // The Active/Recent boundary is `active_within_days`; loaded here for
@@ -2548,8 +2562,7 @@ impl Perch {
         session_id: String,
         owning_app: Option<String>,
     ) -> Option<SessionMenu> {
-        let sessions =
-            live::live_sessions(&config::sessions_dir(&self.config_dir()), &RealProcessProbe);
+        let sessions = live_now(&self.config_dir());
         let session = sessions
             .iter()
             .find(|s| s.session_id == session_id)?
@@ -2601,7 +2614,10 @@ impl Perch {
         let bypass = settings::store::load(&self.config_path)
             .settings
             .resume_bypass_permissions;
-        perch_core::actions::TerminalCommand::resume(&session_id, &cwd, bypass).into()
+        ClaudeCode::new(self.config_dir())
+            .resume_command(&session_id, &cwd, bypass)
+            .expect("Claude Code can always resume")
+            .into()
     }
 
     /// A fresh `claude` session in `cwd`, as a ready-to-run shell line.
@@ -3010,8 +3026,7 @@ impl Perch {
     /// `database` — shared by every edit method so each returns the updated
     /// state rather than making the shell re-fetch or guess what changed.
     fn detail(&self, database: &Db, project_id: i64) -> Result<ProjectDetail, PerchError> {
-        let sessions =
-            live::live_sessions(&config::sessions_dir(&self.config_dir()), &RealProcessProbe);
+        let sessions = live_now(&self.config_dir());
         // `build_project_detail` needs the global `waiting_after_minutes` to
         // compose `notify_default_label` (what "Default" currently means for
         // this project) — `&Settings` rather than the bare minute count,
@@ -3084,7 +3099,7 @@ impl Perch {
     /// for the genuine first run, not for a caller in a hurry.
     fn schema_context(&self, s: &settings::Settings) -> settings::SchemaContext {
         let dir = self.config_dir();
-        let sessions = live::live_sessions(&config::sessions_dir(&dir), &RealProcessProbe);
+        let sessions = live_now(&dir);
         let db = db::open(&self.db_path).ok();
         let now = now_ms();
         let model = self.core_model_for(sessions.clone());

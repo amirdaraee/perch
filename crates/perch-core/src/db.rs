@@ -2,10 +2,10 @@
 
 use crate::model::{SessionRecord, Turn};
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
-pub const SCHEMA_VERSION: i32 = 4;
+pub const SCHEMA_VERSION: i32 = 5;
 
 pub struct Db {
     conn: Connection,
@@ -285,6 +285,42 @@ fn migrate(conn: &Connection, existing_version: i32) -> Result<()> {
     if existing_version < 4 {
         migrate_to_v4(conn)?;
     }
+    if existing_version < 5 {
+        migrate_to_v5(conn)?;
+    }
+    Ok(())
+}
+
+/// v4 -> v5: sessions and turns record which tool wrote them. Every existing
+/// row is Claude Code's, which is what the column's default says, so nothing
+/// is rescanned and nothing is deleted. A response is now unique within its
+/// provider rather than across all of them, since two tools' response ids
+/// say nothing about each other.
+fn migrate_to_v5(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for table in ["sessions", "turns"] {
+        let exists: bool = tx
+            .prepare(&format!(
+                "SELECT 1 FROM pragma_table_info('{table}') WHERE name = 'provider'"
+            ))?
+            .exists([])?;
+        if !exists {
+            tx.execute(
+                &format!(
+                    "ALTER TABLE {table} ADD COLUMN provider TEXT NOT NULL DEFAULT '{}'",
+                    crate::provider::CLAUDE_CODE
+                ),
+                [],
+            )?;
+        }
+    }
+    tx.execute_batch(
+        "DROP INDEX IF EXISTS idx_turns_message;
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_provider_message
+             ON turns(provider, message_id) WHERE message_id IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_sessions_provider ON sessions(provider);",
+    )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -686,8 +722,9 @@ impl Db {
 fn upsert_session_on(conn: &Connection, s: &SessionRecord) -> Result<()> {
     conn.execute(
         "INSERT INTO sessions (id, project_id, file_path, file_size, indexed_offset,
-             started_at, last_activity_at, cwd, git_branch, cc_version, title, message_count)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+             started_at, last_activity_at, cwd, git_branch, cc_version, title, message_count,
+             provider)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
          ON CONFLICT(id) DO UPDATE SET
              project_id = ?2, file_path = ?3, file_size = ?4, indexed_offset = ?5,
              -- `started_at` keeps the OLDEST value it has ever seen.
@@ -714,7 +751,8 @@ fn upsert_session_on(conn: &Connection, s: &SessionRecord) -> Result<()> {
             s.git_branch,
             s.cc_version,
             s.title,
-            s.message_count as i64
+            s.message_count as i64,
+            s.provider
         ],
     )?;
     Ok(())
@@ -729,14 +767,24 @@ fn insert_turns_on(
     if turns.is_empty() {
         return Ok(());
     }
+    // A turn belongs to its session's tool. A session not stored yet can only
+    // be Claude Code's, whose sessions predate providers.
+    let provider: String = conn
+        .query_row(
+            "SELECT provider FROM sessions WHERE id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(crate::provider::claude_code);
     // A response already stored keeps its session and time and takes the newer
     // usage: it may be the rest of a response whose first lines an earlier pass
     // read while it was still being written.
     let mut stmt = conn.prepare(
         "INSERT INTO turns (session_id, agent_id, message_id, ts, model, input, output,
-             cache_read, cache_write_5m, cache_write_1h, thinking)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
-         ON CONFLICT(message_id) WHERE message_id IS NOT NULL DO UPDATE SET
+             cache_read, cache_write_5m, cache_write_1h, thinking, provider)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+         ON CONFLICT(provider, message_id) WHERE message_id IS NOT NULL DO UPDATE SET
              input = excluded.input,
              output = excluded.output,
              cache_read = excluded.cache_read,
@@ -756,7 +804,8 @@ fn insert_turns_on(
             t.usage.cache_read as i64,
             t.usage.cache_write_5m as i64,
             t.usage.cache_write_1h as i64,
-            t.usage.thinking as i64
+            t.usage.thinking as i64,
+            provider
         ])?;
     }
     Ok(())
@@ -808,6 +857,7 @@ mod tests {
 
     fn session(id: &str, project_id: i64, offset: u64) -> SessionRecord {
         SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: id.to_string(),
             project_id,
             file_path: format!("/tmp/{id}.jsonl"),
@@ -1344,6 +1394,79 @@ mod tests {
         );
     }
 
+    /// A v4 index on disk, with a session and a response, reopened with this
+    /// code: everything stays, nothing is rescanned, and it all belongs to
+    /// Claude Code.
+    #[test]
+    fn the_v5_migration_marks_everything_claude_code_and_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("index.db");
+        {
+            let db = open(&p).unwrap();
+            let pid = db.upsert_project("-a-b", "/a/b", false).unwrap();
+            db.apply_scan(
+                &SessionRecord {
+                    indexed_offset: 777,
+                    ..session("s1", pid, 777)
+                },
+                &[Turn {
+                    message_id: Some("msg_1".into()),
+                    ts: 2,
+                    model: "m".into(),
+                    usage: TurnUsage {
+                        output: 5,
+                        ..TurnUsage::default()
+                    },
+                }],
+                false,
+            )
+            .unwrap();
+        }
+        {
+            // Back to v4's shape: no provider columns, one global response index.
+            let conn = Connection::open(&p).unwrap();
+            conn.execute_batch(
+                "DROP INDEX idx_turns_provider_message;
+                 DROP INDEX idx_sessions_provider;
+                 ALTER TABLE turns DROP COLUMN provider;
+                 ALTER TABLE sessions DROP COLUMN provider;
+                 CREATE UNIQUE INDEX idx_turns_message
+                     ON turns(message_id) WHERE message_id IS NOT NULL;
+                 PRAGMA user_version = 4;",
+            )
+            .unwrap();
+        }
+
+        let db = open(&p).unwrap();
+        assert_eq!(db.turn_count().unwrap(), 1, "no response is lost");
+        assert_eq!(
+            db.session_offset("s1").unwrap(),
+            777,
+            "nothing is rescanned"
+        );
+        let providers: Vec<String> = db
+            .conn()
+            .prepare("SELECT provider FROM sessions UNION ALL SELECT provider FROM turns")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(providers, ["claude-code", "claude-code"]);
+        let old_index: bool = db
+            .conn()
+            .prepare("SELECT 1 FROM sqlite_master WHERE name = 'idx_turns_message'")
+            .unwrap()
+            .exists([])
+            .unwrap();
+        assert!(!old_index, "the global response index is replaced");
+        drop(db);
+        assert!(
+            open_read_only(&p).is_ok(),
+            "the MCP server can read it again"
+        );
+    }
+
     #[test]
     fn the_v3_migration_adds_the_columns_without_touching_indexed_data() {
         // A v2-shaped database with real turns: unlike v2, this migration must
@@ -1351,6 +1474,7 @@ mod tests {
         let db = open_in_memory().unwrap();
         let pid = db.upsert_project("-a-b", "/a/b", false).unwrap();
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: "s1".into(),
             project_id: pid,
             file_path: "/tmp/s1.jsonl".into(),
@@ -1546,6 +1670,7 @@ mod tests {
         let db = open_in_memory().unwrap();
         let project_id = db.upsert_project("-a-b", "/a/b", false).unwrap();
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: id.into(),
             project_id,
             file_path: format!("/tmp/{id}.jsonl"),
@@ -1590,6 +1715,7 @@ mod tests {
     fn restarting_one_transcript_leaves_the_others_turns_alone() {
         let db = db_with_session("s1");
         let session = SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: "s1".into(),
             project_id: 1,
             file_path: "/tmp/s1.jsonl".into(),

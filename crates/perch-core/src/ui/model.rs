@@ -906,6 +906,7 @@ mod tests {
             .upsert_project("-Users-a-proj", "/Users/a/proj", false)
             .unwrap();
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: "a".into(),
             project_id: pid,
             file_path: "/tmp/a.jsonl".into(),
@@ -961,6 +962,7 @@ mod tests {
             .unwrap();
         for (id, last) in [("live", 9_000), ("gone", 8_000)] {
             db.upsert_session(&SessionRecord {
+                provider: crate::provider::CLAUDE_CODE.into(),
                 id: id.into(),
                 project_id: pid,
                 file_path: format!("/tmp/{id}.jsonl"),
@@ -1019,6 +1021,7 @@ mod tests {
                     .upsert_project("-Users-a-proj", "/Users/a/proj", false)
                     .unwrap();
                 db.upsert_session(&SessionRecord {
+                    provider: crate::provider::CLAUDE_CODE.into(),
                     id: "a".into(),
                     project_id: pid,
                     file_path: "/tmp/a.jsonl".into(),
@@ -1080,6 +1083,7 @@ mod tests {
                 .upsert_project("-Users-a-proj", "/Users/a/proj", false)
                 .unwrap();
             db.upsert_session(&SessionRecord {
+                provider: crate::provider::CLAUDE_CODE.into(),
                 id: session_id.into(),
                 project_id: pid,
                 file_path: format!("/tmp/{session_id}.jsonl"),
@@ -1127,6 +1131,7 @@ mod tests {
             .unwrap();
         for i in 0..10i64 {
             db.upsert_session(&SessionRecord {
+                provider: crate::provider::CLAUDE_CODE.into(),
                 id: format!("ended-{i}"),
                 project_id: pid,
                 file_path: format!("/tmp/ended-{i}.jsonl"),
@@ -1176,6 +1181,7 @@ mod tests {
             .upsert_project("-Users-a-proj", "/Users/a/proj", false)
             .unwrap();
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: "a".into(),
             project_id: pid,
             file_path: "/tmp/a.jsonl".into(),
@@ -1248,6 +1254,7 @@ mod tests {
             .upsert_project("-Users-a-proj", "/Users/a/proj", false)
             .unwrap();
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: "a".into(),
             project_id: pid,
             file_path: "/tmp/a.jsonl".into(),
@@ -1295,6 +1302,7 @@ mod tests {
             .upsert_project("-Users-a-proj", "/Users/a/proj", false)
             .unwrap();
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: "a".into(),
             project_id: pid,
             file_path: "/tmp/a.jsonl".into(),
@@ -1592,6 +1600,7 @@ mod title_tests {
     fn seed(db: &crate::db::Db, id: &str, cwd: &str, title: Option<&str>, last: i64) {
         let pid = db.upsert_project("-work-api", "/work/api", false).unwrap();
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: id.into(),
             project_id: pid,
             file_path: format!("/tmp/{id}.jsonl"),

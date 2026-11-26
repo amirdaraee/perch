@@ -507,6 +507,7 @@ mod tests {
     ) -> i64 {
         let pid = db.upsert_project(slug, path, false).unwrap();
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: sid.into(),
             project_id: pid,
             file_path: format!("/tmp/{sid}.jsonl"),
@@ -685,6 +686,7 @@ mod tests {
         // stays `None` for this project, and it must sort last within `Recent`.
         let recent_silent = db.upsert_project("-a-rs", "/a/rs", false).unwrap();
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: "s5".into(),
             project_id: recent_silent,
             file_path: "/tmp/s5.jsonl".into(),
@@ -791,6 +793,7 @@ mod tests {
         let now = 100 * DAY;
         let pid = project_with_session(&db, "-a-p", "/a/proj", "s1", now - 1000, 10);
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: "s2".into(),
             project_id: pid,
             file_path: "/tmp/s2.jsonl".into(),
@@ -835,6 +838,7 @@ mod tests {
         let now = 100 * DAY;
         let pid = project_with_session(&db, "-a-p", "/a/proj", "old", now - 5 * DAY, 1_000);
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: "livesess".into(),
             project_id: pid,
             file_path: "/tmp/l.jsonl".into(),
@@ -876,6 +880,7 @@ mod tests {
         let now = 100 * DAY;
         let pid = db.upsert_project("-a-p", "/a/proj", false).unwrap();
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: "6dda468e-ae88-443b-8bf0-4f97f745b455".into(),
             project_id: pid,
             file_path: "/tmp/s.jsonl".into(),
@@ -902,6 +907,7 @@ mod tests {
         let now = 100 * DAY;
         let pid = db.upsert_project("-a-p", "/a/proj", false).unwrap();
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: "6dda468e-ae88-443b-8bf0-4f97f745b455".into(),
             project_id: pid,
             file_path: "/tmp/s.jsonl".into(),
@@ -931,6 +937,7 @@ mod tests {
         let now = 100 * DAY;
         let pid = db.upsert_project("-a-p", "/a/proj", false).unwrap();
         db.upsert_session(&SessionRecord {
+            provider: crate::provider::CLAUDE_CODE.into(),
             id: "nodur".into(),
             project_id: pid,
             file_path: "/tmp/nodur.jsonl".into(),
