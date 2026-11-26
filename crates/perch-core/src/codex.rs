@@ -24,7 +24,7 @@ use crate::index::IndexStats;
 use crate::live::LiveSession;
 use crate::model::{SessionRecord, Turn, TurnUsage};
 use crate::platform::ProcessProbe;
-use crate::provider::{session_key, Capabilities, Provider};
+use crate::provider::{project_for, session_key, Capabilities, Provider};
 use anyhow::Result;
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
@@ -121,14 +121,6 @@ fn session_uuid(path: &Path) -> Option<String> {
     let stem = path.file_name()?.to_str()?.strip_suffix(".jsonl")?;
     let id = stem.get(stem.len().checked_sub(36)?..)?;
     (id.len() == 36 && id.bytes().filter(|&b| b == b'-').count() == 4).then(|| id.to_string())
-}
-
-/// Folder to project slug, the way Claude Code names its project folders, so
-/// a folder both tools work in is one project.
-fn slug_for(path: &str) -> String {
-    path.chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect()
 }
 
 fn ts_ms(v: &Value) -> Option<i64> {
@@ -314,13 +306,6 @@ fn read_thread_totals(db: &Path) -> Result<Vec<ThreadTotal>> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
-}
-
-fn project_for(db: &Db, cwd: &str) -> Result<i64> {
-    match db.project_at(cwd)? {
-        Some(id) => Ok(id),
-        None => db.upsert_project(&slug_for(cwd), cwd, false),
-    }
 }
 
 impl Provider for Codex {
@@ -731,7 +716,10 @@ mod tests {
             .upsert_project("-Users-a-my-app", "/Users/a/my.app", false)
             .unwrap();
         assert_eq!(project_for(&db, "/Users/a/my.app").unwrap(), claude);
-        assert_eq!(slug_for("/Users/a/my.app"), "-Users-a-my-app");
+        assert_eq!(
+            crate::provider::slug_for("/Users/a/my.app"),
+            "-Users-a-my-app"
+        );
     }
 
     #[test]

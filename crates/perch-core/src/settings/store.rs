@@ -257,6 +257,8 @@ launch_at_login = false
 claude_config_dir = ""
 # Also read OpenAI Codex's sessions from ~/.codex (or CODEX_HOME).
 read_codex = true
+# Also read OpenCode's sessions from ~/.local/share/opencode.
+read_opencode = true
 
 [menu_bar]
 # "icon" | "count" | "count-and-waiting"
@@ -390,6 +392,7 @@ pub fn save(path: &Path, s: &Settings) -> Result<()> {
     general["launch_at_login"] = value(s.launch_at_login);
     general["claude_config_dir"] = value(s.claude_config_dir.clone());
     general["read_codex"] = value(s.read_codex);
+    general["read_opencode"] = value(s.read_opencode);
 
     let menu_bar = ensure_table(&mut doc, "menu_bar");
     menu_bar["display"] = value(s.menu_bar_display.as_wire_str().to_string());
@@ -927,6 +930,7 @@ mod tests {
             launch_at_login: true,
             claude_config_dir: dir.path().to_string_lossy().into_owned(),
             read_codex: false,
+            read_opencode: false,
             menu_bar_display: MenuBarDisplay::CountAndWaiting,
             menu_bar_icon: MenuBarIcon::Binoculars,
             dim_when_stale: false,

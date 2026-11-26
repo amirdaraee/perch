@@ -269,6 +269,8 @@ pub struct Settings {
     pub claude_config_dir: String,
     /// Also read OpenAI Codex's sessions, when it is installed.
     pub read_codex: bool,
+    /// Also read OpenCode's sessions, when it is installed.
+    pub read_opencode: bool,
     pub menu_bar_display: MenuBarDisplay,
     pub menu_bar_icon: MenuBarIcon,
     /// Dim the status item once the index has not been refreshed for
@@ -320,6 +322,7 @@ impl Default for Settings {
             launch_at_login: false,
             claude_config_dir: String::new(),
             read_codex: true,
+            read_opencode: true,
             menu_bar_display: MenuBarDisplay::Count,
             // What `StatusItemController` hardcodes today.
             menu_bar_icon: MenuBarIcon::Bird,
@@ -492,6 +495,7 @@ struct GeneralSection {
     launch_at_login: bool,
     claude_config_dir: String,
     read_codex: bool,
+    read_opencode: bool,
 }
 
 impl Default for GeneralSection {
@@ -501,6 +505,7 @@ impl Default for GeneralSection {
             launch_at_login: d.launch_at_login,
             claude_config_dir: d.claude_config_dir,
             read_codex: d.read_codex,
+            read_opencode: d.read_opencode,
         }
     }
 }
@@ -656,6 +661,7 @@ impl From<Settings> for SettingsFile {
                 launch_at_login: s.launch_at_login,
                 claude_config_dir: s.claude_config_dir,
                 read_codex: s.read_codex,
+                read_opencode: s.read_opencode,
             },
             menu_bar: MenuBarSection {
                 display: s.menu_bar_display,
@@ -704,6 +710,7 @@ impl From<SettingsFile> for Settings {
             launch_at_login: f.general.launch_at_login,
             claude_config_dir: f.general.claude_config_dir,
             read_codex: f.general.read_codex,
+            read_opencode: f.general.read_opencode,
             menu_bar_display: f.menu_bar.display,
             menu_bar_icon: f.menu_bar.icon,
             dim_when_stale: f.menu_bar.dim_when_stale,

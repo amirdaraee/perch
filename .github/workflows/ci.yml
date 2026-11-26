@@ -188,12 +188,14 @@ jobs:
           # below use `-path` (the full path from the repo root) rather than
           # `-name` (the basename alone) — `-name 'db.rs'` or `-name
           # 'store.rs'` would silently exclude *any* file with that basename
-          # anywhere under the tree, not just these two exact files. Copy this
+          # anywhere under the tree, not just these two exact files. A third,
+          # snapshot.rs, copies another tool's live database into Perch's own
+          # data folder so that tool's folder is only ever read. Copy this
           # `-path`, not `-name`, if a third file ever needs excluding here.
           # Nothing under crates/perch-ffi/src or crates/perch-mcp/src is
           # excluded — neither performs a write of its own (both delegate to
           # perch-core), so every module in them is audited alike.
-          WRITES='fs::write|fs::remove_file|fs::remove_dir|File::create|OpenOptions'
+          WRITES='fs::write|fs::copy|fs::rename|fs::remove_file|fs::remove_dir|File::create|OpenOptions'
           FFI_SRC_DIR=crates/perch-ffi/src
           # perch-mcp reads the index read-only and answers on stdout; nothing
           # in it has any business writing a file, so nothing is excluded.
@@ -293,7 +295,8 @@ jobs:
           offenders=0
           for f in $(find crates/perch-core/src -name '*.rs' \
                        ! -path 'crates/perch-core/src/db.rs' \
-                       ! -path 'crates/perch-core/src/settings/store.rs') \
+                       ! -path 'crates/perch-core/src/settings/store.rs' \
+                       ! -path 'crates/perch-core/src/snapshot.rs') \
                    $(find "$FFI_SRC_DIR" -name '*.rs') \
                    $(find "$MCP_SRC_DIR" -name '*.rs'); do
             if prod "$f" | grep -E "$WRITES"; then
@@ -305,7 +308,7 @@ jobs:
             exit 1
           fi
 
-          echo "no filesystem writes found in perch-core (db.rs and settings/store.rs excluded), $FFI_SRC_DIR, or $MCP_SRC_DIR (nothing excluded)"
+          echo "no filesystem writes found in perch-core (db.rs, settings/store.rs and snapshot.rs excluded), $FFI_SRC_DIR, or $MCP_SRC_DIR (nothing excluded)"
 
       - name: Assert forbidden crates are unreachable in the resolved dependency graph
         run: |

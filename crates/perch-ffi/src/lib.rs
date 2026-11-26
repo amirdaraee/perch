@@ -1360,6 +1360,7 @@ pub enum SettingKey {
     ActiveWithinDays,
     ShowArchived,
     ReadCodex,
+    ReadOpenCode,
     ChartDays,
     TopProjectsCount,
     TopProjectsDays,
@@ -1393,6 +1394,7 @@ impl From<settings::SettingKey> for SettingKey {
             settings::SettingKey::ActiveWithinDays => SettingKey::ActiveWithinDays,
             settings::SettingKey::ShowArchived => SettingKey::ShowArchived,
             settings::SettingKey::ReadCodex => SettingKey::ReadCodex,
+            settings::SettingKey::ReadOpenCode => SettingKey::ReadOpenCode,
             settings::SettingKey::ChartDays => SettingKey::ChartDays,
             settings::SettingKey::TopProjectsCount => SettingKey::TopProjectsCount,
             settings::SettingKey::TopProjectsDays => SettingKey::TopProjectsDays,
@@ -1428,6 +1430,7 @@ impl From<SettingKey> for settings::SettingKey {
             SettingKey::ActiveWithinDays => settings::SettingKey::ActiveWithinDays,
             SettingKey::ShowArchived => settings::SettingKey::ShowArchived,
             SettingKey::ReadCodex => settings::SettingKey::ReadCodex,
+            SettingKey::ReadOpenCode => settings::SettingKey::ReadOpenCode,
             SettingKey::ChartDays => settings::SettingKey::ChartDays,
             SettingKey::TopProjectsCount => settings::SettingKey::TopProjectsCount,
             SettingKey::TopProjectsDays => settings::SettingKey::TopProjectsDays,
@@ -1980,12 +1983,22 @@ pub trait PerchListener: Send + Sync {
 }
 
 /// The tools Perch reads, in the order their sessions are listed: Claude
-/// Code always, Codex unless the settings turn it off.
-fn providers_for(config_dir: &std::path::Path, read_codex: bool) -> Vec<Box<dyn Provider>> {
+/// Code always, the others unless the settings turn them off.
+fn providers_for(
+    config_dir: &std::path::Path,
+    s: Option<&settings::Settings>,
+) -> Vec<Box<dyn Provider>> {
     let mut out: Vec<Box<dyn Provider>> = vec![Box::new(ClaudeCode::new(config_dir))];
-    if read_codex {
+    let Some(s) = s else { return out };
+    if s.read_codex {
         if let Some(home) = perch_core::codex::codex_home() {
             out.push(Box::new(perch_core::codex::Codex::new(home)));
+        }
+    }
+    if s.read_opencode {
+        let cache = settings::store::app_data_dir().map(|d| d.join("providers").join("opencode"));
+        if let (Some(home), Ok(cache)) = (perch_core::opencode::opencode_home(), cache) {
+            out.push(Box::new(perch_core::opencode::OpenCode::new(home, cache)));
         }
     }
     out
@@ -1999,13 +2012,19 @@ fn provider_of_session(config_dir: &std::path::Path, session_id: &str) -> Box<dy
             return Box::new(perch_core::codex::Codex::new(home));
         }
     }
+    if session_id.starts_with(&format!("{}:", perch_core::opencode::OPENCODE)) {
+        if let Some(home) = perch_core::opencode::opencode_home() {
+            // Resume needs no copy, so no cache folder either.
+            return Box::new(perch_core::opencode::OpenCode::new(home, PathBuf::new()));
+        }
+    }
     Box::new(ClaudeCode::new(config_dir))
 }
 
-/// Every provider's running sessions right now. Codex can't say what's
-/// running, so its setting makes no difference here.
+/// Every provider's running sessions right now. Only Claude Code can say
+/// what's running, so the other tools' settings make no difference here.
 fn live_now(config_dir: &std::path::Path) -> Vec<live::LiveSession> {
-    let providers = providers_for(config_dir, false);
+    let providers = providers_for(config_dir, None);
     let providers: Vec<&dyn Provider> = providers.iter().map(|p| p.as_ref()).collect();
     provider::live_sessions(&providers, &RealProcessProbe)
 }
@@ -2227,8 +2246,8 @@ impl ThisPerch {
                 db::open(&self.db_path).map_err(|e| format!("could not open index: {e}"))?;
             pricing::seed_default_prices(&database)
                 .map_err(|e| format!("could not seed prices: {e}"))?;
-            let read_codex = settings::store::load(&self.config_path).settings.read_codex;
-            let providers = providers_for(&self.config_dir(), read_codex);
+            let loaded = settings::store::load(&self.config_path).settings;
+            let providers = providers_for(&self.config_dir(), Some(&loaded));
             let providers: Vec<&dyn Provider> = providers.iter().map(|p| p.as_ref()).collect();
             provider::index_all(&database, &providers)
                 .map_err(|e| format!("could not index sessions: {e}"))?;
@@ -2854,7 +2873,7 @@ impl Perch {
 
     /// Put every setting back to its factory value.
     ///
-    /// One write of one whole `Settings`, not twenty-eight writes: a reset
+    /// One write of one whole `Settings`, not twenty-nine writes: a reset
     /// that failed halfway would leave a configuration that is neither what
     /// Perch ships nor what the user chose, which is worse than not
     /// resetting at all. Reports the schema that resulted, exactly as
@@ -3379,6 +3398,7 @@ mod tests {
             // Never the developer's own Codex sessions: a folder that
             // doesn't exist reads as Codex not being installed.
             std::env::set_var("CODEX_HOME", dir.join("no-codex"));
+            std::env::set_var("XDG_DATA_HOME", dir.join("no-xdg"));
             Self { _lock: lock }
         }
     }
@@ -3387,6 +3407,7 @@ mod tests {
         fn drop(&mut self) {
             std::env::remove_var("PERCH_DATA_DIR");
             std::env::remove_var("CODEX_HOME");
+            std::env::remove_var("XDG_DATA_HOME");
         }
     }
 
@@ -4732,7 +4753,7 @@ mod tests {
     const UNSEEN_TERMINAL: &str = "Perch Test Terminal";
 
     /// Every key, as the boundary spells them. Taken from core's own list
-    /// rather than restated here, so a twenty-eighth setting joins these
+    /// rather than restated here, so a twenty-nineh setting joins these
     /// tests by existing.
     fn all_keys() -> Vec<SettingKey> {
         settings::SettingKey::ALL
@@ -4963,7 +4984,7 @@ mod tests {
             .unwrap();
     }
 
-    /// **The test that matters most.** Every one of the twenty-eight keys,
+    /// **The test that matters most.** Every one of the twenty-nine keys,
     /// written through the FFI with a value of its own shape, read back from
     /// the schema the write returned, and then read again through a *second*
     /// `Perch` built over the same `config.toml` — which shares nothing with
@@ -5018,7 +5039,7 @@ mod tests {
         }
         assert_eq!(
             written.len(),
-            28,
+            29,
             "a key was added without joining this loop"
         );
     }
@@ -5190,7 +5211,7 @@ mod tests {
         let factory_panes = p.reset_all_settings().unwrap().panes;
         let factory = schema_values(&factory_panes);
         let home = pane_of_each_key(&factory_panes);
-        assert_eq!(home.len(), 28, "a key is drawn by no pane");
+        assert_eq!(home.len(), 29, "a key is drawn by no pane");
 
         let drift: Vec<(SettingKey, SettingValue)> = all_keys()
             .into_iter()
@@ -5419,7 +5440,7 @@ mod tests {
         );
     }
 
-    /// Reset-all is about the twenty-eight settings and nothing else. The index,
+    /// Reset-all is about the twenty-nine settings and nothing else. The index,
     /// the notes a user typed against their projects and the rates they
     /// entered all live elsewhere and must survive it — a "reset settings"
     /// that quietly emptied the index would be unrecoverable.

@@ -122,6 +122,11 @@ wasn't: no such process, that pid isn't `claude`, or the record wouldn't parse.
   a dependency, so those show their total tokens only, with no cost. Codex
   doesn't say what's running, so it never appears as waiting. Turn it off in
   Settings → General.
+* **OpenCode sessions count too.** OpenCode keeps a live database, and opening
+  it could touch its files, so Perch copies it into its own folder whenever it
+  changes and reads the copy. It reads each session's totals only, counted on
+  the day the session was last used, and never the messages or the saved
+  logins in that database. OpenCode can use any model, so many show "no price".
 * **The fullscreen behaviour is right by construction, not by testing.** A
   tracked `NSMenu` is the documented way to stay visible over a fullscreen app,
   and two spikes confirmed the alternatives don't work. Nobody has actually

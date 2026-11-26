@@ -148,7 +148,7 @@ pub fn build_advanced(
                        your Claude Code folder; nothing in it is changed."
             .to_string(),
         reset_warning: format!(
-            "This puts all twenty-eight settings back to their factory values by rewriting {}, \
+            "This puts all twenty-nine settings back to their factory values by rewriting {}, \
              including anything you edited there by hand. Your index, your project notes and \
              your model prices are left alone.",
             config_path.display()

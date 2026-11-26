@@ -41,6 +41,22 @@ pub fn session_key(provider: &str, raw_id: &str) -> String {
     }
 }
 
+/// Folder to project slug, the way Claude Code names its project folders, so
+/// a folder several tools work in is one project.
+pub(crate) fn slug_for(path: &str) -> String {
+    path.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// The project at `cwd`, whichever tool found it first, or a new one.
+pub(crate) fn project_for(db: &Db, cwd: &str) -> Result<i64> {
+    match db.project_at(cwd)? {
+        Some(id) => Ok(id),
+        None => db.upsert_project(&slug_for(cwd), cwd, false),
+    }
+}
+
 /// What a tool can tell Perch. The UI leaves out whatever is `false` rather
 /// than showing a placeholder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
