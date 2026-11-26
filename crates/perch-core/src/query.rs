@@ -595,6 +595,16 @@ pub struct DayUsage {
     pub usage: TurnUsage,
     pub cost_usd: f64,
     pub unpriced_tokens: u64,
+    /// The same day split by model, for charts stacked by model.
+    pub by_model: Vec<ModelDay>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelDay {
+    pub model: String,
+    pub usage: TurnUsage,
+    /// `None` when the model has no price.
+    pub cost_usd: Option<f64>,
 }
 
 /// A `WITH` clause naming the window's days, so one query can group by them.
@@ -684,8 +694,15 @@ pub(crate) fn daily_usage_in<Tz: chrono::TimeZone>(
         .zip(slots)
         .map(|(day, slot)| {
             let mut spend = Spend::default();
-            for (model, usage) in &slot.by_model {
-                spend.add(db, model, usage)?;
+            let mut by_model = Vec::with_capacity(slot.by_model.len());
+            for (model, usage) in slot.by_model {
+                spend.add(db, &model, &usage)?;
+                let cost_usd = price_for(db, &model)?.map(|p| cost_usd(&p, &usage));
+                by_model.push(ModelDay {
+                    model,
+                    usage,
+                    cost_usd,
+                });
             }
             Ok(DayUsage {
                 date: day.date,
@@ -694,6 +711,7 @@ pub(crate) fn daily_usage_in<Tz: chrono::TimeZone>(
                 usage: spend.usage,
                 cost_usd: spend.cost_usd,
                 unpriced_tokens: spend.unpriced_tokens,
+                by_model,
             })
         })
         .collect()

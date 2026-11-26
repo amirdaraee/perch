@@ -4,9 +4,9 @@
 use perch_core::db::Db;
 use perch_core::platform::RealProcessProbe;
 use perch_core::ui::{
-    advanced as core_advanced, diagnostics as core_diagnostics, heatmap as core_heatmap,
-    main_window, model as core_model, prices as core_prices, session_menu as core_session_menu,
-    settings as core_ui_settings, usage as core_usage, watcher,
+    advanced as core_advanced, daily_chart as core_daily_chart, diagnostics as core_diagnostics,
+    heatmap as core_heatmap, main_window, model as core_model, prices as core_prices,
+    session_menu as core_session_menu, settings as core_ui_settings, usage as core_usage, watcher,
 };
 use perch_core::{config, db, discovery, index, live, notify, pricing, query, settings, terminals};
 use std::collections::{HashMap, HashSet};
@@ -623,17 +623,70 @@ pub struct HeroStat {
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
-pub struct DailyBar {
-    pub day_index: i32,
+pub struct UsageChart {
+    pub title: String,
+    pub days: Vec<ChartDay>,
+    pub series: Vec<ChartSeries>,
+    pub measures: Vec<ChartMeasure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Record)]
+pub struct ChartDay {
+    pub index: u32,
+    pub axis_label: Option<String>,
+    pub is_today: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Record)]
+pub struct ChartSeries {
+    pub name: String,
+    pub colour: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, uniffi::Enum)]
+pub enum MeasureKind {
+    Spend,
+    OutputTokens,
+    AllTokens,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct ChartMeasure {
+    pub kind: MeasureKind,
+    pub title: String,
+    pub caption: String,
+    pub y_max: f64,
+    pub ticks: Vec<ChartTick>,
+    pub segments: Vec<ChartSegment>,
+    pub tooltips: Vec<DayTooltip>,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct ChartTick {
+    pub value: f64,
     pub label: String,
-    pub input: u64,
-    pub output: u64,
-    pub cache_read: u64,
-    pub cache_write: u64,
-    pub thinking: u64,
-    pub total_label: String,
-    pub spend: f64,
-    pub spend_label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct ChartSegment {
+    pub day: u32,
+    pub series: u32,
+    pub start: f64,
+    pub end: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Record)]
+pub struct DayTooltip {
+    pub title: String,
+    pub total: String,
+    pub lines: Vec<TooltipLine>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Record)]
+pub struct TooltipLine {
+    pub series: u32,
+    pub label: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -647,6 +700,7 @@ pub struct RankedProject {
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct ModelUsage {
     pub model: String,
+    pub colour: u8,
     pub tokens: u64,
     pub tokens_label: String,
     pub cost: String,
@@ -655,9 +709,8 @@ pub struct ModelUsage {
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct UsageModel {
     pub hero: Vec<HeroStat>,
-    pub chart_title: String,
-    pub spend_caption: String,
-    pub daily: Vec<DailyBar>,
+    pub chart: UsageChart,
+    pub top_projects_title: String,
     pub top_projects: Vec<RankedProject>,
     pub by_model: Vec<ModelUsage>,
     pub burn_rate: Option<String>,
@@ -819,31 +872,106 @@ impl From<core_usage::HeroStat> for HeroStat {
     }
 }
 
-impl From<core_usage::DailyBar> for DailyBar {
-    fn from(b: core_usage::DailyBar) -> Self {
-        let core_usage::DailyBar {
-            day_index,
-            label,
-            input,
-            output,
-            cache_read,
-            cache_write,
-            thinking,
-            total_label,
-            spend,
-            spend_label,
-        } = b;
-        DailyBar {
-            day_index,
-            label,
-            input,
-            output,
-            cache_read,
-            cache_write,
-            thinking,
-            total_label,
-            spend,
-            spend_label,
+impl From<core_daily_chart::UsageChart> for UsageChart {
+    fn from(c: core_daily_chart::UsageChart) -> Self {
+        let core_daily_chart::UsageChart {
+            title,
+            days,
+            series,
+            measures,
+        } = c;
+        UsageChart {
+            title,
+            days: days
+                .into_iter()
+                .map(
+                    |core_daily_chart::ChartDay {
+                         index,
+                         axis_label,
+                         is_today,
+                     }| ChartDay {
+                        index,
+                        axis_label,
+                        is_today,
+                    },
+                )
+                .collect(),
+            series: series
+                .into_iter()
+                .map(|core_daily_chart::ChartSeries { name, colour }| ChartSeries { name, colour })
+                .collect(),
+            measures: measures.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<core_daily_chart::ChartMeasure> for ChartMeasure {
+    fn from(m: core_daily_chart::ChartMeasure) -> Self {
+        let core_daily_chart::ChartMeasure {
+            kind,
+            title,
+            caption,
+            y_max,
+            ticks,
+            segments,
+            tooltips,
+        } = m;
+        ChartMeasure {
+            kind: match kind {
+                core_daily_chart::MeasureKind::Spend => MeasureKind::Spend,
+                core_daily_chart::MeasureKind::OutputTokens => MeasureKind::OutputTokens,
+                core_daily_chart::MeasureKind::AllTokens => MeasureKind::AllTokens,
+            },
+            title,
+            caption,
+            y_max,
+            ticks: ticks
+                .into_iter()
+                .map(|core_daily_chart::ChartTick { value, label }| ChartTick { value, label })
+                .collect(),
+            segments: segments
+                .into_iter()
+                .map(
+                    |core_daily_chart::ChartSegment {
+                         day,
+                         series,
+                         start,
+                         end,
+                     }| ChartSegment {
+                        day,
+                        series,
+                        start,
+                        end,
+                    },
+                )
+                .collect(),
+            tooltips: tooltips
+                .into_iter()
+                .map(
+                    |core_daily_chart::DayTooltip {
+                         title,
+                         total,
+                         lines,
+                     }| DayTooltip {
+                        title,
+                        total,
+                        lines: lines
+                            .into_iter()
+                            .map(
+                                |core_daily_chart::TooltipLine {
+                                     series,
+                                     label,
+                                     value,
+                                 }| TooltipLine {
+                                    series,
+                                    label,
+                                    value,
+                                },
+                            )
+                            .collect(),
+                    },
+                )
+                .collect(),
         }
     }
 }
@@ -869,12 +997,14 @@ impl From<core_usage::ModelUsage> for ModelUsage {
     fn from(m: core_usage::ModelUsage) -> Self {
         let core_usage::ModelUsage {
             model,
+            colour,
             tokens,
             tokens_label,
             cost,
         } = m;
         ModelUsage {
             model,
+            colour,
             tokens,
             tokens_label,
             cost,
@@ -886,9 +1016,8 @@ impl From<core_usage::UsageModel> for UsageModel {
     fn from(m: core_usage::UsageModel) -> Self {
         let core_usage::UsageModel {
             hero,
-            chart_title,
-            spend_caption,
-            daily,
+            chart,
+            top_projects_title,
             top_projects,
             by_model,
             burn_rate,
@@ -897,9 +1026,8 @@ impl From<core_usage::UsageModel> for UsageModel {
         } = m;
         UsageModel {
             hero: hero.into_iter().map(Into::into).collect(),
-            chart_title,
-            spend_caption,
-            daily: daily.into_iter().map(Into::into).collect(),
+            chart: chart.into(),
+            top_projects_title,
             top_projects: top_projects.into_iter().map(Into::into).collect(),
             by_model: by_model.into_iter().map(Into::into).collect(),
             burn_rate,
@@ -3459,7 +3587,7 @@ mod tests {
         let u = perch.usage().unwrap();
         assert!(!u.has_data);
         assert_eq!(
-            u.daily.len(),
+            u.chart.days.len(),
             14,
             "the chart window is drawn even when empty"
         );

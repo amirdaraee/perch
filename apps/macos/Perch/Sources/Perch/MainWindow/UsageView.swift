@@ -2,19 +2,20 @@ import SwiftUI
 import Charts
 import PerchFFI
 
-/// The Usage tab: hero stats with an optional burn-rate line, 14 days of
-/// token-class stacked bars, a 30-day top-projects ranking, and a per-model
-/// breakdown. Every displayed string is already finished on
-/// `UsageModel` — `stat.value`, `stat.caption`, `bar.totalLabel`,
-/// `p.tokensLabel`, `p.cost`, `m.tokens`, `m.cost`, `burnRate` — this view
-/// only lays out, colours, and (for the daily chart) plots the numeric
-/// fields Swift Charts needs to scale. It never formats a number, a
-/// duration, or a currency itself.
+/// The Usage tab: hero stats with an optional burn-rate line, a daily chart
+/// stacked by model, the top projects, and a per-model breakdown. Every
+/// displayed string, tick label and tooltip line is finished in Rust; this
+/// view lays them out, colours them and places the numbers Swift Charts needs
+/// to scale. It never formats a number, a duration or a currency itself.
 struct UsageView: View {
     let engine: PerchEngine
 
     @State private var model: UsageModel?
     @State private var error: String?
+    /// The measure the person picked; `nil` means the model's default.
+    @State private var measureKind: MeasureKind?
+    /// The day under the pointer.
+    @State private var hoveredDay: UInt32?
 
     var body: some View {
         ScrollView {
@@ -92,149 +93,166 @@ struct UsageView: View {
         }
     }
 
-    // MARK: - Daily stacked bars
+    // MARK: - Daily chart
+
+    private func measure(_ chart: UsageChart) -> ChartMeasure? {
+        chart.measures.first { $0.kind == measureKind } ?? chart.measures.first
+    }
 
     @ViewBuilder
     private func dailyBlock(_ model: UsageModel) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(model.chartTitle).font(.caption2).foregroundStyle(.secondary).textCase(.uppercase)
-            if model.daily.isEmpty {
-                Text("No daily usage yet").foregroundStyle(.secondary)
-            } else {
-                dailyChart(model.daily)
-            }
-        }
-    }
-
-    /// One `BarMark` per non-zero token class per day, explicitly stacked
-    /// via `yStart`/`yEnd` (rather than `foregroundStyle(by:)`'s automatic
-    /// stacking) so a small ~2pt gap can be carved out of each internal
-    /// boundary per the spec's stacked-segment rule. `foregroundStyle(by:)`
-    /// still drives the colour and the legend — only the geometry is manual.
-    private func dailyChart(_ daily: [DailyBar]) -> some View {
-        let segments = dailySegments(daily)
-        let yMax = daily.map(dailyTotal).max() ?? 0
-        // The gap is carved out of data units, sized from an *estimate* of
-        // the plot area's pixel height inside the fixed frame below (chart
-        // height minus Charts' own axis/padding reservation). Not pixel-
-        // exact — Swift Charts doesn't expose the realized plot rect before
-        // layout — but close enough to read as a deliberate ~2pt seam
-        // rather than a hairline rounding error.
-        let estimatedPlotHeight: Double = 190
-        let gapValue = yMax > 0 ? (Double(yMax) / estimatedPlotHeight) * 2 : 0
-
-        return Chart(segments) { segment in
-            BarMark(
-                x: .value("Day", segment.dayIndex),
-                yStart: .value("Tokens", segment.yStart(gap: gapValue)),
-                yEnd: .value("Tokens", segment.yEnd(gap: gapValue))
-            )
-            .foregroundStyle(by: .value("Class", segment.classLabel))
-            .accessibilityLabel("\(segment.dayLabel), \(segment.classLabel)")
-            .annotation(position: .top, alignment: .center, spacing: 2) {
-                // `totalLabel` is Rust's finished string; shown once per
-                // day, above its topmost rendered segment.
-                if segment.isLast {
-                    Text(segment.totalLabel)
-                        .font(.system(size: 9))
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
+        let chart = model.chart
+        if let current = measure(chart) {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(chart.title).font(.caption2).foregroundStyle(.secondary).textCase(.uppercase)
+                    Spacer(minLength: 12)
+                    if chart.measures.count > 1 {
+                        Picker("", selection: Binding(
+                            get: { current.kind },
+                            set: { measureKind = $0 }
+                        )) {
+                            ForEach(chart.measures, id: \.kind) { m in
+                                Text(m.title).tag(m.kind)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
                         .fixedSize()
+                    }
                 }
+                Text(current.caption).font(.caption).foregroundStyle(.secondary)
+                dailyChart(chart, current)
+                legend(chart)
             }
         }
-        // Fixed hue order, pinned explicitly rather than left to plotting
-        // order — a legend with direct labels is always shown alongside.
-        .chartForegroundStyleScale(
-            domain: PerchChartPalette.order.map(\.label),
-            range: PerchChartPalette.order.map(\.color)
-        )
-        .chartLegend(position: .bottom, spacing: 12)
-        .chartXAxis {
-            AxisMarks(values: axisDayIndices(daily)) { value in
-                AxisTick()
-                if let day = value.as(Int32.self), let label = dayLabel(for: day, in: daily) {
-                    AxisValueLabel(label)
-                }
-            }
-        }
-        // No axis-drawn numbers: Charts' default y-axis labels would format
-        // a raw token count itself, which Swift must never do. Recessive
-        // grid lines only, no value labels, no dollars on this or any
-        // second axis.
-        .chartYAxis {
-            AxisMarks(position: .leading) { _ in
-                AxisGridLine().foregroundStyle(Color.secondary.opacity(0.15))
-            }
-        }
-        .chartYScale(domain: 0...max(Double(yMax), 1))
-        .frame(height: 220)
     }
 
-    /// Four classes only — matches `TurnUsage::total_tokens()` and
-    /// `bar.totalLabel`, both of which exclude thinking as a subset of
-    /// output. The stacked bar's height must equal the labelled total.
-    private func dailyTotal(_ bar: DailyBar) -> UInt64 {
-        bar.input + bar.output + bar.cacheRead + bar.cacheWrite
-    }
-
-    private func dailySegments(_ daily: [DailyBar]) -> [DailySegment] {
-        daily.flatMap { bar -> [DailySegment] in
-            var cumulative: UInt64 = 0
-            var rendered: [(label: String, start: UInt64, end: UInt64)] = []
-            for entry in PerchChartPalette.order {
-                let value = classValue(entry.key, in: bar)
-                guard value > 0 else { continue }
-                rendered.append((entry.label, cumulative, cumulative + value))
-                cumulative += value
-            }
-            // The stacked height must equal the number `totalLabel` was
-            // rendered from — this is exactly the double-counting bug the
-            // four-class fix above closes (thinking used to push `cumulative`
-            // past `dailyTotal(bar)`, so the bar drew taller than its own
-            // annotation).
-            assert(
-                cumulative == dailyTotal(bar),
-                "stacked bar height (\(cumulative)) must equal the labelled total (\(dailyTotal(bar)))"
-            )
-            return rendered.enumerated().map { index, seg in
-                DailySegment(
-                    dayIndex: bar.dayIndex,
-                    dayLabel: bar.label,
-                    classLabel: seg.label,
-                    totalLabel: bar.totalLabel,
-                    start: seg.start,
-                    end: seg.end,
-                    isFirst: index == 0,
-                    isLast: index == rendered.count - 1
+    private func dailyChart(_ chart: UsageChart, _ m: ChartMeasure) -> some View {
+        let keys = chart.days.map { String($0.index) }
+        let today = chart.days.first(where: \.isToday).map { String($0.index) }
+        let active = Set(m.segments.map(\.day))
+        // A 2pt seam between stacked layers, in data units, from an estimate
+        // of the plot's height inside the frame below.
+        let seam = m.yMax / 190 * 2
+        return Chart {
+            ForEach(Array(m.segments.enumerated()), id: \.offset) { _, seg in
+                let isTop = !m.segments.contains { $0.day == seg.day && $0.start > seg.start }
+                BarMark(
+                    x: .value("Day", String(seg.day)),
+                    yStart: .value("Value", seg.start + (seg.start > 0 ? seam / 2 : 0)),
+                    yEnd: .value("Value", max(seg.end - (isTop ? 0 : seam / 2), seg.start + (seg.start > 0 ? seam / 2 : 0))),
+                    width: .ratio(0.72)
                 )
+                .foregroundStyle(seriesColour(chart, seg.series))
+                .opacity(String(seg.day) == today ? 0.5 : 1)
+            }
+            // A quiet day gets a dot on the baseline, so a gap reads as
+            // "nothing happened" rather than as missing data.
+            ForEach(chart.days.filter { !active.contains($0.index) }, id: \.index) { day in
+                PointMark(x: .value("Day", String(day.index)), y: .value("Value", 0))
+                    .symbolSize(10)
+                    .foregroundStyle(Color.secondary.opacity(0.45))
+            }
+            if let hoveredDay {
+                RuleMark(x: .value("Day", String(hoveredDay)))
+                    .foregroundStyle(Color.secondary.opacity(0.35))
+                    .lineStyle(StrokeStyle(lineWidth: 1))
+                    .annotation(
+                        position: .top,
+                        spacing: 4,
+                        overflowResolution: .init(x: .fit(to: .chart), y: .fit(to: .chart))
+                    ) {
+                        if Int(hoveredDay) < m.tooltips.count {
+                            tooltip(chart, m.tooltips[Int(hoveredDay)])
+                        }
+                    }
+            }
+            PerchChartBaseline()
+        }
+        .chartXScale(domain: keys)
+        .chartXAxis {
+            AxisMarks(values: chart.days.filter { $0.axisLabel != nil }.map { String($0.index) }) { value in
+                AxisTick()
+                if let key = value.as(String.self), let day = chart.days.first(where: { String($0.index) == key }),
+                   let label = day.axisLabel {
+                    // The last label ends at its tick, so it never runs off
+                    // the chart's trailing edge.
+                    AxisValueLabel(anchor: day.index + 1 == UInt32(chart.days.count) ? .topTrailing : .top) {
+                        Text(label).fixedSize()
+                    }
+                }
             }
         }
-    }
-
-    /// Mapped by typed key, not display string — a typo in a string literal
-    /// would silently yield 0 for a whole class. (Moving the labels
-    /// themselves into Rust, so Swift never reinvents them, is backlogged.)
-    private func classValue(_ key: PerchTokenClass, in bar: DailyBar) -> UInt64 {
-        switch key {
-        case .input: return bar.input
-        case .output: return bar.output
-        case .cacheRead: return bar.cacheRead
-        case .cacheWrite: return bar.cacheWrite
+        .chartYScale(domain: 0...max(m.yMax, 1))
+        .chartYAxis {
+            AxisMarks(position: .leading, values: m.ticks.map(\.value)) { value in
+                AxisGridLine().foregroundStyle(Color.secondary.opacity(0.15))
+                if let v = value.as(Double.self), let tick = m.ticks.first(where: { $0.value == v }) {
+                    AxisValueLabel { Text(tick.label).monospacedDigit() }
+                }
+            }
         }
+        .chartOverlay { proxy in
+            GeometryReader { geo in
+                Rectangle().fill(.clear).contentShape(Rectangle())
+                    .onContinuousHover { phase in
+                        switch phase {
+                        case .active(let point):
+                            guard let frame = proxy.plotFrame else { return }
+                            let x = point.x - geo[frame].origin.x
+                            if let key: String = proxy.value(atX: x), let day = UInt32(key) {
+                                hoveredDay = day
+                            }
+                        case .ended:
+                            hoveredDay = nil
+                        }
+                    }
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(m.caption)
+        .accessibilityValue(m.tooltips.map { "\($0.title): \($0.total)" }.joined(separator: "; "))
+        .frame(height: 230)
     }
 
-    /// First, middle, and last day of the window — enough for context
-    /// without crowding the axis with all 14 labels.
-    private func axisDayIndices(_ daily: [DailyBar]) -> [Int32] {
-        let days = daily.map(\.dayIndex).sorted()
-        guard let first = days.first, let last = days.last else { return [] }
-        guard days.count > 2 else { return days }
-        return [first, days[days.count / 2], last]
+    private func seriesColour(_ chart: UsageChart, _ series: UInt32) -> Color {
+        let i = Int(series)
+        return PerchModelPalette.color(i < chart.series.count ? chart.series[i].colour : 255)
     }
 
-    private func dayLabel(for dayIndex: Int32, in daily: [DailyBar]) -> String? {
-        daily.first { $0.dayIndex == dayIndex }?.label
+    private func tooltip(_ chart: UsageChart, _ t: DayTooltip) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(t.title).font(.caption.weight(.semibold))
+            Text(t.total).font(.caption).monospacedDigit()
+            ForEach(t.lines, id: \.self) { line in
+                HStack(spacing: 6) {
+                    RoundedRectangle(cornerRadius: 2).fill(seriesColour(chart, line.series)).frame(width: 8, height: 8)
+                    Text(line.label).font(.caption2)
+                    Spacer(minLength: 8)
+                    Text(line.value).font(.caption2).monospacedDigit().foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(8)
+        .frame(minWidth: 160, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color(nsColor: .separatorColor)))
+        .fixedSize()
+    }
+
+    @ViewBuilder
+    private func legend(_ chart: UsageChart) -> some View {
+        if !chart.series.isEmpty {
+            HStack(spacing: 14) {
+                ForEach(chart.series, id: \.self) { s in
+                    HStack(spacing: 5) {
+                        RoundedRectangle(cornerRadius: 2).fill(PerchModelPalette.color(s.colour)).frame(width: 9, height: 9)
+                        Text(s.name).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - Top projects
@@ -242,7 +260,7 @@ struct UsageView: View {
     @ViewBuilder
     private func topProjectsBlock(_ model: UsageModel) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Top projects (30 days)").font(.caption2).foregroundStyle(.secondary).textCase(.uppercase)
+            Text(model.topProjectsTitle).font(.caption2).foregroundStyle(.secondary).textCase(.uppercase)
             if model.topProjects.isEmpty {
                 Text("No project usage yet").foregroundStyle(.secondary)
             } else {
@@ -277,6 +295,9 @@ struct UsageView: View {
                 VStack(alignment: .leading, spacing: 6) {
                     ForEach(model.byModel, id: \.self) { usage in
                         HStack(spacing: 12) {
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(PerchModelPalette.color(usage.colour))
+                                .frame(width: 9, height: 9)
                             Text(usage.model).fontWeight(.medium).lineLimit(1)
                             Spacer(minLength: 12)
                             Text(usage.tokensLabel)
@@ -291,33 +312,5 @@ struct UsageView: View {
                 }
             }
         }
-    }
-}
-
-/// One rendered token-class segment of one day's stacked bar. Built once per
-/// non-zero class so a day with, say, no cache-write tokens draws four
-/// segments rather than five with an invisible sliver.
-private struct DailySegment: Identifiable {
-    let dayIndex: Int32
-    let dayLabel: String
-    let classLabel: String
-    let totalLabel: String
-    let start: UInt64
-    let end: UInt64
-    /// True for the segment closest to the baseline (no gap trimmed below it).
-    let isFirst: Bool
-    /// True for the segment closest to the bar's top (no gap trimmed above it,
-    /// and where the day's `totalLabel` annotation is anchored).
-    let isLast: Bool
-
-    var id: String { "\(dayIndex)-\(classLabel)" }
-
-    func yStart(gap: Double) -> Double {
-        isFirst ? Double(start) : Double(start) + gap / 2
-    }
-
-    func yEnd(gap: Double) -> Double {
-        let trimmed = isLast ? Double(end) : Double(end) - gap / 2
-        return max(trimmed, yStart(gap: gap))
     }
 }

@@ -362,6 +362,7 @@ mod tests {
             usage: TurnUsage::default(),
             cost_usd: 0.0,
             unpriced_tokens: 0,
+            by_model: Vec::new(),
         }
     }
 

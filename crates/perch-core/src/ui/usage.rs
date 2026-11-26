@@ -4,7 +4,8 @@
 use crate::db::Db;
 use crate::query::{self, DAY_MS};
 use crate::settings::{BurnRate, Settings};
-use crate::ui::format::{cost_label, human_cost, human_tokens, last_days_title, plural};
+use crate::ui::daily_chart::{self, UsageChart};
+use crate::ui::format::{cost_label, human_cost, human_tokens, plural};
 
 const WINDOW_MS: i64 = 5 * 3_600_000;
 const MIN_PROJECTABLE_MS: i64 = 30 * 60_000;
@@ -14,23 +15,6 @@ pub struct HeroStat {
     pub label: String,
     pub value: String,
     pub caption: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct DailyBar {
-    pub day_index: i32,
-    pub label: String,
-    pub input: u64,
-    pub output: u64,
-    pub cache_read: u64,
-    pub cache_write: u64,
-    pub thinking: u64,
-    pub total_label: String,
-    /// The day's height on a spend chart, in whatever `UsageModel::spend_caption`
-    /// says: dollars, or output tokens when dollars can't answer.
-    pub spend: f64,
-    /// `spend`, formatted.
-    pub spend_label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -44,6 +28,8 @@ pub struct RankedProject {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct ModelUsage {
     pub model: String,
+    /// The model's colour in the daily chart, so the two agree.
+    pub colour: u8,
     pub tokens: u64,
     pub tokens_label: String,
     pub cost: String,
@@ -52,11 +38,9 @@ pub struct ModelUsage {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct UsageModel {
     pub hero: Vec<HeroStat>,
-    /// "Last 14 days", the heading over `daily`.
-    pub chart_title: String,
-    /// What each day's `spend` is.
-    pub spend_caption: String,
-    pub daily: Vec<DailyBar>,
+    pub chart: UsageChart,
+    /// "Top projects, last 30 days".
+    pub top_projects_title: String,
     pub top_projects: Vec<RankedProject>,
     pub by_model: Vec<ModelUsage>,
     pub burn_rate: Option<String>,
@@ -188,57 +172,8 @@ fn observed_elapsed_ms(oldest_ts: Option<i64>, now_ms: i64) -> i64 {
     }
 }
 
-/// What a spend chart can plot. One choice for the whole window, because bars in
-/// two different units can't share an axis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SpendMeasure {
-    Cost,
-    /// Costs are hidden in Settings.
-    OutputCostHidden,
-    /// There are tokens in the window and none of them has a price.
-    OutputNoPrices,
-}
-
-impl SpendMeasure {
-    fn for_window(days: &[query::DayUsage], show_cost: bool) -> Self {
-        let tokens: u64 = days.iter().map(|d| d.usage.total_tokens()).sum();
-        let unpriced: u64 = days.iter().map(|d| d.unpriced_tokens).sum();
-        if !show_cost {
-            Self::OutputCostHidden
-        } else if tokens > 0 && unpriced >= tokens {
-            Self::OutputNoPrices
-        } else {
-            Self::Cost
-        }
-    }
-
-    fn value(self, day: &query::DayUsage) -> f64 {
-        match self {
-            Self::Cost => day.cost_usd,
-            Self::OutputCostHidden | Self::OutputNoPrices => day.usage.output as f64,
-        }
-    }
-
-    fn label(self, day: &query::DayUsage) -> String {
-        match self {
-            Self::Cost => cost_label(day.cost_usd, day.unpriced_tokens, day.usage.total_tokens()),
-            Self::OutputCostHidden | Self::OutputNoPrices => human_tokens(day.usage.output),
-        }
-    }
-
-    fn caption(self) -> &'static str {
-        match self {
-            Self::Cost => "Estimated cost per day",
-            Self::OutputCostHidden => "Output tokens per day",
-            Self::OutputNoPrices => "Output tokens per day, because these models have no price",
-        }
-    }
-}
-
-/// `settings.chart_days` spans the daily chart — the same field
-/// `build_project_detail`'s sparkline uses, so the two can never disagree
-/// about their own date range — while `top_projects_count` and
-/// `top_projects_days` shape the ranked list.
+/// `settings.chart_days` spans the daily chart, while `top_projects_count`
+/// and `top_projects_days` shape the ranked list.
 pub fn build_usage(db: &Db, now_ms: i64, settings: &Settings) -> anyhow::Result<UsageModel> {
     let window_since = now_ms - WINDOW_MS;
     let window_spend = query::spend_since(db, window_since)?;
@@ -260,33 +195,6 @@ pub fn build_usage(db: &Db, now_ms: i64, settings: &Settings) -> anyhow::Result<
             String::new()
         }
     };
-
-    let chart_days = settings.chart_days as usize;
-    let days = query::daily_usage(db, chart_days, now_ms)?;
-    let measure = SpendMeasure::for_window(&days, settings.show_cost);
-    let daily: Vec<DailyBar> = days
-        .iter()
-        .enumerate()
-        .map(|(i, d)| {
-            let days_ago = chart_days - 1 - i;
-            DailyBar {
-                day_index: i as i32,
-                label: if days_ago == 0 {
-                    "Today".to_string()
-                } else {
-                    format!("{days_ago}d")
-                },
-                input: d.usage.input,
-                output: d.usage.output,
-                cache_read: d.usage.cache_read,
-                cache_write: d.usage.cache_write_total(),
-                thinking: d.usage.thinking,
-                total_label: human_tokens(d.usage.total_tokens()),
-                spend: measure.value(d),
-                spend_label: measure.label(d),
-            }
-        })
-        .collect();
 
     let top_projects = query::top_projects(
         db,
@@ -312,11 +220,25 @@ pub fn build_usage(db: &Db, now_ms: i64, settings: &Settings) -> anyhow::Result<
             .cmp(&a.1.total_tokens())
             .then_with(|| a.0.cmp(&b.0))
     });
+    // A model's colour is its all-time rank, shared by the list and the chart.
+    let rank: Vec<String> = by_model_rows.iter().map(|(m, _, _)| m.clone()).collect();
+    let colour_of = |model: &str| {
+        rank.iter()
+            .position(|m| m == model)
+            .map_or(daily_chart::OTHER_COLOUR, |i| {
+                (i as u8).min(daily_chart::OTHER_COLOUR)
+            })
+    };
+    let days = query::daily_usage(db, settings.chart_days as usize, now_ms)?;
+    let today = days.last().map(|d| d.date).unwrap_or_default();
+    let chart = daily_chart::build(&days, today, settings.show_cost, &colour_of);
+
     let by_model = by_model_rows
         .into_iter()
         .map(|(model, u, cost)| {
             let priced = query::model_has_price(db, &model)?;
             Ok(ModelUsage {
+                colour: colour_of(&model),
                 tokens: u.total_tokens(),
                 tokens_label: human_tokens(u.total_tokens()),
                 cost: shown_cost(query::Spend {
@@ -351,8 +273,8 @@ pub fn build_usage(db: &Db, now_ms: i64, settings: &Settings) -> anyhow::Result<
     ];
 
     Ok(UsageModel {
-        chart_title: last_days_title(settings.chart_days),
-        spend_caption: measure.caption().to_string(),
+        chart,
+        top_projects_title: format!("Top projects, last {} days", settings.top_projects_days),
         has_data: db.turn_count()? > 0,
         burn_rate: burn_rate(
             settings.burn_rate,
@@ -368,7 +290,6 @@ pub fn build_usage(db: &Db, now_ms: i64, settings: &Settings) -> anyhow::Result<
             None
         },
         hero,
-        daily,
         top_projects,
         by_model,
     })
@@ -418,10 +339,15 @@ mod tests {
         assert!(!m.has_data);
         assert!(m.burn_rate.is_none(), "no projection without data");
         assert!(m.top_projects.is_empty());
-        assert_eq!(m.daily.len(), 14, "the window is still drawn, just empty");
+        assert_eq!(
+            m.chart.days.len(),
+            14,
+            "the window is still drawn, just empty"
+        );
     }
 
-    fn spend_case(models: &[&str], settings: &Settings) -> (String, f64, String) {
+    /// The default measure's caption and today's total in it.
+    fn spend_case(models: &[&str], settings: &Settings) -> (String, String) {
         let db = open_in_memory().unwrap();
         seed_default_prices(&db).unwrap();
         let now = 100 * DAY_MS;
@@ -438,105 +364,115 @@ mod tests {
             );
         }
         let m = build_usage(&db, now, settings).unwrap();
-        let today = m.daily.last().unwrap();
-        (m.spend_caption, today.spend, today.spend_label.clone())
+        let first = &m.chart.measures[0];
+        (
+            first.caption.clone(),
+            first.tooltips.last().unwrap().total.clone(),
+        )
     }
 
     #[test]
     fn spend_is_dollars_when_anything_has_a_price() {
-        let (caption, spend, label) = spend_case(&["claude-sonnet-5"], &Settings::default());
-        assert_eq!(caption, "Estimated cost per day");
-        assert!(spend > 0.0);
-        assert_eq!(label, human_cost(spend));
+        let (caption, total) = spend_case(&["claude-sonnet-5"], &Settings::default());
+        assert_eq!(caption, "Estimated cost per day, by model");
+        assert!(total.starts_with('$'), "{total}");
     }
 
     #[test]
     fn a_partly_priced_day_stays_in_dollars_and_says_at_least() {
-        let (caption, spend, label) = spend_case(
+        let (caption, total) = spend_case(
             &["claude-sonnet-5", "claude-future-1"],
             &Settings::default(),
         );
-        assert_eq!(caption, "Estimated cost per day");
-        assert_eq!(label, format!("at least {}", human_cost(spend)));
+        assert!(caption.starts_with("Estimated cost per day"), "{caption}");
+        assert!(total.starts_with("at least $"), "{total}");
     }
 
     #[test]
     fn with_nothing_priced_spend_falls_back_to_output_tokens_and_says_so() {
-        let (caption, spend, label) = spend_case(&["claude-future-1"], &Settings::default());
+        let (caption, total) = spend_case(&["claude-future-1"], &Settings::default());
         assert_eq!(
             caption,
-            "Output tokens per day, because these models have no price"
+            "Output tokens per day, by model, because these models have no price"
         );
-        assert_eq!(spend, 1_000_000.0);
-        assert_eq!(label, human_tokens(1_000_000));
+        assert_eq!(total, "1.0M tokens");
     }
 
     #[test]
-    fn hidden_costs_never_reach_the_spend_chart() {
+    fn hidden_costs_never_reach_the_chart() {
         let settings = Settings {
             show_cost: false,
             ..Settings::default()
         };
-        let (caption, spend, label) = spend_case(&["claude-sonnet-5"], &settings);
-        assert_eq!(caption, "Output tokens per day");
-        assert_eq!(spend, 1_000_000.0);
-        assert!(!label.contains('$'), "{label}");
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        seed(
+            &db,
+            "s",
+            100 * DAY_MS,
+            "claude-sonnet-5",
+            TurnUsage {
+                output: 5,
+                ..TurnUsage::default()
+            },
+        );
+        let m = build_usage(&db, 100 * DAY_MS, &settings).unwrap();
+        let json = serde_json::to_string(&m.chart).unwrap();
+        assert!(!json.contains('$'), "{json}");
     }
 
     #[test]
-    fn the_chart_title_follows_the_setting() {
+    fn the_chart_title_and_top_projects_heading_follow_the_settings() {
         let db = open_in_memory().unwrap();
         let settings = Settings {
             chart_days: 30,
+            top_projects_days: 90,
             ..Settings::default()
         };
-        assert_eq!(
-            build_usage(&db, 100 * DAY_MS, &settings)
-                .unwrap()
-                .chart_title,
-            "Last 30 days"
-        );
+        let m = build_usage(&db, 100 * DAY_MS, &settings).unwrap();
+        assert_eq!(m.chart.title, "Last 30 days");
+        assert_eq!(m.chart.days.len(), 30);
+        assert_eq!(m.top_projects_title, "Top projects, last 90 days");
     }
 
     #[test]
-    fn daily_bars_carry_each_token_class_separately() {
+    fn a_model_has_one_colour_in_the_list_and_the_chart() {
         let db = open_in_memory().unwrap();
         seed_default_prices(&db).unwrap();
         let now = 100 * DAY_MS;
         seed(
             &db,
-            "s1",
-            now,
-            "claude-fable-5",
+            "old",
+            now - 60 * DAY_MS,
+            "claude-opus-5",
             TurnUsage {
-                input: 10,
-                output: 20,
-                cache_read: 30,
-                cache_write_5m: 40,
-                cache_write_1h: 5,
-                thinking: 6,
+                output: 900,
+                ..TurnUsage::default()
             },
         );
-
+        seed(
+            &db,
+            "new",
+            now,
+            "claude-sonnet-5",
+            TurnUsage {
+                output: 10,
+                ..TurnUsage::default()
+            },
+        );
         let m = build_usage(&db, now, &Settings::default()).unwrap();
-        let today = m.daily.last().unwrap();
-        assert_eq!(today.input, 10);
-        assert_eq!(today.output, 20);
-        assert_eq!(today.cache_read, 30);
+        let listed = m
+            .by_model
+            .iter()
+            .find(|u| u.model == "claude-sonnet-5")
+            .unwrap();
+        assert_eq!(listed.colour, 1, "second by all-time tokens");
         assert_eq!(
-            today.cache_write, 45,
-            "5m and 1h cache writes are one visual class"
+            m.chart.series.len(),
+            1,
+            "only models in the window are stacked"
         );
-        assert_eq!(today.thinking, 6);
-        // `total_tokens()` excludes `thinking` (it's a subset of `output`, not
-        // an additional billable class), so the total is 10+20+30+40+5 = 105,
-        // not 111 — double-counting thinking tokens would overstate usage.
-        assert_eq!(today.total_label, human_tokens(105));
-        assert_eq!(
-            today.label, "Today",
-            "the last bar reads as today, not \"0d\""
-        );
-        assert!(m.has_data);
+        assert_eq!(m.chart.series[0].colour, listed.colour);
     }
 
     #[test]

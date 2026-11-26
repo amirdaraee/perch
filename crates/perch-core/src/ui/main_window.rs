@@ -658,7 +658,8 @@ mod tests {
             assert_eq!(
                 crate::ui::usage::build_usage(&db, now, &s)
                     .unwrap()
-                    .daily
+                    .chart
+                    .days
                     .len(),
                 want,
                 "the usage chart must span chart_days"
