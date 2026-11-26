@@ -393,6 +393,15 @@ fn general_pane(s: &Settings, cx: &SchemaContext) -> SettingsPane {
                     },
                 )
                 .searchable(&["opencode", "tools", "providers"]),
+                row(
+                    s,
+                    SettingKey::ReadGrok,
+                    "Read Grok Build sessions",
+                    "Include Grok Build's sessions, from ~/.grok. Perch reads only each \
+                     session's usage file, never the conversation or the login.",
+                    Control::Toggle { on: s.read_grok },
+                )
+                .searchable(&["grok", "xai", "tools", "providers"]),
             ],
         ),
         group(

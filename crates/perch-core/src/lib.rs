@@ -7,6 +7,7 @@ pub mod config;
 pub mod days;
 pub mod db;
 pub mod discovery;
+pub mod grok;
 pub mod index;
 pub mod live;
 pub mod model;

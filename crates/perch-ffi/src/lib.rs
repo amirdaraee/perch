@@ -1361,6 +1361,7 @@ pub enum SettingKey {
     ShowArchived,
     ReadCodex,
     ReadOpenCode,
+    ReadGrok,
     ChartDays,
     TopProjectsCount,
     TopProjectsDays,
@@ -1395,6 +1396,7 @@ impl From<settings::SettingKey> for SettingKey {
             settings::SettingKey::ShowArchived => SettingKey::ShowArchived,
             settings::SettingKey::ReadCodex => SettingKey::ReadCodex,
             settings::SettingKey::ReadOpenCode => SettingKey::ReadOpenCode,
+            settings::SettingKey::ReadGrok => SettingKey::ReadGrok,
             settings::SettingKey::ChartDays => SettingKey::ChartDays,
             settings::SettingKey::TopProjectsCount => SettingKey::TopProjectsCount,
             settings::SettingKey::TopProjectsDays => SettingKey::TopProjectsDays,
@@ -1431,6 +1433,7 @@ impl From<SettingKey> for settings::SettingKey {
             SettingKey::ShowArchived => settings::SettingKey::ShowArchived,
             SettingKey::ReadCodex => settings::SettingKey::ReadCodex,
             SettingKey::ReadOpenCode => settings::SettingKey::ReadOpenCode,
+            SettingKey::ReadGrok => settings::SettingKey::ReadGrok,
             SettingKey::ChartDays => settings::SettingKey::ChartDays,
             SettingKey::TopProjectsCount => settings::SettingKey::TopProjectsCount,
             SettingKey::TopProjectsDays => settings::SettingKey::TopProjectsDays,
@@ -1993,6 +1996,11 @@ fn providers_for(
     if s.read_codex {
         if let Some(home) = perch_core::codex::codex_home() {
             out.push(Box::new(perch_core::codex::Codex::new(home)));
+        }
+    }
+    if s.read_grok {
+        if let Some(home) = perch_core::grok::grok_home() {
+            out.push(Box::new(perch_core::grok::Grok::new(home)));
         }
     }
     if s.read_opencode {
@@ -2873,7 +2881,7 @@ impl Perch {
 
     /// Put every setting back to its factory value.
     ///
-    /// One write of one whole `Settings`, not twenty-nine writes: a reset
+    /// One write of one whole `Settings`, not thirty writes: a reset
     /// that failed halfway would leave a configuration that is neither what
     /// Perch ships nor what the user chose, which is worse than not
     /// resetting at all. Reports the schema that resulted, exactly as
@@ -3399,6 +3407,7 @@ mod tests {
             // doesn't exist reads as Codex not being installed.
             std::env::set_var("CODEX_HOME", dir.join("no-codex"));
             std::env::set_var("XDG_DATA_HOME", dir.join("no-xdg"));
+            std::env::set_var("GROK_HOME", dir.join("no-grok"));
             Self { _lock: lock }
         }
     }
@@ -3408,6 +3417,7 @@ mod tests {
             std::env::remove_var("PERCH_DATA_DIR");
             std::env::remove_var("CODEX_HOME");
             std::env::remove_var("XDG_DATA_HOME");
+            std::env::remove_var("GROK_HOME");
         }
     }
 
@@ -4753,7 +4763,7 @@ mod tests {
     const UNSEEN_TERMINAL: &str = "Perch Test Terminal";
 
     /// Every key, as the boundary spells them. Taken from core's own list
-    /// rather than restated here, so a twenty-nineh setting joins these
+    /// rather than restated here, so a thirtyh setting joins these
     /// tests by existing.
     fn all_keys() -> Vec<SettingKey> {
         settings::SettingKey::ALL
@@ -4984,7 +4994,7 @@ mod tests {
             .unwrap();
     }
 
-    /// **The test that matters most.** Every one of the twenty-nine keys,
+    /// **The test that matters most.** Every one of the thirty keys,
     /// written through the FFI with a value of its own shape, read back from
     /// the schema the write returned, and then read again through a *second*
     /// `Perch` built over the same `config.toml` — which shares nothing with
@@ -5039,7 +5049,7 @@ mod tests {
         }
         assert_eq!(
             written.len(),
-            29,
+            30,
             "a key was added without joining this loop"
         );
     }
@@ -5211,7 +5221,7 @@ mod tests {
         let factory_panes = p.reset_all_settings().unwrap().panes;
         let factory = schema_values(&factory_panes);
         let home = pane_of_each_key(&factory_panes);
-        assert_eq!(home.len(), 29, "a key is drawn by no pane");
+        assert_eq!(home.len(), 30, "a key is drawn by no pane");
 
         let drift: Vec<(SettingKey, SettingValue)> = all_keys()
             .into_iter()
@@ -5440,7 +5450,7 @@ mod tests {
         );
     }
 
-    /// Reset-all is about the twenty-nine settings and nothing else. The index,
+    /// Reset-all is about the thirty settings and nothing else. The index,
     /// the notes a user typed against their projects and the rates they
     /// entered all live elsewhere and must survive it — a "reset settings"
     /// that quietly emptied the index would be unrecoverable.

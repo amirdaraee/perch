@@ -75,6 +75,10 @@ const DEFAULTS: &[(&str, ModelPrice)] = &[
     price("gpt-5.6-sol", 4.0, 20.0, 0.4, 5.0),
     price("gpt-5.6-luna", 0.2, 1.2, 0.02, 0.25),
     price("gpt-5.5", 5.0, 30.0, 0.5, 5.0),
+    // xAI's rates for prompts under 200K tokens, as of 2026-11-26
+    // (docs.x.ai/docs/pricing). No cache-write rate is listed, so a write is
+    // priced as input. grok-4.7-build isn't on the list, so it has no price.
+    price("grok-4.7", 2.0, 6.0, 0.5, 2.0),
 ];
 
 /// Rates Perch used to ship. A row still holding one of these was never edited,

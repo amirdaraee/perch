@@ -259,6 +259,8 @@ claude_config_dir = ""
 read_codex = true
 # Also read OpenCode's sessions from ~/.local/share/opencode.
 read_opencode = true
+# Also read Grok Build's sessions from ~/.grok.
+read_grok = true
 
 [menu_bar]
 # "icon" | "count" | "count-and-waiting"
@@ -393,6 +395,7 @@ pub fn save(path: &Path, s: &Settings) -> Result<()> {
     general["claude_config_dir"] = value(s.claude_config_dir.clone());
     general["read_codex"] = value(s.read_codex);
     general["read_opencode"] = value(s.read_opencode);
+    general["read_grok"] = value(s.read_grok);
 
     let menu_bar = ensure_table(&mut doc, "menu_bar");
     menu_bar["display"] = value(s.menu_bar_display.as_wire_str().to_string());
@@ -931,6 +934,7 @@ mod tests {
             claude_config_dir: dir.path().to_string_lossy().into_owned(),
             read_codex: false,
             read_opencode: false,
+            read_grok: false,
             menu_bar_display: MenuBarDisplay::CountAndWaiting,
             menu_bar_icon: MenuBarIcon::Binoculars,
             dim_when_stale: false,

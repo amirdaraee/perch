@@ -105,7 +105,7 @@ wasn't: no such process, that pid isn't `claude`, or the record wouldn't parse.
   session's transcript and its subagent transcripts, under
   `<session-id>/subagents/`, and counts each API response once.
 * **Costs are estimates at list price.** Perch uses Anthropic's (and, for
-  Codex, OpenAI's) published rates as of November 2026, and you can edit them in the Prices pane. On a
+  Codex and Grok, OpenAI's and xAI's) published rates as of November 2026, and you can edit them in the Prices pane. On a
   subscription, this is what the usage would cost at those rates, not what you
   pay. Fast mode and the higher Haiku 5.5 rate on very large prompts aren't
   counted. If a model has no price, Perch counts its tokens and says "no price"
@@ -127,6 +127,10 @@ wasn't: no such process, that pid isn't `claude`, or the record wouldn't parse.
   changes and reads the copy. It reads each session's totals only, counted on
   the day the session was last used, and never the messages or the saved
   logins in that database. OpenCode can use any model, so many show "no price".
+* **Grok Build sessions count too.** Perch reads only each session's
+  `usage.json` under `~/.grok/sessions`, never the conversation or the login.
+  xAI publishes a price for grok-4.7 but not for grok-4.7-build, so that one
+  shows "no price".
 * **The fullscreen behaviour is right by construction, not by testing.** A
   tracked `NSMenu` is the documented way to stay visible over a fullscreen app,
   and two spikes confirmed the alternatives don't work. Nobody has actually
