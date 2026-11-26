@@ -464,7 +464,7 @@ pub struct ProjectRow {
     pub live_session_count: u32,
     pub subtitle: String,
     pub description: Option<String>,
-    pub sparkline: Vec<SparkPoint>,
+    pub recent: Vec<HeatCell>,
     pub live_label: Option<String>,
     pub waiting_label: Option<String>,
     pub stats_line: String,
@@ -500,6 +500,25 @@ pub struct AxisLabel {
     pub label: String,
 }
 
+impl From<core_heatmap::HeatCell> for HeatCell {
+    fn from(c: core_heatmap::HeatCell) -> Self {
+        let core_heatmap::HeatCell {
+            column,
+            row,
+            level,
+            before_tracking,
+            label,
+        } = c;
+        HeatCell {
+            column,
+            row,
+            level,
+            before_tracking,
+            label,
+        }
+    }
+}
+
 impl From<core_heatmap::Heatmap> for Heatmap {
     fn from(h: core_heatmap::Heatmap) -> Self {
         let core_heatmap::Heatmap {
@@ -522,24 +541,7 @@ impl From<core_heatmap::Heatmap> for Heatmap {
         };
         Heatmap {
             columns,
-            cells: cells
-                .into_iter()
-                .map(
-                    |core_heatmap::HeatCell {
-                         column,
-                         row,
-                         level,
-                         before_tracking,
-                         label,
-                     }| HeatCell {
-                        column,
-                        row,
-                        level,
-                        before_tracking,
-                        label,
-                    },
-                )
-                .collect(),
+            cells: cells.into_iter().map(Into::into).collect(),
             months: axis(months),
             weekdays: axis(weekdays),
             summary,
@@ -691,7 +693,7 @@ impl From<main_window::ProjectRow> for ProjectRow {
             live_session_count,
             subtitle,
             description,
-            sparkline,
+            recent,
             live_label,
             waiting_label,
             stats_line,
@@ -709,7 +711,7 @@ impl From<main_window::ProjectRow> for ProjectRow {
             live_session_count,
             subtitle,
             description,
-            sparkline: sparkline.into_iter().map(Into::into).collect(),
+            recent: recent.into_iter().map(Into::into).collect(),
             live_label,
             waiting_label,
             stats_line,

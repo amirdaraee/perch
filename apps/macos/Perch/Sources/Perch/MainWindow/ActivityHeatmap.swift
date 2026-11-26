@@ -78,7 +78,7 @@ struct ActivityHeatmap: View {
                     .offset(x: 0, y: monthRow + CGFloat(day.index) * pitch)
             }
             ForEach(model.cells, id: \.self) { c in
-                swatch(level: c.level, beforeTracking: c.beforeTracking)
+                HeatSwatch(level: c.level, beforeTracking: c.beforeTracking)
                     .frame(width: cell, height: cell)
                     .contentShape(Rectangle())
                     .onHover { inside in
@@ -96,23 +96,28 @@ struct ActivityHeatmap: View {
 
     private var legend: some View {
         HStack(spacing: 3) {
-            swatch(level: 0, beforeTracking: true).frame(width: 9, height: 9)
+            HeatSwatch(level: 0, beforeTracking: true).frame(width: 9, height: 9)
             Text(model.legendUntracked).font(.caption2).foregroundStyle(.secondary)
                 .padding(.trailing, 6)
             Text(model.legendLess).font(.caption2).foregroundStyle(.secondary)
             ForEach(0..<5, id: \.self) { level in
-                swatch(level: UInt8(level), beforeTracking: false).frame(width: 9, height: 9)
+                HeatSwatch(level: UInt8(level), beforeTracking: false).frame(width: 9, height: 9)
             }
             Text(model.legendMore).font(.caption2).foregroundStyle(.secondary)
         }
         .fixedSize()
         .accessibilityHidden(true)
     }
+}
 
-    /// Quiet days are a faint fill; days before tracking are an outline only,
-    /// so they don't read as quiet ones.
-    @ViewBuilder
-    private func swatch(level: UInt8, beforeTracking: Bool) -> some View {
+/// One day's square, shared by every heatmap so a shade means the same
+/// thing wherever it appears. Quiet days are a faint fill; days before
+/// tracking are an outline only, so they don't read as quiet ones.
+struct HeatSwatch: View {
+    let level: UInt8
+    let beforeTracking: Bool
+
+    var body: some View {
         let shape = RoundedRectangle(cornerRadius: 2, style: .continuous)
         if beforeTracking {
             shape.strokeBorder(Color.secondary.opacity(0.25), lineWidth: 1)
@@ -124,4 +129,40 @@ struct ActivityHeatmap: View {
     }
 
     private static let opacity: [Double] = [0, 0.35, 0.55, 0.78, 1.0]
+}
+
+/// A single row of days, as on a project card: the cells share the width,
+/// up to the Overview's cell size. `hovered` receives the cell's sentence.
+struct HeatStrip: View {
+    let cells: [HeatCell]
+    @Binding var hovered: String?
+
+    private let gapRatio: CGFloat = 0.25
+    private let maxCell: CGFloat = 14
+    @State private var width: CGFloat = 0
+
+    var body: some View {
+        HStack(spacing: gap) {
+            ForEach(cells, id: \.self) { c in
+                HeatSwatch(level: c.level, beforeTracking: c.beforeTracking)
+                    .frame(width: cell, height: cell)
+                    .contentShape(Rectangle())
+                    .onHover { inside in
+                        if inside { hovered = c.label } else if hovered == c.label { hovered = nil }
+                    }
+                    .help(c.label)
+                    .accessibilityLabel(c.label)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: cell, maxHeight: cell, alignment: .leading)
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
+        .accessibilityElement(children: .contain)
+    }
+
+    private var count: CGFloat { CGFloat(max(cells.count, 1)) }
+    private var cell: CGFloat {
+        let fitted = width / (count + (count - 1) * gapRatio)
+        return max(min(fitted, maxCell), 2)
+    }
+    private var gap: CGFloat { cell * gapRatio }
 }

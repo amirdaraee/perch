@@ -2,7 +2,7 @@
 
 A menu bar app that tells you when a Claude Code session is waiting on you.
 
-![Perch's main window, showing a card for each project with its description, session count, token usage and a two week chart](site/screenshots/main-window.png)
+![Perch's main window, showing a card for each project with its description, session count, spend and its last two weeks of activity](site/screenshots/main-window.png)
 
 > **Status:** early. I use it every day, but it's pre-1.0 and some of the
 > numbers come with caveats. They're listed below rather than buried.
@@ -69,8 +69,9 @@ real `NSMenu`, which is what keeps it visible when you're in a fullscreen app.
 
 **Open Perch** opens the main window. Overview starts with a year of activity
 as a calendar grid, like GitHub's, and then a card per project with its
-README blurb, session count, tokens, spend, a two week chart, and whether
-anything is running or waiting right now. Click through for that project's
+README blurb, its last two weeks as a row of days, how many of them were
+active and when you last worked on it, its branch, sessions and spend, and
+whether anything is running or waiting right now. Click through for that project's
 sessions, your own notes, and its totals. There's a separate Usage view with
 everything broken down by day, by project and by model.
 

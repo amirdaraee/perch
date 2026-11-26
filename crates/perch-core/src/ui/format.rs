@@ -53,6 +53,22 @@ pub fn human_elapsed(ms: i64) -> String {
     }
 }
 
+/// How long ago something last happened, for recency rather than alarm:
+/// hours up to two days, then days, then months, so a project last used in
+/// the spring doesn't read "4000h".
+pub fn human_ago(ms: i64) -> String {
+    const HOUR: i64 = 3_600_000;
+    const DAY: i64 = 24 * HOUR;
+    let ms = ms.max(0);
+    if ms < 48 * HOUR {
+        human_elapsed(ms)
+    } else if ms < 90 * DAY {
+        format!("{}d", ms / DAY)
+    } else {
+        format!("{}mo", ms / (30 * DAY))
+    }
+}
+
 /// A file size as a person reads it. Decimal units, because that is what
 /// Finder shows for the same file and a settings pane that disagrees with
 /// Finder about the size of one file on disk is just wrong twice.
@@ -88,6 +104,16 @@ pub fn last_days_title(days: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recency_moves_from_hours_to_days_to_months() {
+        const H: i64 = 3_600_000;
+        assert_eq!(human_ago(5_000), "5s");
+        assert_eq!(human_ago(47 * H), "47h");
+        assert_eq!(human_ago(48 * H), "2d");
+        assert_eq!(human_ago(89 * 24 * H), "89d");
+        assert_eq!(human_ago(200 * 24 * H), "6mo");
+    }
 
     #[test]
     fn a_cost_says_when_some_or_all_of_it_has_no_price() {

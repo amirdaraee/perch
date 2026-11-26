@@ -1,4 +1,3 @@
-import Charts
 import SwiftUI
 import PerchFFI
 
@@ -48,22 +47,24 @@ struct ProjectCard: View {
     let row: ProjectRow
     let open: () -> Void
     @State private var hovering = false
+    /// The hovered day's sentence, shown in place of the stat line.
+    @State private var hoveredDay: String?
 
     var body: some View {
         Button(action: open) {
             VStack(alignment: .leading, spacing: 8) {
                 header
                 // Reserve three lines whether or not there is a description,
-                // so cards in one grid row keep their sparklines aligned.
+                // so cards in one grid row keep their day cells aligned.
                 Text(row.description ?? " ")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .lineLimit(3, reservesSpace: true)
                     .multilineTextAlignment(.leading)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                sparkline
+                HeatStrip(cells: row.recent, hovered: $hoveredDay)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(row.statsLine)
+                    Text(hoveredDay ?? row.statsLine)
                         .font(.caption)
                         .monospacedDigit()
                         .lineLimit(1)
@@ -71,7 +72,7 @@ struct ProjectCard: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
-                        .truncationMode(.middle)
+                        .truncationMode(.tail)
                 }
             }
             .padding(12)
@@ -113,24 +114,5 @@ struct ProjectCard: View {
                 }
             }
         }
-    }
-
-    private var sparkline: some View {
-        Chart {
-            ForEach(row.sparkline, id: \.dayIndex) { point in
-                BarMark(
-                    x: .value("Day", point.dayIndex),
-                    y: .value("Responses", point.responses)
-                )
-                .foregroundStyle(Color.perchWorking.opacity(0.85))
-                // Both are Rust's finished strings, never formatted here.
-                .accessibilityLabel(point.label)
-                .accessibilityValue(point.valueLabel)
-            }
-            PerchChartBaseline()
-        }
-        .chartXAxis(.hidden)
-        .chartYAxis(.hidden)
-        .frame(height: 30)
     }
 }

@@ -153,7 +153,7 @@ fn weekday_from_mac(n: u8) -> Weekday {
 /// Each active day's level comes from where it ranks among the active days,
 /// not from its share of the busiest one. One enormous day then can't fade
 /// every other day to the lowest shade.
-fn levels(responses: &[u64]) -> Vec<u8> {
+pub(crate) fn levels(responses: &[u64]) -> Vec<u8> {
     let mut active: Vec<u64> = responses.iter().copied().filter(|&n| n > 0).collect();
     active.sort_unstable();
     let total = active.len();
@@ -170,7 +170,7 @@ fn levels(responses: &[u64]) -> Vec<u8> {
 }
 
 /// "Oct 24", with the year when it isn't this year's.
-fn date_label(date: NaiveDate, today: NaiveDate) -> String {
+pub(crate) fn date_label(date: NaiveDate, today: NaiveDate) -> String {
     if date.year() == today.year() {
         date.format("%b %-d").to_string()
     } else {

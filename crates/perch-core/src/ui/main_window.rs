@@ -7,9 +7,14 @@ use crate::query;
 use crate::readme;
 use crate::settings::Settings;
 use crate::ui::format::{
-    cost_label, elapsed_or_dash, human_elapsed, human_tokens, last_days_title, plural,
+    cost_label, human_ago, human_elapsed, human_tokens, last_days_title, plural,
 };
+use crate::ui::heatmap::{self, HeatCell};
 use crate::ui::model::PopoverModel;
+
+/// How many days a project card shows. Fixed rather than `chart_days`: the
+/// card has room for two weeks of cells whatever the charts elsewhere span.
+pub const CARD_DAYS: usize = 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ProjectGroup {
@@ -35,16 +40,18 @@ pub struct ProjectRow {
     /// The overview card's opening paragraph from the project's own README or
     /// CLAUDE.md; `None` when neither says anything or the folder is gone.
     pub description: Option<String>,
-    /// Responses per day over `settings.chart_days`, oldest first — the same
-    /// window and labels as the project page's sparkline.
-    pub sparkline: Vec<SparkPoint>,
+    /// The last [`CARD_DAYS`] local days, oldest first, shaded on the same
+    /// scale as the Overview heatmap; each cell's label names its day.
+    pub recent: Vec<HeatCell>,
     /// "2 running", or `None` when nothing runs in this project.
     pub live_label: Option<String>,
     /// "1 waiting", or `None` when no session here is waiting on the user.
     pub waiting_label: Option<String>,
-    /// "12 sessions · 2.0M · $20.00" — the subtitle without its recency.
+    /// "Active 6 of the last 14 days · 4s ago": whether the project is in
+    /// use and when it was last worked on, readable without hovering.
     pub stats_line: String,
-    /// "main · 3h" — the latest branch, when one was recorded, then recency.
+    /// "main · 12 sessions · $42" — the latest branch when one was recorded,
+    /// then the project's all-time totals.
     pub activity_line: String,
 }
 
@@ -147,7 +154,10 @@ pub fn custom_notify_label(minutes: u32) -> String {
 /// just extends that to the `Option` these queries actually return, rather
 /// than re-deciding what "absent" means a second time.
 fn since(now_ms: i64, ts: Option<i64>) -> String {
-    ts.map_or_else(|| "—".to_string(), |t| elapsed_or_dash(now_ms, t))
+    match ts {
+        Some(t) if t > 0 => human_ago(now_ms - t),
+        _ => "—".to_string(),
+    }
 }
 
 /// Every project the index knows, grouped for the sidebar. `db: None` (or a
@@ -170,14 +180,13 @@ pub fn build_main_window(
             error: Some("index unavailable".into()),
         };
     };
-    let chart_days = settings.chart_days as usize;
-    // All three are read up front, so a card's sparkline and branch cost one
+    // All three are read up front, so a card's cells and branch cost one
     // query each for the whole grid rather than one per project. A failure in
     // any of them fails the list: zero bars would be a fabricated "quiet".
     let loaded = query::project_summaries(db).and_then(|s| {
         Ok((
             s,
-            query::daily_responses_by_project(db, chart_days, now_ms)?,
+            query::daily_responses_by_project(db, CARD_DAYS, now_ms)?,
             query::latest_branches(db)?,
         ))
     });
@@ -191,6 +200,8 @@ pub fn build_main_window(
             }
         }
     };
+    // The same window the query bucketed by, so each cell's date is its own.
+    let window = crate::days::window(&chrono::Local, CARD_DAYS, now_ms);
 
     // Carry `last_activity_at` alongside each row only for sorting — it does
     // not belong on `ProjectRow` itself (the brief's fields are exact, and a
@@ -238,24 +249,20 @@ pub fn build_main_window(
                 .iter()
                 .filter(|l| matches!(l.status, SessionStatus::Waiting { .. }))
                 .count();
-            let stats_line = [
+            let activity_line = [
+                branches.get(&s.id).cloned(),
                 Some(session_count.clone()),
-                Some(tokens.clone()),
                 (!cost.is_empty()).then(|| cost.clone()),
             ]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>()
             .join(" · ");
-            let activity_line = [branches.get(&s.id).cloned(), Some(last_active.clone())]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" · ");
             let responses_per_day = daily
                 .get(&s.id)
                 .cloned()
-                .unwrap_or_else(|| vec![0; chart_days]);
+                .unwrap_or_else(|| vec![0; window.len()]);
+            let stats_line = card_stats_line(&responses_per_day, &last_active);
             // Composed as optional fragments, not a fixed-arity `format!`, so
             // a hidden cost drops cleanly instead of leaving a stray " · ".
             let subtitle = [
@@ -280,7 +287,7 @@ pub fn build_main_window(
                 last_active,
                 live_session_count,
                 description: readme::project_description(std::path::Path::new(&s.real_path)),
-                sparkline: spark_points(&responses_per_day),
+                recent: card_cells(&window, &responses_per_day),
                 live_label: (live_session_count > 0)
                     .then(|| format!("{live_session_count} running")),
                 waiting_label: (waiting > 0).then(|| format!("{waiting} waiting")),
@@ -306,6 +313,58 @@ pub fn build_main_window(
         projects: projects.into_iter().map(|(row, _)| row).collect(),
         error: None,
     }
+}
+
+/// "Active 6 of the last 14 days · 4s ago", or "No activity in the last 14
+/// days · 3w ago". Recency is dropped when the project has no turns at all.
+fn card_stats_line(responses_per_day: &[u64], last_active: &str) -> String {
+    let n = responses_per_day.len();
+    let active = responses_per_day.iter().filter(|&&r| r > 0).count();
+    let activity = if active == 0 {
+        format!("No activity in the last {n} days")
+    } else {
+        format!("Active {active} of the last {n} days")
+    };
+    if last_active == "—" {
+        activity
+    } else {
+        format!("{activity} · {last_active} ago")
+    }
+}
+
+/// One cell per day of `window`, shaded like the Overview heatmap and
+/// labelled "Fri, Oct 24: 12 responses" or "…: no activity".
+fn card_cells(window: &[crate::days::Day], responses_per_day: &[u64]) -> Vec<HeatCell> {
+    let levels = heatmap::levels(responses_per_day);
+    let today = window.last().map(|d| d.date);
+    window
+        .iter()
+        .zip(responses_per_day)
+        .zip(levels)
+        .enumerate()
+        .map(|(i, ((day, &responses), level))| {
+            let date = format!(
+                "{}, {}",
+                day.date.format("%a"),
+                heatmap::date_label(day.date, today.unwrap_or(day.date))
+            );
+            let label = if responses == 0 {
+                format!("{date}: no activity")
+            } else {
+                format!(
+                    "{date}: {}",
+                    plural(responses as i64, "response", "responses")
+                )
+            };
+            HeatCell {
+                column: i as u32,
+                row: 0,
+                level,
+                before_tracking: false,
+                label,
+            }
+        })
+        .collect()
 }
 
 /// One bar per day, oldest first, labelled with the same scheme as
@@ -1190,7 +1249,7 @@ mod tests {
     }
 
     #[test]
-    fn a_card_carries_its_readme_sparkline_branch_and_live_labels() {
+    fn a_card_carries_its_readme_cells_branch_and_live_labels() {
         let db = open_in_memory().unwrap();
         seed_default_prices(&db).unwrap();
         let dir = tempfile::tempdir().unwrap();
@@ -1221,25 +1280,20 @@ mod tests {
         let card = m.projects.iter().find(|p| p.id == pid).unwrap();
 
         assert_eq!(card.description.as_deref(), Some("Does a useful thing."));
-        assert_eq!(
-            card.sparkline.len(),
-            Settings::default().chart_days as usize
-        );
-        assert_eq!(card.sparkline.last().unwrap().responses, 1);
-        assert_eq!(card.sparkline.last().unwrap().value_label, "1 response");
-        assert_eq!(card.sparkline.last().unwrap().label, "Today");
+        assert_eq!(card.recent.len(), CARD_DAYS);
+        let today = card.recent.last().unwrap();
+        assert_eq!(today.level, 4, "the only active day is fully lit");
+        assert!(today.label.ends_with(": 1 response"), "{}", today.label);
+        assert!(card.recent[..CARD_DAYS - 1].iter().all(|c| c.level == 0));
+        assert!(card.recent[0].label.ends_with(": no activity"));
         assert_eq!(card.live_label.as_deref(), Some("2 running"));
         assert_eq!(card.waiting_label.as_deref(), Some("1 waiting"));
         assert!(
-            card.activity_line.starts_with("main · "),
+            card.activity_line.starts_with("main · 1 session · $"),
             "{}",
             card.activity_line
         );
-        assert!(
-            card.stats_line.starts_with("1 session · "),
-            "{}",
-            card.stats_line
-        );
+        assert_eq!(card.stats_line, "Active 1 of the last 14 days · 0s ago");
 
         let q = m.projects.iter().find(|p| p.id == quiet).unwrap();
         assert_eq!(
@@ -1248,11 +1302,9 @@ mod tests {
         );
         assert_eq!(q.live_label, None);
         assert_eq!(q.waiting_label, None);
-        assert!(
-            !q.sparkline.is_empty(),
-            "quiet is drawn as zero bars, not nothing"
-        );
-        assert!(q.sparkline.iter().all(|p| p.responses == 0));
+        assert_eq!(q.recent.len(), CARD_DAYS, "quiet is drawn, not left out");
+        assert!(q.recent.iter().all(|c| c.level == 0));
+        assert_eq!(q.stats_line, "No activity in the last 14 days · 60d ago");
     }
 
     #[test]
@@ -1271,9 +1323,10 @@ mod tests {
             "the fixture must produce a card to inspect"
         );
         for card in &m.projects {
-            assert!(!card.stats_line.contains('$'), "{}", card.stats_line);
-            assert!(!card.stats_line.ends_with(" · "), "{}", card.stats_line);
-            assert!(!card.stats_line.contains(" ·  · "), "{}", card.stats_line);
+            let line = &card.activity_line;
+            assert!(!line.contains('$'), "{line}");
+            assert!(!line.ends_with(" · "), "{line}");
+            assert!(!line.contains(" ·  · "), "{line}");
         }
 
         let shown = build_main_window(
@@ -1284,7 +1337,7 @@ mod tests {
             &Settings::default(),
         );
         assert!(
-            shown.projects[0].stats_line.contains('$'),
+            shown.projects[0].activity_line.contains('$'),
             "cost is there when not hidden"
         );
     }
@@ -1306,9 +1359,10 @@ mod tests {
             &Settings::default(),
         );
         let card = m.projects.iter().find(|p| p.id == pid).unwrap();
-        assert_eq!(
-            card.activity_line, card.last_active,
-            "recency alone, no separator"
+        assert!(
+            card.activity_line.starts_with("1 session"),
+            "no branch and no leading separator: {}",
+            card.activity_line
         );
     }
 }
