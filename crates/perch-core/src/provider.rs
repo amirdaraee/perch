@@ -152,6 +152,7 @@ pub fn index_all(db: &Db, providers: &[&dyn Provider]) -> Result<IndexStats> {
                 total.sessions_skipped += s.sessions_skipped;
                 total.subagents += s.subagents;
                 total.subagents_skipped += s.subagents_skipped;
+                total.sessions_totals_only += s.sessions_totals_only;
             }
             Err(e) => {
                 if first_error.is_none() {

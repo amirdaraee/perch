@@ -369,6 +369,19 @@ fn general_pane(s: &Settings, cx: &SchemaContext) -> SettingsPane {
             ],
         ),
         group(
+            "Other tools",
+            vec![row(
+                s,
+                SettingKey::ReadCodex,
+                "Read Codex sessions",
+                "Include OpenAI Codex's sessions, from ~/.codex, beside Claude Code's. \
+                 Perch reads only its session records, never its login. Sessions Codex \
+                 has compressed show their total tokens only, without a cost.",
+                Control::Toggle { on: s.read_codex },
+            )
+            .searchable(&["codex", "openai", "tools", "providers"])],
+        ),
+        group(
             "Refreshing",
             vec![row(
                 s,

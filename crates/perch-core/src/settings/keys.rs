@@ -1,6 +1,6 @@
 //! Every setting addressed as data rather than as a field.
 //!
-//! [`Settings`] is a flat struct of twenty-seven differently-typed fields, and
+//! [`Settings`] is a flat struct of twenty-eight differently-typed fields, and
 //! almost nothing outside this module wants to know that: the schema, search,
 //! per-pane reset and the FFI all want to say "this setting, that value".
 //! [`SettingKey`] is that address, and [`Settings::get`]/[`Settings::set`]
@@ -23,6 +23,7 @@ use super::{BurnRate, MenuBarDisplay, MenuBarIcon, RowDensity, Settings};
 pub enum SettingKey {
     LaunchAtLogin,
     ClaudeConfigDir,
+    ReadCodex,
     MenuBarDisplay,
     MenuBarIcon,
     DimWhenStale,
@@ -54,10 +55,11 @@ impl SettingKey {
     /// Every key, once, in the order the fields are declared in [`Settings`].
     /// Consumers walk this instead of keeping their own list, which is what
     /// makes "every key has a row", "every key is searchable" and "every key
-    /// resets" testable as one assertion each rather than twenty-seven.
-    pub const ALL: [SettingKey; 27] = [
+    /// resets" testable as one assertion each rather than twenty-eight.
+    pub const ALL: [SettingKey; 28] = [
         SettingKey::LaunchAtLogin,
         SettingKey::ClaudeConfigDir,
+        SettingKey::ReadCodex,
         SettingKey::MenuBarDisplay,
         SettingKey::MenuBarIcon,
         SettingKey::DimWhenStale,
@@ -199,6 +201,7 @@ impl Settings {
         match key {
             SettingKey::LaunchAtLogin => SettingValue::Bool(self.launch_at_login),
             SettingKey::ClaudeConfigDir => SettingValue::Text(self.claude_config_dir.clone()),
+            SettingKey::ReadCodex => SettingValue::Bool(self.read_codex),
             SettingKey::MenuBarDisplay => {
                 SettingValue::Choice(self.menu_bar_display.as_wire_str().to_string())
             }
@@ -251,6 +254,7 @@ impl Settings {
         match key {
             SettingKey::LaunchAtLogin => self.launch_at_login = want_bool(key, value)?,
             SettingKey::ClaudeConfigDir => self.claude_config_dir = want_text(key, value)?,
+            SettingKey::ReadCodex => self.read_codex = want_bool(key, value)?,
             SettingKey::MenuBarDisplay => {
                 let raw = want_choice(key, value, &MenuBarDisplay::KNOWN_WIRE_VALUES)?;
                 self.menu_bar_display = MenuBarDisplay::from_wire_str(&raw);
@@ -391,7 +395,7 @@ mod tests {
         seen.dedup();
         assert_eq!(seen.len(), before, "ALL contains a duplicate");
         assert_eq!(
-            before, 27,
+            before, 28,
             "ALL is missing a key, or gained one without this count"
         );
     }

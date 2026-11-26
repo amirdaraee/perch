@@ -24,6 +24,9 @@ pub struct IndexStats {
     /// Subagent transcripts the pass could not read, for the same reason
     /// `sessions_skipped` exists.
     pub subagents_skipped: usize,
+    /// Sessions known only by their total tokens, because the tool keeps their
+    /// records in a form Perch can't read (Codex's compressed rollouts).
+    pub sessions_totals_only: usize,
 }
 
 pub fn index_all(db: &Db, projects_root: &Path) -> Result<IndexStats> {

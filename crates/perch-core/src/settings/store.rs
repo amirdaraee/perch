@@ -255,6 +255,8 @@ version = 2
 launch_at_login = false
 # "" auto-detects Claude Code's directory; set a path to override it.
 claude_config_dir = ""
+# Also read OpenAI Codex's sessions from ~/.codex (or CODEX_HOME).
+read_codex = true
 
 [menu_bar]
 # "icon" | "count" | "count-and-waiting"
@@ -387,6 +389,7 @@ pub fn save(path: &Path, s: &Settings) -> Result<()> {
     let general = ensure_table(&mut doc, "general");
     general["launch_at_login"] = value(s.launch_at_login);
     general["claude_config_dir"] = value(s.claude_config_dir.clone());
+    general["read_codex"] = value(s.read_codex);
 
     let menu_bar = ensure_table(&mut doc, "menu_bar");
     menu_bar["display"] = value(s.menu_bar_display.as_wire_str().to_string());
@@ -923,6 +926,7 @@ mod tests {
         let want = Settings {
             launch_at_login: true,
             claude_config_dir: dir.path().to_string_lossy().into_owned(),
+            read_codex: false,
             menu_bar_display: MenuBarDisplay::CountAndWaiting,
             menu_bar_icon: MenuBarIcon::Binoculars,
             dim_when_stale: false,

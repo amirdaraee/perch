@@ -104,8 +104,8 @@ wasn't: no such process, that pid isn't `claude`, or the record wouldn't parse.
 * **Subagents count towards the session that ran them.** Perch indexes each
   session's transcript and its subagent transcripts, under
   `<session-id>/subagents/`, and counts each API response once.
-* **Costs are estimates at list price.** Perch uses Anthropic's published rates
-  as of November 2026, and you can edit them in the Prices pane. On a
+* **Costs are estimates at list price.** Perch uses Anthropic's (and, for
+  Codex, OpenAI's) published rates as of November 2026, and you can edit them in the Prices pane. On a
   subscription, this is what the usage would cost at those rates, not what you
   pay. Fast mode and the higher Haiku 5.5 rate on very large prompts aren't
   counted. If a model has no price, Perch counts its tokens and says "no price"
@@ -115,6 +115,13 @@ wasn't: no such process, that pid isn't `claude`, or the record wouldn't parse.
   token total, so a chart of it mostly shows how long a conversation had grown.
   The small charts count API responses per day instead. Days follow your local
   time zone, including across daylight saving changes.
+* **Codex sessions count too.** If OpenAI's Codex CLI is installed, Perch also
+  reads its sessions from `~/.codex` (or `CODEX_HOME`), priced at OpenAI's
+  published rates. It reads only the session records, never Codex's login.
+  Codex compresses older sessions in a format Perch can't read without adding
+  a dependency, so those show their total tokens only, with no cost. Codex
+  doesn't say what's running, so it never appears as waiting. Turn it off in
+  Settings → General.
 * **The fullscreen behaviour is right by construction, not by testing.** A
   tracked `NSMenu` is the documented way to stay visible over a fullscreen app,
   and two spikes confirmed the alternatives don't work. Nobody has actually

@@ -62,6 +62,19 @@ const DEFAULTS: &[(&str, ModelPrice)] = &[
     price("claude-haiku-5-5", 0.1, 0.5, 0.01, 0.125),
     price("claude-haiku-4-5", 1.0, 5.0, 0.1, 1.25),
     price("claude-haiku-4-5-20251001", 1.0, 5.0, 0.1, 1.25),
+    // OpenAI's standard short-context rates as of 2026-11-26
+    // (developers.openai.com/api/docs/pricing), for Codex. The cache-write
+    // column is OpenAI's 30-minute write. Prompts over 272K tokens cost more,
+    // which, as with Haiku 5.5 above, sums can't see. gpt-5.5 lists no write
+    // rate, so a write is priced as input.
+    price("gpt-6.2-astra", 8.0, 40.0, 0.4, 10.0),
+    price("gpt-6.1-sol", 2.0, 10.0, 0.1, 2.5),
+    price("gpt-6-astra", 10.0, 50.0, 1.0, 12.5),
+    price("gpt-6-sol", 2.0, 10.0, 0.2, 2.5),
+    price("gpt-6-luna", 0.1, 0.5, 0.01, 0.125),
+    price("gpt-5.6-sol", 4.0, 20.0, 0.4, 5.0),
+    price("gpt-5.6-luna", 0.2, 1.2, 0.02, 0.25),
+    price("gpt-5.5", 5.0, 30.0, 0.5, 5.0),
 ];
 
 /// Rates Perch used to ship. A row still holding one of these was never edited,

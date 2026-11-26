@@ -649,6 +649,31 @@ impl Db {
         }
     }
 
+    /// Where a session's records were read from, if it has been indexed.
+    pub fn session_file_path(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT file_path FROM sessions WHERE id = ?1",
+                params![session_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The project already known at `real_path`, from whichever tool found it
+    /// first, so one folder is one project however many tools work in it.
+    pub fn project_at(&self, real_path: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM projects WHERE real_path = ?1 ORDER BY path_is_guess, id LIMIT 1",
+                params![real_path],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn insert_turns(&self, session_id: &str, turns: &[Turn]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         insert_turns_on(&tx, session_id, None, turns)?;

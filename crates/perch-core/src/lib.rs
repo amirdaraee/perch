@@ -2,6 +2,7 @@
 //! Never writes to it.
 
 pub mod actions;
+pub mod codex;
 pub mod config;
 pub mod days;
 pub mod db;
