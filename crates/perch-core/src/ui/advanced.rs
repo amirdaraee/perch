@@ -142,9 +142,10 @@ pub fn build_advanced(
     AdvancedModel {
         groups: vec![files, index, mcp_group(mcp_binary), about],
         links: links(),
-        reindex_help: "Re-reads every session file Claude Code has written and rebuilds the \
-                       index from scratch. Perch only ever reads your Claude Code folder; \
-                       nothing in it is changed."
+        reindex_help: "Reads every session file Claude Code has written and adds anything \
+                       new to the index. Sessions whose files Claude Code has since deleted \
+                       are kept, since the index is their only record. Perch only ever reads \
+                       your Claude Code folder; nothing in it is changed."
             .to_string(),
         reset_warning: format!(
             "This puts all twenty-seven settings back to their factory values by rewriting {}, \

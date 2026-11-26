@@ -620,13 +620,6 @@ impl Db {
         Ok(())
     }
 
-    /// Drop derived rows only. Never touches `projects`.
-    pub fn rebuild_derived(&self) -> Result<()> {
-        self.conn
-            .execute_batch("DELETE FROM turns; DELETE FROM subagents; DELETE FROM sessions;")?;
-        Ok(())
-    }
-
     pub fn project_count(&self) -> Result<i64> {
         Ok(self
             .conn
@@ -1067,34 +1060,6 @@ mod tests {
             db.display_name(id).unwrap().as_deref(),
             Some("Personal Dashboard")
         );
-    }
-
-    #[test]
-    fn rebuild_derived_clears_sessions_and_turns_but_not_projects() {
-        let db = open_in_memory().unwrap();
-        let id = db.upsert_project("slug", "/Users/a/proj", false).unwrap();
-        db.set_note(id, "keep me").unwrap();
-        db.upsert_session(&session("s1", id, 10)).unwrap();
-        db.insert_turns(
-            "s1",
-            &[Turn {
-                message_id: None,
-                ts: 1,
-                model: "m".into(),
-                usage: TurnUsage {
-                    input: 1,
-                    ..Default::default()
-                },
-            }],
-        )
-        .unwrap();
-
-        db.rebuild_derived().unwrap();
-
-        assert_eq!(db.session_count().unwrap(), 0);
-        assert_eq!(db.turn_count().unwrap(), 0);
-        assert_eq!(db.project_count().unwrap(), 1);
-        assert_eq!(db.note(id).unwrap().as_deref(), Some("keep me"));
     }
 
     #[test]
@@ -1652,14 +1617,5 @@ mod tests {
 
         db.apply_scan(&session, &[], true).unwrap();
         assert_eq!(db.turn_totals().unwrap().1, 4);
-    }
-
-    #[test]
-    fn rebuilding_clears_subagents_too() {
-        let db = db_with_session("s1");
-        db.apply_subagent_scan("s1", "a", "/tmp/a.jsonl", 10, &[], false)
-            .unwrap();
-        db.rebuild_derived().unwrap();
-        assert_eq!(db.subagent_offset("s1", "a").unwrap(), 0);
     }
 }

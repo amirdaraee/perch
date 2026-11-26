@@ -5470,6 +5470,39 @@ mod tests {
         );
     }
 
+    /// Claude Code deletes old transcripts, so the index is often the only
+    /// record left of them. "Reindex now" must keep a session whose
+    /// transcript has gone, not rebuild from scratch and lose it.
+    #[test]
+    fn a_reindex_keeps_sessions_whose_transcripts_are_gone() {
+        let (p, _guard, _data, claude) = perch_in_temp();
+        let project = claude.path().join("projects").join("-Users-a-one");
+        std::fs::create_dir_all(&project).unwrap();
+        let transcript = project.join("aaaa.jsonl");
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n{}\n",
+                assistant_line("2026-08-18T10:00:00.000Z", "/Users/a/one", 1, 2),
+                assistant_line("2026-08-18T10:01:00.000Z", "/Users/a/one", 3, 4),
+            ),
+        )
+        .unwrap();
+        p.reindex_now().unwrap();
+        assert_eq!(fact(&p.advanced(), "Turns indexed"), "2");
+
+        std::fs::remove_file(&transcript).unwrap();
+        let m = p
+            .reindex_now()
+            .expect("a missing transcript is not an error");
+        assert_eq!(fact(&m, "Sessions indexed"), "1");
+        assert_eq!(
+            fact(&m, "Turns indexed"),
+            "2",
+            "the deleted transcript's usage must survive the reindex"
+        );
+    }
+
     /// A v1 file, opened through `Perch`. `include_background` moved from
     /// `[sessions]` to `[notifications]`, and to the deserializer a key that
     /// moved is simply absent — so without the migration the user's `true`

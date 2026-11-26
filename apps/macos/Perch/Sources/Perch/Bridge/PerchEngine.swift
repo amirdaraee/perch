@@ -259,8 +259,9 @@ final class PerchEngine: ObservableObject {
         return await Task.detached(priority: .userInitiated) { perch.advanced() }.value
     }
 
-    /// Rebuilds the index from Claude Code's session files. Slow by nature —
-    /// it reads every one of them — and it returns the pane the run
+    /// Brings the index up to date with Claude Code's session files, keeping
+    /// sessions whose files are gone. Slow by nature — it reads every one of
+    /// them — and it returns the pane the run
     /// produced, so the new counts are this run's rather than the old ones
     /// redrawn.
     func reindexNow() async -> Result<AdvancedModel, Error> {
