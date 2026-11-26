@@ -292,9 +292,8 @@ pub struct Settings {
     /// 1..=90.
     pub active_within_days: u32,
     pub show_archived: bool,
-    /// One of 7, 14, 30, 90 — a choice, not a range. Drives both the usage
-    /// chart and the project sparkline, which is why it is one key: two
-    /// constants that both happened to be 14 could drift apart silently.
+    /// One of 7, 14, 30, 90 — a choice, not a range. Spans the usage chart
+    /// and the MCP server's daily figures for a project.
     pub chart_days: u32,
     /// 3..=20.
     pub top_projects_count: u32,

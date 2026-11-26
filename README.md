@@ -71,9 +71,10 @@ real `NSMenu`, which is what keeps it visible when you're in a fullscreen app.
 as a calendar grid, like GitHub's, and then a card per project with its
 README blurb, its last two weeks as a row of days, how many of them were
 active and when you last worked on it, its branch, sessions and spend, and
-whether anything is running or waiting right now. Click through for that project's
-sessions, your own notes, and its totals. There's a separate Usage view with
-everything broken down by day, by project and by model.
+whether anything is running or waiting right now. Click through for that
+project's last six months of activity, its sessions, your own notes, and its
+totals. There's a separate Usage view with everything broken down by day, by
+project and by model.
 
 From a project you can pin it, archive it, rename it, resume a session
 (`claude --resume <id>`), or start a new one. Both open in the project's folder,

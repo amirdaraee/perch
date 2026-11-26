@@ -6,9 +6,7 @@ use crate::live::{LiveSession, SessionStatus};
 use crate::query;
 use crate::readme;
 use crate::settings::Settings;
-use crate::ui::format::{
-    cost_label, human_ago, human_elapsed, human_tokens, last_days_title, plural,
-};
+use crate::ui::format::{cost_label, human_ago, human_elapsed, human_tokens, plural};
 use crate::ui::heatmap::{self, HeatCell};
 use crate::ui::model::PopoverModel;
 
@@ -56,17 +54,6 @@ pub struct ProjectRow {
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct SparkPoint {
-    pub day_index: i32,
-    /// What the bar's height comes from.
-    pub responses: u64,
-    /// "13d" or "Today".
-    pub label: String,
-    /// "12 responses".
-    pub value_label: String,
-}
-
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct SessionHistoryRow {
     pub id: String,
     pub name: String,
@@ -88,9 +75,6 @@ pub struct ProjectDetail {
     pub tokens: String,
     pub cost: String,
     pub session_count: String,
-    /// "Last 14 days", the heading over `sparkline`.
-    pub chart_title: String,
-    pub sparkline: Vec<SparkPoint>,
     pub sessions: Vec<SessionHistoryRow>,
     pub pinned: bool,
     pub archived: bool,
@@ -367,31 +351,6 @@ fn card_cells(window: &[crate::days::Day], responses_per_day: &[u64]) -> Vec<Hea
         .collect()
 }
 
-/// One bar per day, oldest first, labelled with the same scheme as
-/// `ui::usage`'s daily chart over the identical window — "Today", "1d" … — not
-/// `human_elapsed`, which caps at hours and would read "313h ago" for day 0.
-/// Shared by the overview card and the project page so the two never disagree.
-fn spark_points(responses_per_day: &[u64]) -> Vec<SparkPoint> {
-    let n = responses_per_day.len();
-    responses_per_day
-        .iter()
-        .enumerate()
-        .map(|(i, &responses)| {
-            let days_ago = n - 1 - i;
-            SparkPoint {
-                day_index: i as i32,
-                responses,
-                value_label: plural(responses as i64, "response", "responses"),
-                label: if days_ago == 0 {
-                    "Today".to_string()
-                } else {
-                    format!("{days_ago}d")
-                },
-            }
-        })
-        .collect()
-}
-
 /// Which sidebar group a project belongs to: Archived beats Pinned, and an
 /// unpinned project is Active while its last turn is within
 /// `active_within_days`. Public so every reader of the index — the main window
@@ -434,11 +393,8 @@ fn recency_key(ts: Option<i64>) -> (u8, i64) {
     }
 }
 
-/// One project in full: its note, totals, a `settings.chart_days`-long
-/// sparkline scoped to this project alone, and every session ever recorded for
-/// it. That is the same setting `ui::usage`'s daily chart spans: the two were
-/// separate constants that both happened to be 14, and a user who widened one
-/// would have been left comparing two different date ranges.
+/// One project in full: its note, totals, and every session ever recorded
+/// for it. Its activity grid comes from `ui::heatmap`, scoped to the project.
 pub fn build_project_detail(
     db: &Db,
     project_id: i64,
@@ -456,10 +412,6 @@ pub fn build_project_detail(
         .display_name
         .clone()
         .unwrap_or_else(|| dir_name(&summary.real_path));
-
-    let chart_days = settings.chart_days as usize;
-    let days = query::daily_usage_for_project(db, project_id, chart_days, now_ms)?;
-    let sparkline = spark_points(&days.iter().map(|d| d.responses).collect::<Vec<_>>());
 
     let sessions = query::session_history(db, project_id)?
         .into_iter()
@@ -527,8 +479,6 @@ pub fn build_project_detail(
             String::new()
         },
         session_count: plural(summary.sessions, "session", "sessions"),
-        chart_title: last_days_title(settings.chart_days),
-        sparkline,
         sessions,
         pinned: meta.pinned,
         archived: meta.archived,
@@ -692,16 +642,12 @@ mod tests {
         );
     }
 
-    /// The defect this prevents: `CHART_DAYS` and `SPARK_DAYS` were two
-    /// independent declarations that both happened to be 14, so exposing
-    /// either alone would let the usage chart and a project's sparkline
-    /// silently disagree about their own date range.
     #[test]
-    fn one_setting_drives_both_the_chart_and_the_sparkline() {
+    fn chart_days_spans_the_usage_chart() {
         let db = open_in_memory().unwrap();
         seed_default_prices(&db).unwrap();
         let now = 100 * DAY + 3_600_000;
-        let pid = project_with_session(&db, "-a-p", "/a/proj", "s1", now - 1000, 1_000_000);
+        project_with_session(&db, "-a-p", "/a/proj", "s1", now - 1000, 1_000_000);
 
         for days in [7u32, 30, 90] {
             let s = Settings {
@@ -716,14 +662,6 @@ mod tests {
                     .len(),
                 want,
                 "the usage chart must span chart_days"
-            );
-            assert_eq!(
-                build_project_detail(&db, pid, &[], now, &s)
-                    .unwrap()
-                    .sparkline
-                    .len(),
-                want,
-                "the sparkline must span the very same setting"
             );
         }
     }
@@ -887,61 +825,6 @@ mod tests {
         );
         assert!(m.projects.is_empty());
         assert!(m.error.is_some(), "the user is told why the list is empty");
-    }
-
-    #[test]
-    fn project_detail_has_a_full_fourteen_day_sparkline_even_when_quiet() {
-        let db = open_in_memory().unwrap();
-        seed_default_prices(&db).unwrap();
-        // The turn is at `now` exactly: any gap could cross local midnight in
-        // some time zone, and this test would wrongly see "today" as quiet.
-        let now = 100 * DAY;
-        let pid = project_with_session(&db, "-a-p", "/a/proj", "s1", now, 1_000_000);
-
-        let d = build_project_detail(&db, pid, &[], now, &Settings::default()).unwrap();
-        assert_eq!(d.sparkline.len(), 14);
-        assert_eq!(
-            d.sparkline[0].day_index, 0,
-            "indices are 0..13, oldest first"
-        );
-        assert_eq!(d.sparkline[13].day_index, 13);
-        assert!(d.sparkline[13].responses > 0, "today has the activity");
-        assert!(d.sparkline[0].responses == 0, "thirteen days ago was quiet");
-        assert_eq!(
-            d.sparkline[0].label, "13d",
-            "oldest day reads as a day count, not \"313h ago\""
-        );
-        assert_eq!(
-            d.sparkline[13].label, "Today",
-            "newest day reads as Today, matching ui::usage's scheme"
-        );
-    }
-
-    #[test]
-    fn project_detail_sparkline_is_scoped_to_its_own_project() {
-        // A second, noisy project must not bleed into the first project's
-        // sparkline — otherwise the chart on a quiet project's page would show
-        // someone else's activity as if it were its own.
-        let db = open_in_memory().unwrap();
-        seed_default_prices(&db).unwrap();
-        let now = 100 * DAY;
-        let quiet = project_with_session(&db, "-a-quiet", "/a/quiet", "s1", now - 60 * DAY, 0);
-        let noisy = project_with_session(&db, "-a-noisy", "/a/noisy", "s2", now - 1000, 5_000_000);
-        let responses = |id| {
-            build_project_detail(&db, id, &[], now, &Settings::default())
-                .unwrap()
-                .sparkline
-                .iter()
-                .map(|p| p.responses)
-                .sum::<u64>()
-        };
-
-        assert_eq!(
-            responses(quiet),
-            0,
-            "the other project's activity must not appear on this one's sparkline"
-        );
-        assert_eq!(responses(noisy), 1);
     }
 
     #[test]

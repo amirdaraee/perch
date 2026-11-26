@@ -7,11 +7,23 @@ use crate::query::{self, DayUsage};
 use crate::ui::format::{cost_label, plural};
 use chrono::{DateTime, Datelike, Days, NaiveDate, TimeZone, Weekday};
 
-/// Columns in the grid: a year, plus the week in progress.
+/// Columns in the Overview's grid: a year, plus the week in progress.
 pub const WEEKS: u32 = 53;
+/// Columns on a project's page, which has less to show and less room.
+pub const PROJECT_WEEKS: u32 = 26;
+
+fn weeks_for(project_id: Option<i64>) -> u32 {
+    if project_id.is_some() {
+        PROJECT_WEEKS
+    } else {
+        WEEKS
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Heatmap {
+    /// "Last year" or "Last 26 weeks": the span the grid covers.
+    pub title: String,
     pub columns: u32,
     /// Today and every day before it in the grid. Days after today aren't here.
     pub cells: Vec<HeatCell>,
@@ -21,6 +33,8 @@ pub struct Heatmap {
     pub weekdays: Vec<AxisLabel>,
     /// "212 active days · current streak 4 days · longest 19 days · busiest Oct 24".
     pub summary: String,
+    /// Figures over the grid's span, for a stat row: active days, busiest day.
+    pub stats: Vec<HeatStat>,
     /// "Tracking since Jul 19", when records begin inside the grid.
     pub tracking_note: Option<String>,
     pub legend_less: String,
@@ -42,6 +56,14 @@ pub struct HeatCell {
     pub before_tracking: bool,
     /// "Fri, Oct 24: 312 responses, 5 sessions, $18.40".
     pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct HeatStat {
+    /// "Active days".
+    pub label: String,
+    /// "41 of 182", or "Oct 24".
+    pub value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -85,10 +107,16 @@ pub(crate) fn build_in<Tz: TimeZone>(
             .date_naive()
     };
     let today = local_date(now_ms);
+    let weeks = weeks_for(project_id);
+    let span_name = if weeks == WEEKS {
+        "the last year".to_string()
+    } else {
+        format!("the last {weeks} weeks")
+    };
     let week_start = weekday_from_mac(first_weekday);
     let into_week = today.weekday().days_since(week_start);
     let grid_start = today
-        .checked_sub_days(Days::new(u64::from(into_week + (WEEKS - 1) * 7)))
+        .checked_sub_days(Days::new(u64::from(into_week + (weeks - 1) * 7)))
         .unwrap_or(today);
     let span = (today - grid_start).num_days() as usize + 1;
 
@@ -111,7 +139,8 @@ pub(crate) fn build_in<Tz: TimeZone>(
         .collect();
 
     Ok(Heatmap {
-        columns: WEEKS,
+        title: capitalise(span_name.trim_start_matches("the ")),
+        columns: weeks,
         cells,
         months: month_labels(grid_start, span, today),
         weekdays: (0..7u32)
@@ -125,7 +154,8 @@ pub(crate) fn build_in<Tz: TimeZone>(
                     .to_string(),
             })
             .collect(),
-        summary: summary(&days, today),
+        summary: summary(&days, today, &span_name),
+        stats: stats(&days, today),
         tracking_note: first_tracked
             .filter(|first| *first > grid_start)
             .map(|first| format!("Tracking since {}", date_label(first, today))),
@@ -257,15 +287,44 @@ fn streaks(days: &[DayUsage]) -> (usize, usize) {
     (current, longest)
 }
 
-fn summary(days: &[DayUsage], today: NaiveDate) -> String {
+/// "Last 26 weeks" from "last 26 weeks".
+fn capitalise(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
+}
+
+/// The day with the most responses; the earliest of equals.
+fn busiest(days: &[DayUsage]) -> Option<&DayUsage> {
+    days.iter()
+        .filter(|d| d.responses > 0)
+        .max_by_key(|d| (d.responses, std::cmp::Reverse(d.date)))
+}
+
+fn stats(days: &[DayUsage], today: NaiveDate) -> Vec<HeatStat> {
+    let active = days.iter().filter(|d| d.responses > 0).count();
+    vec![
+        HeatStat {
+            label: "Active days".into(),
+            value: format!("{active} of {}", days.len()),
+        },
+        HeatStat {
+            label: "Busiest day".into(),
+            value: busiest(days)
+                .map(|d| date_label(d.date, today))
+                .unwrap_or_else(|| "—".into()),
+        },
+    ]
+}
+
+fn summary(days: &[DayUsage], today: NaiveDate, span_name: &str) -> String {
     let active = days.iter().filter(|d| d.responses > 0).count();
     if active == 0 {
-        return "No activity in the last year".into();
+        return format!("No activity in {span_name}");
     }
     let (current, longest) = streaks(days);
-    let busiest = days
-        .iter()
-        .max_by_key(|d| (d.responses, std::cmp::Reverse(d.date)))
+    let busiest = busiest(days)
         .map(|d| date_label(d.date, today))
         .unwrap_or_default();
     format!(
@@ -389,13 +448,50 @@ mod tests {
     fn the_summary_names_active_days_streaks_and_the_busiest_day() {
         let days = run(&[2, 9, 0, 9, 1]);
         assert_eq!(
-            summary(&days, date(2026, 6, 1)),
+            summary(&days, date(2026, 6, 1), "the last year"),
             "4 active days · current streak 2 days · longest 2 days · busiest Jan 2"
         );
         assert_eq!(
-            summary(&run(&[0, 0]), date(2026, 6, 1)),
-            "No activity in the last year"
+            summary(&run(&[0, 0]), date(2026, 6, 1), "the last 26 weeks"),
+            "No activity in the last 26 weeks"
         );
+    }
+
+    #[test]
+    fn the_stat_row_counts_active_days_and_names_the_busiest() {
+        let s = stats(&run(&[2, 9, 0, 9, 1]), date(2026, 6, 1));
+        assert_eq!(s[0].label, "Active days");
+        assert_eq!(s[0].value, "4 of 5");
+        assert_eq!(s[1].label, "Busiest day");
+        assert_eq!(s[1].value, "Jan 2", "the earlier of equals");
+        let quiet = stats(&run(&[0, 0]), date(2026, 6, 1));
+        assert_eq!(quiet[0].value, "0 of 2");
+        assert_eq!(quiet[1].value, "—");
+    }
+
+    #[test]
+    fn a_project_spans_26_weeks_and_the_overview_a_year() {
+        let db = open_in_memory().unwrap();
+        seed_default_prices(&db).unwrap();
+        let today = date(2026, 11, 6);
+        seed(&db, &[(today, "claude-sonnet-5")]);
+        let pid: i64 = db
+            .conn()
+            .query_row("SELECT id FROM projects LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+
+        let all = build_in(&db, &Utc, None, noon(today), 2, true).unwrap();
+        assert_eq!((all.columns, all.title.as_str()), (53, "Last year"));
+        let one = build_in(&db, &Utc, Some(pid), noon(today), 2, true).unwrap();
+        assert_eq!((one.columns, one.title.as_str()), (26, "Last 26 weeks"));
+        assert!(one.cells.iter().all(|c| c.column < 26));
+        assert_eq!(
+            one.cells.last().unwrap().column,
+            25,
+            "today is in the last column"
+        );
+        assert!(one.has_data);
+        assert_eq!(one.stats[0].value, format!("1 of {}", one.cells.len()));
     }
 
     #[test]

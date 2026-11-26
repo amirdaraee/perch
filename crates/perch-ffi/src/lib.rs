@@ -473,11 +473,13 @@ pub struct ProjectRow {
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct Heatmap {
+    pub title: String,
     pub columns: u32,
     pub cells: Vec<HeatCell>,
     pub months: Vec<AxisLabel>,
     pub weekdays: Vec<AxisLabel>,
     pub summary: String,
+    pub stats: Vec<HeatStat>,
     pub tracking_note: Option<String>,
     pub legend_less: String,
     pub legend_more: String,
@@ -492,6 +494,12 @@ pub struct HeatCell {
     pub level: u8,
     pub before_tracking: bool,
     pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Record)]
+pub struct HeatStat {
+    pub label: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, uniffi::Record)]
@@ -522,11 +530,13 @@ impl From<core_heatmap::HeatCell> for HeatCell {
 impl From<core_heatmap::Heatmap> for Heatmap {
     fn from(h: core_heatmap::Heatmap) -> Self {
         let core_heatmap::Heatmap {
+            title,
             columns,
             cells,
             months,
             weekdays,
             summary,
+            stats,
             tracking_note,
             legend_less,
             legend_more,
@@ -540,11 +550,16 @@ impl From<core_heatmap::Heatmap> for Heatmap {
                 .collect()
         };
         Heatmap {
+            title,
             columns,
             cells: cells.into_iter().map(Into::into).collect(),
             months: axis(months),
             weekdays: axis(weekdays),
             summary,
+            stats: stats
+                .into_iter()
+                .map(|core_heatmap::HeatStat { label, value }| HeatStat { label, value })
+                .collect(),
             tracking_note,
             legend_less,
             legend_more,
@@ -552,14 +567,6 @@ impl From<core_heatmap::Heatmap> for Heatmap {
             has_data,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, uniffi::Record)]
-pub struct SparkPoint {
-    pub day_index: i32,
-    pub responses: u64,
-    pub label: String,
-    pub value_label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
@@ -584,8 +591,6 @@ pub struct ProjectDetail {
     pub tokens: String,
     pub cost: String,
     pub session_count: String,
-    pub chart_title: String,
-    pub sparkline: Vec<SparkPoint>,
     pub sessions: Vec<SessionHistoryRow>,
     pub pinned: bool,
     pub archived: bool,
@@ -720,23 +725,6 @@ impl From<main_window::ProjectRow> for ProjectRow {
     }
 }
 
-impl From<main_window::SparkPoint> for SparkPoint {
-    fn from(p: main_window::SparkPoint) -> Self {
-        let main_window::SparkPoint {
-            day_index,
-            responses,
-            label,
-            value_label,
-        } = p;
-        SparkPoint {
-            day_index,
-            responses,
-            label,
-            value_label,
-        }
-    }
-}
-
 impl From<main_window::SessionHistoryRow> for SessionHistoryRow {
     fn from(r: main_window::SessionHistoryRow) -> Self {
         let main_window::SessionHistoryRow {
@@ -774,8 +762,6 @@ impl From<main_window::ProjectDetail> for ProjectDetail {
             tokens,
             cost,
             session_count,
-            chart_title,
-            sparkline,
             sessions,
             pinned,
             archived,
@@ -792,8 +778,6 @@ impl From<main_window::ProjectDetail> for ProjectDetail {
             tokens,
             cost,
             session_count,
-            chart_title,
-            sparkline: sparkline.into_iter().map(Into::into).collect(),
             sessions: sessions.into_iter().map(Into::into).collect(),
             notify: notify.into(),
             notify_default_label,
@@ -2341,7 +2325,7 @@ impl Perch {
             .into()
     }
 
-    /// One project in full: note, totals, sparkline, and every session.
+    /// One project in full: note, totals, and every session.
     pub fn project_detail(&self, project_id: i64) -> Result<ProjectDetail, PerchError> {
         let database = self.open_db()?;
         self.detail(&database, project_id)

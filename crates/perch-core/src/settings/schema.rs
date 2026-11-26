@@ -624,15 +624,14 @@ fn projects_pane(s: &Settings, cx: &SchemaContext) -> SettingsPane {
                 s,
                 SettingKey::ChartDays,
                 "Days of history",
-                "How many days the usage chart and each project's sparkline cover. Both \
-                 read this one setting, so they can never disagree about their own date \
-                 range.",
+                "How many days the usage chart covers, and the daily figures Perch's \
+                 MCP server reports for a project.",
                 Control::IntChoice {
                     selected: i64::from(s.chart_days),
                     options: chart_day_options(),
                 },
             )
-            .searchable(&["chart", "sparkline", "history", "range", "window"])],
+            .searchable(&["chart", "history", "range", "window"])],
         ),
     ];
 

@@ -1,5 +1,4 @@
 import SwiftUI
-import Charts
 import PerchFFI
 
 /// A single project in full: note, totals, sparkline, session history, and
@@ -14,6 +13,9 @@ struct ProjectDetailPane: View {
     let onChanged: () async -> Void
 
     @State private var detail: ProjectDetail?
+    /// This project's activity grid; `nil` until it loads or if it fails,
+    /// in which case the section is left out rather than shown as quiet.
+    @State private var activity: Heatmap?
     @State private var loadError: String?
     @State private var actionError: String?
 
@@ -110,9 +112,9 @@ struct ProjectDetailPane: View {
                 }
 
                 totals(detail)
+                activitySection
                 noteEditor(detail)
                 notifySection(detail)
-                sparkline(detail)
                 sessionList(detail)
             }
             .padding(20)
@@ -157,11 +159,17 @@ struct ProjectDetailPane: View {
         }
     }
 
+    /// All-time sessions and cost, then the grid's own figures. Tokens are
+    /// left to the Usage view: the total is mostly cache and says little here.
     private func totals(_ detail: ProjectDetail) -> some View {
-        HStack(spacing: 24) {
+        HStack(alignment: .top, spacing: 24) {
             stat("Sessions", detail.sessionCount)
-            stat("Tokens", detail.tokens)
-            stat("Cost", detail.cost)
+            if !detail.cost.isEmpty {
+                stat("Cost", detail.cost)
+            }
+            ForEach(activity?.stats ?? [], id: \.self) { s in
+                stat(s.label, s.value)
+            }
         }
     }
 
@@ -224,50 +232,13 @@ struct ProjectDetailPane: View {
     }
 
     @ViewBuilder
-    private func sparkline(_ detail: ProjectDetail) -> some View {
-        if !detail.sparkline.isEmpty {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(detail.chartTitle).font(.caption2).foregroundStyle(.secondary).textCase(.uppercase)
-                Chart {
-                    ForEach(detail.sparkline, id: \.dayIndex) { point in
-                        BarMark(
-                            x: .value("Day", point.dayIndex),
-                            y: .value("Responses", point.responses)
-                        )
-                        .foregroundStyle(Color.perchWorking)
-                        // Both are Rust's finished strings, never formatted here.
-                        .accessibilityLabel(point.label)
-                        .accessibilityValue(point.valueLabel)
-                    }
-                    PerchChartBaseline()
-                }
-                .chartXAxis {
-                    // A handful of labelled ticks give the bars a day, without
-                    // crowding 14 of them onto one axis.
-                    AxisMarks(values: axisDayIndices(detail)) { value in
-                        AxisTick()
-                        if let day = value.as(Int32.self), let label = dayLabel(for: day, in: detail) {
-                            AxisValueLabel(label)
-                        }
-                    }
-                }
-                .chartYAxis(.hidden)
-                .frame(height: 70)
+    private var activitySection: some View {
+        if let activity, activity.hasData {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(activity.title).font(.caption2).foregroundStyle(.secondary).textCase(.uppercase)
+                ActivityHeatmap(model: activity)
             }
         }
-    }
-
-    /// First, middle, and last day of the sparkline — enough for context
-    /// without crowding the axis with all 14 labels.
-    private func axisDayIndices(_ detail: ProjectDetail) -> [Int32] {
-        let days = detail.sparkline.map(\.dayIndex).sorted()
-        guard let first = days.first, let last = days.last else { return [] }
-        guard days.count > 2 else { return days }
-        return [first, days[days.count / 2], last]
-    }
-
-    private func dayLabel(for dayIndex: Int32, in detail: ProjectDetail) -> String? {
-        detail.sparkline.first { $0.dayIndex == dayIndex }?.label
     }
 
     @ViewBuilder
@@ -411,6 +382,7 @@ struct ProjectDetailPane: View {
         case .failure(let e):
             loadError = e.localizedDescription
         }
+        if case .success(let h) = await engine.activity(projectId: projectId) { activity = h }
     }
 
     /// `notifyMode` reads straight from `detail`, so it needs no seeding.

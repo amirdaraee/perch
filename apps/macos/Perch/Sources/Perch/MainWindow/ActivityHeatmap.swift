@@ -45,7 +45,14 @@ struct ActivityHeatmap: View {
             }
             .padding(.leading, weekdayColumn)
         }
+        // No wider than the grid at full size, so the legend stays beside
+        // the grid rather than drifting to the far edge of a wide pane.
+        .frame(maxWidth: fullWidth, alignment: .leading)
         .accessibilityElement(children: .contain)
+    }
+
+    private var fullWidth: CGFloat {
+        weekdayColumn + columns * maxCell + (columns - 1) * maxCell * gapRatio
     }
 
     private var columns: CGFloat { CGFloat(max(model.columns, 1)) }
